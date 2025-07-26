@@ -1,0 +1,20 @@
+# Добавьте эти строки в ваш основной Caddyfile на хосте Proxmox
+# Замените $LOCAL_IP на IP адрес VPS, показанный в конце установки
+
+# Matrix Synapse
+matrix.yourdomain.com {
+    reverse_proxy $LOCAL_IP:8008 {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+    }
+}
+
+# Element Web
+element.yourdomain.com {
+    reverse_proxy $LOCAL_IP:8080
+}
+
+# Synapse Admin
+admin.yourdomain.com {
+    reverse_proxy $LOCAL_IP:8081
+}
