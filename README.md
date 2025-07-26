@@ -17,11 +17,17 @@
 - Root доступ
 - Настроенные DNS записи для доменов (A-записи должны указывать на ваш сервер)
 
+## ⚡ Быстрая установка
+
+```bash
+wget -qO setup-matrix.sh https://raw.githubusercontent.com/gopnikgame/matrix-setup/main/setup-matrix.sh && chmod +x setup-matrix.sh && sudo ./setup-matrix.sh
+```
+
 ## Использование
 
 1. Клонируйте репозиторий:
 ```bash
-git clone https://github.com/yourusername/matrix-setup.git
+git clone https://github.com/gopnikgame/matrix-setup.git
 cd matrix-setup
 ```
 
