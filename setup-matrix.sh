@@ -47,13 +47,9 @@ echo "Обновление системы..."
 apt update
 apt upgrade -y
 
-# Установка зависимостей (убираем certbot, так как Caddy сам управляет сертификатами)
+# Установка зависимостей
 echo "Установка зависимостей..."
-apt install -y net-tools python3-dev python3-pip libpq-dev mc aptitude htop apache2-utils lsb-release wget apt-transport-https postgresql docker.io docker-compose git
-
-# Установка psycopg2 через pip
-echo "Установка psycopg2..."
-pip3 install psycopg2
+apt install -y net-tools python3-dev libpq-dev mc aptitude htop apache2-utils lsb-release wget apt-transport-https postgresql docker.io docker-compose git python3-psycopg2
 
 # Установка и настройка PostgreSQL
 echo "Настройка PostgreSQL..."
@@ -210,6 +206,14 @@ docker run -d --name element-web --restart always -p 127.0.0.1:8080:80 -v /opt/e
 echo "Установка Synapse Admin..."
 mkdir -p /opt/synapse-admin
 cd /opt/synapse-admin
+
+# Создаем config.json для ограничения homeserver
+cat > config.json <<EOL
+{
+  "restrictBaseUrl": "https://$MATRIX_DOMAIN"
+}
+EOL
+
 git clone https://github.com/Awesome-Technologies/synapse-admin.git .
 cat > docker-compose.yml <<EOL
 version: '3'
@@ -220,28 +224,32 @@ services:
     restart: always
     ports:
       - "127.0.0.1:8081:80"
+    volumes:
+      - ./config.json:/app/config.json:ro
     environment:
       - REACT_APP_SERVER_URL=https://$MATRIX_DOMAIN
 EOL
 
 docker-compose up -d
 
-# Остановка других веб-серверов на время запуска Caddy
-echo "Останавливаем другие веб-серверы..."
-systemctl stop nginx 2>/dev/null || true
-systemctl stop apache2 2>/dev/null || true
+# Установка и настройка веб-сервера (только для хостинга)
+if [ "$SERVER_TYPE" = "hosting" ]; then
+  # Остановка других веб-серверов на время запуска Caddy
+  echo "Останавливаем другие веб-серверы..."
+  systemctl stop nginx 2>/dev/null || true
+  systemctl stop apache2 2>/dev/null || true
 
-# Установка и настройка Caddy
-echo "Установка и настройка Caddy..."
-apt install -y debian-keyring debian-archive-keyring apt-transport-https
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
-apt update
-apt install -y caddy
+  # Установка и настройка Caddy
+  echo "Установка и настройка Caddy..."
+  apt install -y debian-keyring debian-archive-keyring apt-transport-https
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
+  apt update
+  apt install -y caddy
 
-# Создание Caddyfile - Caddy автоматически получит и обновит SSL сертификаты
-echo "Создание Caddyfile..."
-cat > /etc/caddy/Caddyfile <<EOL
+  # Создание Caddyfile - Caddy автоматически получит и обновит SSL сертификаты
+  echo "Создание Caddyfile..."
+  cat > /etc/caddy/Caddyfile <<EOL
 # Matrix Synapse - Caddy автоматически получит SSL сертификат
 $MATRIX_DOMAIN {
     reverse_proxy 127.0.0.1:8008 {
@@ -261,21 +269,27 @@ $ADMIN_DOMAIN {
 }
 EOL
 
-# Запуск и включение Caddy
-systemctl enable caddy
-systemctl start caddy
+  # Запуск и включение Caddy
+  systemctl enable caddy
+  systemctl start caddy
+fi
 
 # Проверка статуса сервисов
 echo "Проверка статуса сервисов..."
 systemctl status matrix-synapse --no-pager -l
 systemctl status postgresql --no-pager -l
 systemctl status coturn --no-pager -l
-systemctl status caddy --no-pager -l
+if [ "$SERVER_TYPE" = "hosting" ]; then
+  systemctl status caddy --no-pager -l
+fi
 
 # Создание первого пользователя
 echo "Создание первого пользователя..."
 echo "Запустите следующую команду для создания первого пользователя:"
 echo "register_new_matrix_user -c /etc/matrix-synapse/homeserver.yaml http://localhost:8008"
+echo ""
+echo "Для доступа к Synapse Admin используйте администраторские учетные данные"
+echo "созданные через register_new_matrix_user"
 
 # Финальная информация
 echo ""
@@ -287,32 +301,42 @@ echo "Element Web доступен по адресу: https://$ELEMENT_DOMAIN"
 echo "Synapse Admin доступен по адресу: https://$ADMIN_DOMAIN"
 echo "Первый администратор: @$ADMIN_USER:$MATRIX_DOMAIN"
 echo ""
-echo "ВАЖНО: Caddy автоматически получит SSL сертификаты Let's Encrypt"
-echo "Подождите несколько минут после запуска для получения сертификатов"
-echo ""
-if [ "$SERVER_TYPE" = "proxmox" ]; then
-echo "Для Proxmox VPS добавьте в Caddyfile хоста следующие строки:"
-echo ""
-echo "# Matrix Synapse"
-echo "$MATRIX_DOMAIN {"
-echo "    reverse_proxy $LOCAL_IP:8008 {"
-echo "        header_up X-Forwarded-For {remote_host}"
-echo "        header_up X-Real-IP {remote_host}"  
-echo "    }"
-echo "}"
-echo ""
-echo "# Element Web"
-echo "$ELEMENT_DOMAIN {"
-echo "    reverse_proxy $LOCAL_IP:8080"
-echo "}"
-echo ""
-echo "# Synapse Admin"
-echo "$ADMIN_DOMAIN {"
-echo "    reverse_proxy $LOCAL_IP:8081"
-echo "}"
-echo ""
-echo "Затем перезапустите Caddy на хосте: systemctl reload caddy"
+
+if [ "$SERVER_TYPE" = "hosting" ]; then
+  echo "ВАЖНО: Caddy автоматически получит SSL сертификаты Let's Encrypt"
+  echo "Подождите несколько минут после запуска для получения сертификатов"
+  echo ""
+  echo "SYNAPSE ADMIN: Для работы требуется доступ к:"
+  echo "- /_matrix (для API Matrix)"
+  echo "- /_synapse/admin (для админ-панели)"
+  echo "Эти эндпоинты уже настроены в Caddyfile"
+elif [ "$SERVER_TYPE" = "proxmox" ]; then
+  echo "ДЛЯ PROXMOX VPS: Добавьте следующие строки в Caddyfile хоста:"
+  echo ""
+  echo "# Matrix Synapse"
+  echo "$MATRIX_DOMAIN {"
+  echo "    reverse_proxy $LOCAL_IP:8008 {"
+  echo "        header_up X-Forwarded-For {remote_host}"
+  echo "        header_up X-Real-IP {remote_host}"  
+  echo "    }"
+  echo "}"
+  echo ""
+  echo "# Element Web"
+  echo "$ELEMENT_DOMAIN {"
+  echo "    reverse_proxy $LOCAL_IP:8080"
+  echo "}"
+  echo ""
+  echo "# Synapse Admin"
+  echo "$ADMIN_DOMAIN {"
+  echo "    reverse_proxy $LOCAL_IP:8081"
+  echo "}"
+  echo ""
+  echo "Затем перезапустите Caddy на хосте: systemctl reload caddy"
+  echo ""
+  echo "SYNAPSE ADMIN: Убедитесь, что Caddy на хосте проксирует:"
+  echo "- /_matrix и /_synapse/admin эндпоинты для работы админ-панели"
 fi
+
 echo ""
 echo "Registration Shared Secret: $REGISTRATION_SHARED_SECRET"
 echo "Turn Shared Secret: $TURN_SHARED_SECRET"
