@@ -419,3 +419,5 @@ FodyWeavers.xsd
 log.txt
 proxmox-output-example.txt
 proxmox-repair-example.txt
+doc-element-synapse.txt
+doc-element-web

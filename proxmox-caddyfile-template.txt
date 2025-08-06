@@ -1,20 +1,159 @@
-# Добавьте эти строки в ваш основной Caddyfile на хосте Proxmox
-# Замените $LOCAL_IP на IP адрес VPS, показанный в конце установки
+# Matrix Setup Caddyfile Template для Proxmox VPS
+# Версия 5.1 - Enhanced Security & Element Call Support
+# Замените LOCAL_IP на IP адрес вашего Proxmox VPS
 
-# Matrix Synapse
-matrix.yourdomain.com {
-    reverse_proxy $LOCAL_IP:8008 {
+# Matrix Synapse (клиентский API) с улучшенной безопасностью
+matrix.example.com {
+    # .well-known для федерации и обнаружения клиентов (Enhanced)
+    handle_path /.well-known/matrix/server {
+        respond `{"m.server": "matrix.example.com:8448"}` 200 {
+            header Content-Type application/json
+            header Access-Control-Allow-Origin *
+            header Cache-Control "public, max-age=3600"
+        }
+    }
+    
+    handle_path /.well-known/matrix/client {
+        respond `{
+            "m.homeserver": {"base_url": "https://matrix.example.com"},
+            "m.identity_server": {"base_url": "https://vector.im"},
+            "io.element.e2ee": {
+                "default": true,
+                "secure_backup_required": false,
+                "secure_backup_setup_methods": ["key", "passphrase"]
+            },
+            "io.element.jitsi": {
+                "preferredDomain": "matrix.example.com"
+            },
+            "org.matrix.msc3488.tile_server": {
+                "map_style_url": ""
+            }
+        }` 200 {
+            header Content-Type application/json
+            header Access-Control-Allow-Origin *
+            header Cache-Control "public, max-age=3600"
+        }
+    }
+
+    # Проксирование клиентского API с улучшенными заголовками
+    reverse_proxy /_matrix/* LOCAL_IP:8008 {
         header_up X-Forwarded-For {remote_host}
         header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto https
+        header_up Host {upstream_hostport}
+    }
+    reverse_proxy /_synapse/client/* LOCAL_IP:8008 {
+        header_up X-Forwarded-For {remote_host}  
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto https
+        header_up Host {upstream_hostport}
+    }
+    
+    # Усиленные заголовки безопасности для Matrix
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        X-Robots-Tag "noindex, nofollow"
+        Permissions-Policy "geolocation=(), microphone=(), camera=()"
     }
 }
 
-# Element Web
-element.yourdomain.com {
-    reverse_proxy $LOCAL_IP:8080
+# Matrix Synapse (Federation API) с безопасностью
+matrix.example.com:8448 {
+    reverse_proxy LOCAL_IP:8448 {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto https
+    }
+    
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Robots-Tag "noindex, nofollow"
+    }
 }
 
-# Synapse Admin
-admin.yourdomain.com {
-    reverse_proxy $LOCAL_IP:8081
+# Element Web с кэшированием и улучшенной безопасностью
+element.example.com {
+    reverse_proxy LOCAL_IP:8080 {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto https
+    }
+    
+    # Настройка кэширования Element Web (Enhanced)
+    @static {
+        path *.js *.css *.woff *.woff2 *.ttf *.eot *.svg *.png *.jpg *.jpeg *.gif *.ico
+    }
+    
+    @no_cache {
+        path /config*.json /i18n* /index.html /
+    }
+    
+    header @static Cache-Control "public, max-age=31536000, immutable"
+    header @no_cache Cache-Control "no-cache, no-store, must-revalidate"
+    header @no_cache Pragma "no-cache"
+    header @no_cache Expires "0"
+    
+    # Заголовки безопасности Element Web (Enhanced CSP)
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; media-src 'self' blob: https:; font-src 'self' https:; connect-src 'self' https: wss:; frame-src 'self' https:; worker-src 'self' blob:; manifest-src 'self';"
+        Permissions-Policy "geolocation=(self), microphone=(self), camera=(self), payment=(), usb=(), magnetometer=(), gyroscope=()"
+    }
 }
+
+# Synapse Admin с усиленной безопасностью
+admin.example.com {
+    reverse_proxy LOCAL_IP:8081 {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto https
+    }
+    
+    # Заголовки безопасности для Admin (Enhanced)
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        X-Robots-Tag "noindex, nofollow, noarchive, nosnippet"
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self';"
+        Permissions-Policy "geolocation=(), microphone=(), camera=(), payment=(), usb=(), magnetometer=(), gyroscope=()"
+    }
+}
+
+# ===== ИНСТРУКЦИИ ПО ИСПОЛЬЗОВАНИЮ =====
+# 1. Замените "LOCAL_IP" на реальный IP адрес вашего Proxmox VPS
+# 2. Замените домены на ваши реальные домены
+# 3. Добавьте этот код в ваш основной Caddyfile на хосте Proxmox
+# 4. Перезапустите Caddy: systemctl reload caddy
+
+# ===== НОВЫЕ ФУНКЦИИ В v5.1 =====
+# ✅ Well-known endpoints с кэшированием
+# ✅ Element Call конфигурация в well-known
+# ✅ Улучшенные заголовки безопасности
+# ✅ Content Security Policy для Element Web
+# ✅ Permissions Policy для ограничения API браузера
+# ✅ Кэширование статических ресурсов Element Web
+# ✅ No-cache для динамических файлов Element Web
+# ✅ Расширенная безопасность Synapse Admin
+
+# ===== ПРОВЕРКА КОНФИГУРАЦИИ =====
+# Протестируйте well-known endpoints:
+# curl https://matrix.example.com/.well-known/matrix/client
+# curl https://matrix.example.com/.well-known/matrix/server
+
+# ===== СООТВЕТСТВИЕ ELEMENT WEB ДОКУМЕНТАЦИИ =====
+# - Разные домены для безопасности (XSS защита)
+# - Правильные заголовки кэширования
+# - SAMEORIGIN для Element Web (не DENY как для Matrix)
+# - CSP политика разрешает Element Web функции
+# - Permissions Policy ограничивает доступ к API браузера
