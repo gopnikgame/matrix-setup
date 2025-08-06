@@ -1,8 +1,9 @@
 #!/bin/bash
 
-# Matrix Setup & Repair Tool v5.1
+# Matrix Setup & Repair Tool v5.2
 # Поддерживает Synapse 1.93.0+ с современными настройками безопасности
 # НОВОЕ: Element Call, расширенная конфигурация Element Web, улучшенная безопасность
+# ИСПРАВЛЕНО: Правильное управление Caddy для Proxmox и хостинг VPS
 
 # Проверка на root
 if [ "$(id -u)" -ne 0 ]; then
@@ -336,6 +337,143 @@ $admin_domain {
 EOL
 }
 
+# Функция для создания шаблона Caddyfile для Proxmox
+create_proxmox_caddyfile_template() {
+  local matrix_domain=$1
+  local element_domain=$2
+  local admin_domain=$3
+  local local_ip=$4
+  
+  cat > /root/proxmox-caddy-config/caddyfile-template.txt <<EOL
+# Matrix Setup Caddyfile Template для Proxmox VPS
+# Версия 5.1 - Enhanced Security & Element Call Support
+# IP адрес Proxmox VPS: $local_ip
+
+# Matrix Synapse (клиентский API)
+$matrix_domain {
+    # .well-known для федерации и обнаружения клиентов
+    handle_path /.well-known/matrix/server {
+        respond \`{"m.server": "$matrix_domain:8448"}\` 200 {
+            header Content-Type application/json
+            header Access-Control-Allow-Origin *
+            header Cache-Control "public, max-age=3600"
+        }
+    }
+    
+    handle_path /.well-known/matrix/client {
+        respond \`{
+            "m.homeserver": {"base_url": "https://$matrix_domain"},
+            "m.identity_server": {"base_url": "https://vector.im"},
+            "io.element.e2ee": {
+                "default": true,
+                "secure_backup_required": false,
+                "secure_backup_setup_methods": ["key", "passphrase"]
+            },
+            "io.element.jitsi": {
+                "preferredDomain": "$matrix_domain"
+            }
+        }\` 200 {
+            header Content-Type application/json
+            header Access-Control-Allow-Origin *
+            header Cache-Control "public, max-age=3600"
+        }
+    }
+
+    # Проксирование клиентского API
+    reverse_proxy /_matrix/* $local_ip:8008 {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto https
+    }
+    reverse_proxy /_synapse/client/* $local_ip:8008 {
+        header_up X-Forwarded-For {remote_host}  
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto https
+    }
+    
+    # Усиленные заголовки безопасности для Matrix
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        X-Robots-Tag "noindex, nofollow"
+        Permissions-Policy "geolocation=(), microphone=(), camera=()"
+    }
+}
+
+# Федерация (отдельный порт)
+$matrix_domain:8448 {
+    reverse_proxy $local_ip:8448 {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto https
+    }
+    
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Robots-Tag "noindex, nofollow"
+    }
+}
+
+# Element Web с кэшированием
+$element_domain {
+    reverse_proxy $local_ip:8080
+    
+    # Настройка кэширования Element Web
+    @static {
+        path *.js *.css *.woff *.woff2 *.ttf *.eot *.svg *.png *.jpg *.jpeg *.gif *.ico
+    }
+    
+    @no_cache {
+        path /config*.json /i18n* /index.html /
+    }
+    
+    header @static Cache-Control "public, max-age=31536000, immutable"
+    header @no_cache Cache-Control "no-cache, no-store, must-revalidate"
+    header @no_cache Pragma "no-cache"
+    header @no_cache Expires "0"
+    
+    # Заголовки безопасности Element Web
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; media-src 'self' blob: https:; font-src 'self' https:; connect-src 'self' https: wss:; frame-src 'self' https:; worker-src 'self' blob:; manifest-src 'self';"
+        Permissions-Policy "geolocation=(self), microphone=(self), camera=(self), payment=(), usb=(), magnetometer=(), gyroscope=()"
+    }
+}
+
+# Synapse Admin
+$admin_domain {
+    reverse_proxy $local_ip:8081
+    
+    # Заголовки безопасности для Admin
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        X-Robots-Tag "noindex, nofollow"
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self';"
+    }
+}
+
+# ===== ИНСТРУКЦИИ ПО ИСПОЛЬЗОВАНИЮ =====
+# 1. Скопируйте этот код в ваш основной Caddyfile на хосте Proxmox
+# 2. Перезапустите Caddy: systemctl reload caddy
+# 3. Проверьте статус: systemctl status caddy
+
+# ===== ПРОВЕРКА РАБОТЫ =====
+# curl https://$matrix_domain/.well-known/matrix/client
+# curl https://$matrix_domain/.well-known/matrix/server
+EOL
+}
+
 # Функция для исправления Matrix Synapse binding
 fix_matrix_binding() {
   local target_binding=$1
@@ -524,7 +662,7 @@ turn_shared_secret: "$turn_shared_secret"
 turn_user_lifetime: "1h"
 turn_allow_guests: true
 
-# ===== НАСТРОЙКИ МЕДИА =====
+# ===== НАСТРОЙКИ МЕДИЯ =====
 media_store_path: "/var/lib/matrix-synapse/media"
 enable_authenticated_media: true
 max_upload_size: "100M"
@@ -927,7 +1065,7 @@ EOL
 
   docker-compose up -d
 
-  # Установка Caddy только для хостинга с улучшенной конфигурацией
+  # Установка Caddy только для хостинга с улучшенной безопасностью
   if [ "$SERVER_TYPE" = "hosting" ]; then
     echo "Установка и настройка Caddy с улучшенной безопасностью..."
     systemctl stop nginx 2>/dev/null || true
@@ -943,6 +1081,17 @@ EOL
 
     systemctl enable caddy
     systemctl start caddy
+    
+    echo "✅ CADDY установлен и настроен для хостинг VPS"
+  else
+    echo "🔧 Создание шаблона Caddyfile для Proxmox VPS..."
+    
+    # Создаем шаблон Caddyfile для Proxmox
+    mkdir -p /root/proxmox-caddy-config
+    create_proxmox_caddyfile_template "$MATRIX_DOMAIN" "$ELEMENT_DOMAIN" "$ADMIN_DOMAIN" "$LOCAL_IP"
+    
+    echo "🔧 Шаблон Caddyfile создан: /root/proxmox-caddy-config/caddyfile-template.txt"
+    echo "📋 IP адрес VPS: $LOCAL_IP"
   fi
 
   # Настройка логротации
@@ -1015,8 +1164,14 @@ EOL
     echo "✅ CADDY: Автоматически получит SSL сертификаты Let's Encrypt"
     echo "Подождите несколько минут после запуска для получения сертификатов"
   elif [ "$SERVER_TYPE" = "proxmox" ]; then
-    echo "🔧 ДЛЯ PROXMOX VPS: Используйте шаблон из файла proxmox-caddyfile-template.txt"
-    echo "с улучшенными настройками безопасности и кэширования"
+    echo "🔧 ДЛЯ PROXMOX VPS:"
+    echo "Шаблон Caddyfile создан в: /root/proxmox-caddy-config/caddyfile-template.txt"
+    echo "Скопируйте содержимое шаблона в ваш основной Caddyfile на хосте Proxmox"
+    echo "Замените LOCAL_IP на: $LOCAL_IP"
+    echo "Затем перезапустите Caddy на хосте: systemctl reload caddy"
+    echo ""
+    echo "📋 БЫСТРАЯ КОМАНДА ДЛЯ КОПИРОВАНИЯ:"
+    echo "cat /root/proxmox-caddy-config/caddyfile-template.txt"
   fi
 
   echo ""
@@ -1399,7 +1554,7 @@ check_system_info() {
 show_help() {
   echo "Использование: $0 [опции]"
   echo ""
-  echo "Matrix Setup & Repair Tool v5.1"
+  echo "Matrix Setup & Repair Tool v5.2"
   echo "Поддерживает современные настройки безопасности Synapse 1.93.0+"
   echo ""
   echo "Опции:"
@@ -1413,19 +1568,14 @@ show_help() {
   echo "  -re, --restart-services       Перезагрузить все сервисы"
   echo "  -h, --help                   Показать эту справку"
   echo ""
-  echo "Новые возможности версии 5.1:"
-  echo "- Element Call готов к использованию"
-  echo "- Расширенная конфигурация Element Web"
-  echo "- Настройка VoIP и Jitsi"
-  echo "- Улучшенная Content Security Policy"
-  echo "- Оптимизированное кэширование"
-  echo ""
+  echo "Новые возможности версии 5.2:"
+  echo "- Исправления для Proxmox и хостинг VPS"
 }
 
 # Главное меню
 show_menu() {
   echo "========================================"
-  echo "    Matrix Setup & Repair Tool v5.1"
+  echo "    Matrix Setup & Repair Tool v5.2"
   echo "========================================"
   echo "1.  Полная установка Matrix системы"
   echo "2.  Исправить binding для Proxmox VPS"
@@ -1529,8 +1679,8 @@ while true; do
   
   case $choice in
     1) full_installation; break ;;
-    2) detect_server_type; fix_all_services "0.0.0.0" "$LOCAL_IP"; break ;;
-    3) detect_server_type; fix_all_services "127.0.0.1" "127.0.0.1"; break ;;
+    2) detect_server_type; fix_all_services "0.0.0.0" "$LOCAL_IP" "$SERVER_TYPE"; break ;;
+    3) detect_server_type; fix_all_services "127.0.0.1" "127.0.0.1" "$SERVER_TYPE"; break ;;
     4) detect_server_type; echo ""; check_matrix_binding; check_coturn_binding; check_docker_binding; echo ""; read -p "Нажмите Enter..."; ;;
     5) migrate_to_element_synapse; break ;;
     6) backup_configuration; break ;;
