@@ -10,7 +10,6 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # Глобальные переменные для конфигурации
-#SYNAPSE_VERSION="v1.119.0"
 SYNAPSE_VERSION="latest"
 ELEMENT_VERSION="v1.11.81"
 SYNAPSE_ADMIN_VERSION="0.10.3"
@@ -19,7 +18,7 @@ MATRIX_DOMAIN=""
 ELEMENT_DOMAIN=""
 ADMIN_DOMAIN=""
 BIND_ADDRESS=""
-DB_PASSWORD=$(openssl rand -hex 16)
+DB_PASSWORD=""  # Будет запрашиваться у пользователя
 REGISTRATION_SHARED_SECRET=$(openssl rand -hex 32)
 TURN_SECRET=$(openssl rand -hex 32)
 ADMIN_USER="admin"
@@ -286,7 +285,7 @@ EOL
   echo "✅ Расширенная конфигурация Synapse создана"
 }
 
-# Функция для создания Docker Compose конфигурации
+# Функция для создания Docker Compose конфигурации (исправленная)
 create_docker_compose() {
   local matrix_domain=$1
   local db_password=$2
@@ -297,9 +296,28 @@ create_docker_compose() {
   mkdir -p /opt/synapse-config
   
   cat > /opt/synapse-config/docker-compose.yml <<EOL
-version: '3.8'
-
 services:
+  # PostgreSQL база данных
+  postgres:
+    image: postgres:15-alpine
+    container_name: matrix-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=matrix
+      - POSTGRES_PASSWORD=$db_password
+      - POSTGRES_DB=matrix
+      - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - matrix-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U matrix"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    stop_grace_period: 30s
+
   # Matrix Synapse сервер
   synapse:
     image: matrixdotorg/synapse:$SYNAPSE_VERSION
@@ -326,26 +344,7 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
-
-  # PostgreSQL база данных
-  postgres:
-    image: postgres:15-alpine
-    container_name: matrix-postgres
-    restart: unless-stopped
-    environment:
-      - POSTGRES_USER=matrix
-      - POSTGRES_PASSWORD=$db_password
-      - POSTGRES_DB=matrix
-      - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    networks:
-      - matrix-network
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U matrix"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+    stop_grace_period: 30s
 
   # Element Web клиент
   element-web:
@@ -363,6 +362,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    stop_grace_period: 15s
 
   # Synapse Admin интерфейс
   synapse-admin:
@@ -382,8 +382,9 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    stop_grace_period: 15s
 
-  # Coturn TURN сервер
+  # Coturn TURN сервер (исправленная конфигурация)
   coturn:
     image: coturn/coturn:latest
     container_name: matrix-coturn
@@ -391,12 +392,17 @@ services:
     ports:
       - "3478:3478/udp"
       - "3478:3478/tcp"
+      - "5349:5349/udp"
+      - "5349:5349/tcp"
       - "49152-65535:49152-65535/udp"
     volumes:
-      - /opt/coturn/turnserver.conf:/etc/turnserver.conf:ro
+      - /opt/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
     networks:
       - matrix-network
-    command: ["-c", "/etc/turnserver.conf"]
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    depends_on:
+      - synapse
+    stop_grace_period: 10s
 
 volumes:
   postgres-data:
@@ -525,7 +531,7 @@ EOL
   echo "✅ Конфигурация Synapse Admin создана"
 }
 
-# Функция для создания конфигурации Coturn
+# Функция для создания конфигурации Coturn (исправленная)
 create_coturn_config() {
   local matrix_domain=$1
   local turn_secret=$2
@@ -537,8 +543,9 @@ create_coturn_config() {
   mkdir -p /opt/coturn
   
   cat > /opt/coturn/turnserver.conf <<EOL
-# Coturn TURN Server Configuration
+# Coturn TURN Server Configuration для Matrix
 listening-port=3478
+tls-listening-port=5349
 listening-ip=0.0.0.0
 relay-ip=$local_ip
 external-ip=$public_ip
@@ -552,7 +559,11 @@ use-auth-secret
 static-auth-secret=$turn_secret
 realm=$matrix_domain
 
-# Безопасность
+# Логирование
+verbose
+log-file=/var/log/turnserver.log
+
+# Безопасность - блокируем приватные IP
 denied-peer-ip=10.0.0.0-10.255.255.255
 denied-peer-ip=192.168.0.0-192.168.255.255
 denied-peer-ip=172.16.0.0-172.31.255.255
@@ -568,19 +579,20 @@ denied-peer-ip=198.51.100.0-198.51.100.255
 denied-peer-ip=203.0.113.0-203.0.113.255
 denied-peer-ip=240.0.0.0-255.255.255.255
 
-# Разрешаем локальную сеть для клиент->TURN->TURN->клиент
+# Разрешаем локальную сеть
 allowed-peer-ip=$local_ip
 
-# Ограничения
+# Ограничения пользователей
 no-multicast-peers
 no-cli
 no-loopback-peers
 user-quota=12
 total-quota=1200
 
-# Логирование
-verbose
-log-file=/var/log/turnserver.log
+# Оптимизация
+pidfile=/var/run/turnserver.pid
+proc-user=root
+proc-group=root
 EOL
 
   echo "✅ Конфигурация Coturn создана"
@@ -776,7 +788,7 @@ full_installation() {
     exit 1
   fi
   
-  # Запрос доменов
+  # Запрос доменов и конфигурации
   echo ""
   echo "=== Настройка доменов ==="
   read -p "Введите домен Matrix сервера (например, matrix.example.com): " MATRIX_DOMAIN
@@ -786,6 +798,26 @@ full_installation() {
   ADMIN_USER=${input_admin:-admin}
   
   echo ""
+  echo "=== Настройка базы данных ==="
+  while true; do
+    read -s -p "Введите пароль для базы данных PostgreSQL: " DB_PASSWORD
+    echo ""
+    read -s -p "Подтвердите пароль: " DB_PASSWORD_CONFIRM
+    echo ""
+    
+    if [ "$DB_PASSWORD" = "$DB_PASSWORD_CONFIRM" ]; then
+      if [ ${#DB_PASSWORD} -lt 8 ]; then
+        echo "❌ Пароль должен содержать минимум 8 символов"
+        continue
+      fi
+      echo "✅ Пароль принят"
+      break
+    else
+      echo "❌ Пароли не совпадают. Попробуйте снова."
+    fi
+  done
+  
+  echo ""
   echo "=== Конфигурация ==="
   echo "Matrix Domain: $MATRIX_DOMAIN"
   echo "Element Domain: $ELEMENT_DOMAIN"
@@ -793,6 +825,7 @@ full_installation() {
   echo "Admin User: $ADMIN_USER"
   echo "Server Type: $SERVER_TYPE"
   echo "Bind Address: $BIND_ADDRESS"
+  echo "DB Password: [СКРЫТ - ${#DB_PASSWORD} символов]"
   echo ""
   
   read -p "Продолжить установку? (y/N): " confirm
@@ -809,27 +842,69 @@ full_installation() {
   mkdir -p /opt/synapse-admin
   mkdir -p /opt/coturn
   
-  # Установка прав доступа
-  chown -R 991:991 /opt/synapse-data
-  
   # Создание конфигураций
   create_synapse_config "$MATRIX_DOMAIN" "$DB_PASSWORD" "$REGISTRATION_SHARED_SECRET" "$TURN_SECRET" "$ADMIN_USER"
-  create_docker_compose "$MATRIX_DOMAIN" "$DB_PASSWORD" "$BIND_ADDRESS"
   create_element_config "$MATRIX_DOMAIN" "$ADMIN_USER"
   create_synapse_admin_config "$MATRIX_DOMAIN"
   create_coturn_config "$MATRIX_DOMAIN" "$TURN_SECRET" "$PUBLIC_IP" "$LOCAL_IP"
   
-  # Запуск контейнеров
-  echo "Запуск Matrix сервисов..."
-  cd /opt/synapse-config
-  docker compose pull
-  docker compose up -d
+  # Генерация ключа подписи для Synapse
+  echo "Генерация ключа подписи..."
+  if [ ! -f "/opt/synapse-data/signing.key" ]; then
+    openssl genpkey -algorithm Ed25519 -out /opt/synapse-data/signing.key
+  fi
   
-  # Ожидание запуска сервисов
-  echo "Ожидание запуска сервисов..."
-  sleep 30
+  # Установка прав доступа
+  chown -R 991:991 /opt/synapse-data
+  
+  # Создание Docker Compose конфигурации
+  create_docker_compose "$MATRIX_DOMAIN" "$DB_PASSWORD" "$BIND_ADDRESS"
+  
+  # Запуск контейнеров поэтапно
+  echo "Запуск Matrix сервисов поэтапно..."
+  cd /opt/synapse-config
+  
+  echo "1. Скачивание образов..."
+  docker compose pull
+  
+  echo "2. Запуск PostgreSQL..."
+  docker compose up -d postgres
+  
+  echo "3. Ожидание готовности PostgreSQL..."
+  sleep 10
+  for i in {1..6}; do
+    if docker exec matrix-postgres pg_isready -U matrix >/dev/null 2>&1; then
+      echo "   PostgreSQL готов!"
+      break
+    else
+      echo "   Ожидание PostgreSQL... ($i/6)"
+      sleep 5
+    fi
+  done
+  
+  echo "4. Запуск Synapse..."
+  docker compose up -d synapse
+  
+  echo "5. Ожидание готовности Synapse..."
+  sleep 20
+  for i in {1..12}; do
+    if curl -s http://localhost:8008/health >/dev/null 2>&1; then
+      echo "   Synapse готов!"
+      break
+    else
+      echo "   Ожидание Synapse... ($i/12)"
+      sleep 10
+    fi
+  done
+  
+  echo "6. Запуск веб-интерфейсов..."
+  docker compose up -d element-web synapse-admin
+  
+  echo "7. Запуск Coturn..."
+  docker compose up -d coturn
   
   # Проверка статуса
+  echo ""
   echo "Проверка статуса контейнеров..."
   docker compose ps
   
@@ -849,7 +924,7 @@ full_installation() {
   echo ""
   echo "🔐 Данные для конфигурации:"
   echo "  Admin User: $ADMIN_USER"
-  echo "  DB Password: $DB_PASSWORD"
+  echo "  DB Password: [СКРЫТ] (${#DB_PASSWORD} символов)"
   echo "  Registration Secret: $REGISTRATION_SHARED_SECRET"
   echo "  TURN Secret: $TURN_SECRET"
   echo ""
@@ -863,6 +938,8 @@ full_installation() {
   echo "  docker compose logs        # Логи"
   echo "  docker compose restart     # Перезапуск"
   echo "  docker compose pull && docker compose up -d  # Обновление"
+  echo ""
+  echo "⚠️  ВАЖНО: Дождитесь полной загрузки всех контейнеров (~2-3 минуты)"
   echo ""
   if [ "$SERVER_TYPE" = "proxmox" ]; then
     echo "🌐 Для Proxmox VPS добавьте в Caddyfile хоста:"
@@ -974,29 +1051,42 @@ manage_docker() {
   echo "=== Управление Docker контейнерами ==="
   echo ""
   echo "1. Статус контейнеров"
-  echo "2. Остановить все"
+  echo "2. Остановить все (с таймаутом)"
   echo "3. Запустить все"
   echo "4. Перезапустить все"
-  echo "5. Удалить все контейнеры"
-  echo "6. Назад"
+  echo "5. Принудительно остановить все"
+  echo "6. Удалить все контейнеры"
+  echo "7. Назад"
   echo ""
-  read -p "Выберите действие (1-6): " docker_choice
+  read -p "Выберите действие (1-7): " docker_choice
   
   cd /opt/synapse-config 2>/dev/null || { echo "❌ Конфигурация не найдена"; return 1; }
   
   case $docker_choice in
     1) docker compose ps ;;
-    2) docker compose stop ;;
+    2) 
+      echo "Остановка контейнеров с таймаутом 30 секунд..."
+      timeout 60 docker compose stop || {
+        echo "⚠️  Таймаут остановки, используйте принудительную остановку (опция 5)"
+      }
+      ;;
     3) docker compose up -d ;;
     4) docker compose restart ;;
-    5) 
+    5)
+      echo "Принудительная остановка контейнеров..."
+      docker stop matrix-synapse matrix-postgres matrix-element-web matrix-synapse-admin matrix-coturn 2>/dev/null || true
+      echo "✅ Принудительная остановка завершена"
+      ;;
+    6) 
       read -p "❗ Это удалит ВСЕ контейнеры Matrix! Продолжить? (y/N): " confirm
       if [[ $confirm == [yY] ]]; then
-        docker compose down
+        echo "Остановка и удаление контейнеров..."
+        timeout 60 docker compose down || docker stop matrix-synapse matrix-postgres matrix-element-web matrix-synapse-admin matrix-coturn 2>/dev/null
+        docker compose down --remove-orphans
         echo "✅ Контейнеры удалены"
       fi
       ;;
-    6) return 0 ;;
+    7) return 0 ;;
     *) echo "Неверный выбор" ;;
   esac
   
