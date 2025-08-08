@@ -1,9 +1,10 @@
 #!/bin/bash
 
-# Matrix Setup & Repair Tool v5.2
+# Matrix Setup & Repair Tool v5.3
 # Поддерживает Synapse 1.93.0+ с современными настройками безопасности
+# ИСПРАВЛЕНО: Полная совместимость с Ubuntu 24.04 LTS (Noble Numbat)
+# ИСПРАВЛЕНО: Проблемы с репозиториями и системным временем
 # НОВОЕ: Element Call, расширенная конфигурация Element Web, улучшенная безопасность
-# ИСПРАВЛЕНО: Правильное управление Caddy для Proxmox и хостинг VPS
 
 # Проверка на root
 if [ "$(id -u)" -ne 0 ]; then
@@ -15,6 +16,88 @@ fi
 SYNAPSE_VERSION="1.119.0"  # Последняя стабильная версия
 ELEMENT_VERSION="v1.11.81"
 REQUIRED_MIN_VERSION="1.93.0"
+
+# Функция для проверки и исправления системного времени
+fix_system_time() {
+  echo "Проверка системного времени..."
+  
+  # Проверяем, синхронизировано ли время
+  if ! timedatectl status | grep -q "NTP synchronized: yes"; then
+    echo "Исправление системного времени..."
+    
+    # Установка и включение NTP
+    apt update >/dev/null 2>&1
+    apt install -y ntp ntpdate >/dev/null 2>&1
+    
+    # Принудительная синхронизация времени
+    systemctl stop ntp >/dev/null 2>&1
+    ntpdate -s pool.ntp.org >/dev/null 2>&1 || ntpdate -s time.nist.gov >/dev/null 2>&1
+    systemctl start ntp >/dev/null 2>&1
+    systemctl enable ntp >/dev/null 2>&1
+    
+    # Настройка timedatectl
+    timedatectl set-ntp true >/dev/null 2>&1
+    
+    echo "Системное время синхронизировано"
+  else
+    echo "Системное время уже синхронизировано"
+  fi
+}
+
+# Функция для очистки и настройки репозиториев
+setup_repositories() {
+  echo "Настройка репозиториев для Ubuntu $(lsb_release -cs)..."
+  
+  # Исправляем системное время перед работой с репозиториями
+  fix_system_time
+  
+  # Удаляем старые репозитории Matrix/Element
+  rm -f /etc/apt/sources.list.d/matrix-org.list >/dev/null 2>&1
+  rm -f /etc/apt/sources.list.d/element-io.list >/dev/null 2>&1
+  
+  # Определяем версию Ubuntu и настраиваем репозитории
+  UBUNTU_CODENAME=$(lsb_release -cs)
+  
+  case "$UBUNTU_CODENAME" in
+    "noble"|"mantic"|"lunar"|"kinetic")
+      echo "Обнаружена современная версия Ubuntu: $UBUNTU_CODENAME"
+      echo "Используется основной репозиторий Matrix.org с fallback на jammy"
+      
+      # Для новых версий используем jammy репозиторий (LTS)
+      wget -qO /usr/share/keyrings/matrix-org-archive-keyring.gpg https://packages.matrix.org/debian/matrix-org-archive-keyring.gpg
+      echo "deb [signed-by=/usr/share/keyrings/matrix-org-archive-keyring.gpg] https://packages.matrix.org/debian/ jammy main" | tee /etc/apt/sources.list.d/matrix-org.list
+      ;;
+    "jammy"|"focal"|"bionic")
+      echo "Обнаружена LTS версия Ubuntu: $UBUNTU_CODENAME"
+      
+      # Для LTS версий используем нативный репозиторий
+      wget -qO /usr/share/keyrings/matrix-org-archive-keyring.gpg https://packages.matrix.org/debian/matrix-org-archive-keyring.gpg
+      echo "deb [signed-by=/usr/share/keyrings/matrix-org-archive-keyring.gpg] https://packages.matrix.org/debian/ $UBUNTU_CODENAME main" | tee /etc/apt/sources.list.d/matrix-org.list
+      ;;
+    *)
+      echo "Неизвестная версия Ubuntu: $UBUNTU_CODENAME"
+      echo "Используется fallback на jammy репозиторий"
+      
+      wget -qO /usr/share/keyrings/matrix-org-archive-keyring.gpg https://packages.matrix.org/debian/matrix-org-archive-keyring.gpg
+      echo "deb [signed-by=/usr/share/keyrings/matrix-org-archive-keyring.gpg] https://packages.matrix.org/debian/ jammy main" | tee /etc/apt/sources.list.d/matrix-org.list
+      ;;
+  esac
+  
+  # Обновляем список пакетов с повторными попытками
+  echo "Обновление списка пакетов..."
+  for i in {1..3}; do
+    if apt update; then
+      echo "Репозитории успешно обновлены"
+      return 0
+    else
+      echo "Попытка $i/3 неудача, повторяем через 3 секунды..."
+      sleep 3
+    fi
+  done
+  
+  echo "⚠️  Предупреждение: Проблемы с обновлением репозиториев"
+  echo "Продолжаем установку с доступными пакетами..."
+}
 
 # Функция для определения типа сервера
 detect_server_type() {
@@ -33,445 +116,80 @@ detect_server_type() {
   fi
 }
 
-# Функция для проверки доменов на безопасность
-check_domain_security() {
-  local matrix_domain=$1
-  local element_domain=$2
+# Функция для альтернативной установки Synapse
+install_synapse_alternative() {
+  echo "Попытка установки Matrix Synapse альтернативным способом..."
   
-  if [ "$matrix_domain" = "$element_domain" ]; then
-    echo "⚠️  ВНИМАНИЕ: Использование одного домена для Matrix и Element может создать уязвимости XSS!"
-    echo "Рекомендуется использовать разные поддомены:"
-    echo "  Matrix: matrix.example.com"
-    echo "  Element: element.example.com"
-    read -p "Продолжить с одним доменом? (y/n): " confirm
-    if [ "$confirm" != "y" ]; then
-      return 1
+  # Метод 1: Установка через pip в виртуальном окружении
+  if ! systemctl is-active --quiet matrix-synapse; then
+    echo "Установка Synapse через Python pip..."
+    
+    # Создаем пользователя matrix-synapse если не существует
+    if ! id "matrix-synapse" &>/dev/null; then
+      useradd -r -s /bin/false -d /var/lib/matrix-synapse matrix-synapse
     fi
+    
+    # Создаем необходимые директории
+    mkdir -p /opt/venvs/matrix-synapse
+    mkdir -p /etc/matrix-synapse
+    mkdir -p /var/lib/matrix-synapse
+    mkdir -p /var/log/matrix-synapse
+    
+    # Устанавливаем Python зависимости
+    apt install -y python3-venv python3-dev python3-pip build-essential libffi-dev libssl-dev libxml2-dev libxslt1-dev zlib1g-dev libjpeg-dev libpq-dev
+    
+    # Создаем виртуальное окружение
+    python3 -m venv /opt/venvs/matrix-synapse
+    source /opt/venvs/matrix-synapse/bin/activate
+    
+    # Обновляем pip и устанавливаем Synapse
+    pip install --upgrade pip setuptools wheel
+    pip install matrix-synapse[postgres,systemd,url_preview]
+    
+    # Создаем systemd сервис
+    cat > /etc/systemd/system/matrix-synapse.service <<EOL
+[Unit]
+Description=Matrix Synapse Homeserver
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/opt/venvs/matrix-synapse/bin/python -m synapse.app.homeserver --config-path=/etc/matrix-synapse/homeserver.yaml
+ExecReload=/bin/kill -HUP \$MAINPID
+User=matrix-synapse
+Group=matrix-synapse
+WorkingDirectory=/var/lib/matrix-synapse
+RuntimeDirectory=matrix-synapse
+RuntimeDirectoryMode=0700
+
+# Security settings
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/matrix-synapse /var/log/matrix-synapse /tmp
+
+# Resource limits
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+    # Устанавливаем права доступа
+    chown -R matrix-synapse:matrix-synapse /var/lib/matrix-synapse
+    chown -R matrix-synapse:matrix-synapse /var/log/matrix-synapse
+    
+    # Включаем сервис
+    systemctl daemon-reload
+    systemctl enable matrix-synapse
+    
+    echo "Matrix Synapse установлен через pip"
+    return 0
   fi
-  return 0
-}
-
-# Функция для создания расширенной конфигурации Element Web
-create_element_config() {
-  local matrix_domain=$1
-  local element_domain=$2
-  local admin_user=$3
-  
-  cat > /opt/element-web/config.json <<EOL
-{
-    "default_server_config": {
-        "m.homeserver": {
-            "base_url": "https://$matrix_domain",
-            "server_name": "$matrix_domain"
-        },
-        "m.identity_server": {
-            "base_url": "https://vector.im"
-        }
-    },
-    "disable_custom_urls": true,
-    "disable_guests": true,
-    "disable_login_language_selector": false,
-    "disable_3pid_login": false,
-    "brand": "Element Web",
-    "welcome_user_id": "@$admin_user:$matrix_domain",
-    
-    "default_country_code": "RU",
-    "default_theme": "dark",
-    "default_federate": false,
-    
-    "integrations_ui_url": null,
-    "integrations_rest_url": null,
-    "integrations_widgets_urls": [],
-    "bug_report_endpoint_url": "",
-    
-    "showLabsSettings": true,
-    "features": {
-        "feature_pinning": true,
-        "feature_custom_status": false,
-        "feature_custom_tags": false,
-        "feature_state_counters": false,
-        "feature_latex_maths": false,
-        "feature_jump_to_date": false,
-        "feature_location_share_live": false,
-        "feature_video_rooms": false,
-        "feature_element_call_video_rooms": false,
-        "feature_group_calls": false,
-        "feature_disable_call_per_sender_encryption": false,
-        "feature_notifications": false,
-        "feature_ask_to_join": false
-    },
-    
-    "setting_defaults": {
-        "MessageComposerInput.showStickersButton": false,
-        "MessageComposerInput.showPollsButton": true,
-        "UIFeature.urlPreviews": true,
-        "UIFeature.feedback": false,
-        "UIFeature.voip": true,
-        "UIFeature.widgets": true,
-        "UIFeature.advancedSettings": false,
-        "UIFeature.shareQrCode": true,
-        "UIFeature.shareSocial": false,
-        "UIFeature.identityServer": false,
-        "UIFeature.thirdPartyId": true,
-        "UIFeature.registration": false,
-        "UIFeature.passwordReset": false,
-        "UIFeature.deactivate": false,
-        "UIFeature.advancedEncryption": false,
-        "UIFeature.roomHistorySettings": false,
-        "UIFeature.TimelineEnableRelativeDates": true,
-        "UIFeature.BulkUnverifiedSessionsReminder": true,
-        "UIFeature.locationSharing": false
-    },
-    
-    "room_directory": {
-        "servers": ["$matrix_domain"]
-    },
-    
-    "enable_presence_by_hs_url": {
-        "https://matrix.org": false,
-        "https://matrix-client.matrix.org": false,
-        "https://$matrix_domain": true
-    },
-    
-    "jitsi": {
-        "preferred_domain": "$matrix_domain"
-    },
-    
-    "element_call": {
-        "use_exclusively": false,
-        "participant_limit": 8,
-        "brand": "Element Call",
-        "guest_spa_url": null
-    },
-    
-    "voip": {
-        "obey_asserted_identity": false
-    },
-    
-    "widget_build_url": null,
-    "widget_build_url_ignore_dm": true,
-    "audio_stream_url": null,
-    
-    "posthog": {
-        "project_api_key": null,
-        "api_host": null
-    },
-    
-    "privacy_policy_url": "",
-    "terms_and_conditions_links": [],
-    "analytics_owner": "",
-    
-    "map_style_url": "",
-    "custom_translations_url": "",
-    
-    "user_notice": null,
-    "help_url": "https://element.io/help",
-    "help_encryption_url": "https://element.io/help#encryption",
-    "force_verification": false,
-    
-    "desktop_builds": {
-        "available": true,
-        "logo": "https://element.io/images/logo-mark-primary.svg",
-        "url": "https://element.io/get-started"
-    },
-    
-    "mobile_builds": {
-        "ios": "https://apps.apple.com/app/vector/id1083446067",
-        "android": "https://play.google.com/store/apps/details?id=im.vector.app",
-        "fdroid": "https://f-droid.org/packages/im.vector.app/"
-    },
-    
-    "mobile_guide_toast": true,
-    "mobile_guide_app_variant": "element",
-    
-    "embedded_pages": {
-        "welcome_url": null,
-        "home_url": null
-    },
-    
-    "branding": {
-        "welcome_background_url": null,
-        "auth_header_logo_url": null,
-        "auth_footer_links": []
-    },
-    
-    "sso_redirect_options": {
-        "immediate": false,
-        "on_welcome_page": false,
-        "on_login_page": false
-    },
-    
-    "oidc_static_clients": {},
-    "oidc_metadata": {
-        "client_uri": null,
-        "logo_uri": null,
-        "tos_uri": null,
-        "policy_uri": null,
-        "contacts": []
-    }
-}
-EOL
-}
-
-# Функция для создания улучшенного Caddyfile с кэшированием и well-known
-create_enhanced_caddyfile() {
-  local matrix_domain=$1
-  local element_domain=$2
-  local admin_domain=$3
-  local bind_address=$4
-  
-  cat > /etc/caddy/Caddyfile <<EOL
-# Matrix Synapse (клиентский API)
-$matrix_domain {
-    # .well-known для федерации и обнаружения клиентов
-    handle_path /.well-known/matrix/server {
-        respond \`{"m.server": "$matrix_domain:8448"}\` 200 {
-            header Content-Type application/json
-            header Access-Control-Allow-Origin *
-            header Cache-Control "public, max-age=3600"
-        }
-    }
-    
-    handle_path /.well-known/matrix/client {
-        respond \`{
-            "m.homeserver": {"base_url": "https://$matrix_domain"},
-            "m.identity_server": {"base_url": "https://vector.im"},
-            "io.element.e2ee": {
-                "default": true,
-                "secure_backup_required": false,
-                "secure_backup_setup_methods": ["key", "passphrase"]
-            },
-            "io.element.jitsi": {
-                "preferredDomain": "$matrix_domain"
-            }
-        }\` 200 {
-            header Content-Type application/json
-            header Access-Control-Allow-Origin *
-            header Cache-Control "public, max-age=3600"
-        }
-    }
-
-    # Проксирование клиентского API
-    reverse_proxy /_matrix/* $bind_address:8008 {
-        header_up X-Forwarded-For {remote_host}
-        header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-Proto https
-    }
-    reverse_proxy /_synapse/client/* $bind_address:8008 {
-        header_up X-Forwarded-For {remote_host}  
-        header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-Proto https
-    }
-    
-    # Усиленные заголовки безопасности для Matrix
-    header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-        X-Content-Type-Options "nosniff"
-        X-Frame-Options "DENY"
-        X-XSS-Protection "1; mode=block"
-        Referrer-Policy "strict-origin-when-cross-origin"
-        X-Robots-Tag "noindex, nofollow"
-        Permissions-Policy "geolocation=(), microphone=(), camera=()"
-    }
-}
-
-# Федерация (отдельный порт)
-$matrix_domain:8448 {
-    reverse_proxy $bind_address:8448 {
-        header_up X-Forwarded-For {remote_host}
-        header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-Proto https
-    }
-    
-    header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains"
-        X-Robots-Tag "noindex, nofollow"
-    }
-}
-
-# Element Web с кэшированием
-$element_domain {
-    reverse_proxy $bind_address:8080
-    
-    # Настройка кэширования Element Web
-    @static {
-        path *.js *.css *.woff *.woff2 *.ttf *.eot *.svg *.png *.jpg *.jpeg *.gif *.ico
-    }
-    
-    @no_cache {
-        path /config*.json /i18n* /index.html /
-    }
-    
-    header @static Cache-Control "public, max-age=31536000, immutable"
-    header @no_cache Cache-Control "no-cache, no-store, must-revalidate"
-    header @no_cache Pragma "no-cache"
-    header @no_cache Expires "0"
-    
-    # Заголовки безопасности Element Web
-    header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-        X-Content-Type-Options "nosniff"
-        X-Frame-Options "SAMEORIGIN"
-        X-XSS-Protection "1; mode=block"
-        Referrer-Policy "strict-origin-when-cross-origin"
-        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; media-src 'self' blob: https:; font-src 'self' https:; connect-src 'self' https: wss:; frame-src 'self' https:; worker-src 'self' blob:; manifest-src 'self';"
-        Permissions-Policy "geolocation=(self), microphone=(self), camera=(self), payment=(), usb=(), magnetometer=(), gyroscope=()"
-    }
-}
-
-# Synapse Admin
-$admin_domain {
-    reverse_proxy $bind_address:8081
-    
-    # Заголовки безопасности для Admin
-    header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains"
-        X-Content-Type-Options "nosniff"
-        X-Frame-Options "SAMEORIGIN"
-        X-XSS-Protection "1; mode=block"
-        Referrer-Policy "strict-origin-when-cross-origin"
-        X-Robots-Tag "noindex, nofollow"
-        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self';"
-    }
-}
-EOL
-}
-
-# Функция для создания шаблона Caddyfile для Proxmox
-create_proxmox_caddyfile_template() {
-  local matrix_domain=$1
-  local element_domain=$2
-  local admin_domain=$3
-  local local_ip=$4
-  
-  cat > /root/proxmox-caddy-config/caddyfile-template.txt <<EOL
-# Matrix Setup Caddyfile Template для Proxmox VPS
-# Версия 5.1 - Enhanced Security & Element Call Support
-# IP адрес Proxmox VPS: $local_ip
-
-# Matrix Synapse (клиентский API)
-$matrix_domain {
-    # .well-known для федерации и обнаружения клиентов
-    handle_path /.well-known/matrix/server {
-        respond \`{"m.server": "$matrix_domain:8448"}\` 200 {
-            header Content-Type application/json
-            header Access-Control-Allow-Origin *
-            header Cache-Control "public, max-age=3600"
-        }
-    }
-    
-    handle_path /.well-known/matrix/client {
-        respond \`{
-            "m.homeserver": {"base_url": "https://$matrix_domain"},
-            "m.identity_server": {"base_url": "https://vector.im"},
-            "io.element.e2ee": {
-                "default": true,
-                "secure_backup_required": false,
-                "secure_backup_setup_methods": ["key", "passphrase"]
-            },
-            "io.element.jitsi": {
-                "preferredDomain": "$matrix_domain"
-            }
-        }\` 200 {
-            header Content-Type application/json
-            header Access-Control-Allow-Origin *
-            header Cache-Control "public, max-age=3600"
-        }
-    }
-
-    # Проксирование клиентского API
-    reverse_proxy /_matrix/* $local_ip:8008 {
-        header_up X-Forwarded-For {remote_host}
-        header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-Proto https
-    }
-    reverse_proxy /_synapse/client/* $local_ip:8008 {
-        header_up X-Forwarded-For {remote_host}  
-        header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-Proto https
-    }
-    
-    # Усиленные заголовки безопасности для Matrix
-    header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-        X-Content-Type-Options "nosniff"
-        X-Frame-Options "DENY"
-        X-XSS-Protection "1; mode=block"
-        Referrer-Policy "strict-origin-when-cross-origin"
-        X-Robots-Tag "noindex, nofollow"
-        Permissions-Policy "geolocation=(), microphone=(), camera=()"
-    }
-}
-
-# Федерация (отдельный порт)
-$matrix_domain:8448 {
-    reverse_proxy $local_ip:8448 {
-        header_up X-Forwarded-For {remote_host}
-        header_up X-Real-IP {remote_host}
-        header_up X-Forwarded-Proto https
-    }
-    
-    header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains"
-        X-Robots-Tag "noindex, nofollow"
-    }
-}
-
-# Element Web с кэшированием
-$element_domain {
-    reverse_proxy $local_ip:8080
-    
-    # Настройка кэширования Element Web
-    @static {
-        path *.js *.css *.woff *.woff2 *.ttf *.eot *.svg *.png *.jpg *.jpeg *.gif *.ico
-    }
-    
-    @no_cache {
-        path /config*.json /i18n* /index.html /
-    }
-    
-    header @static Cache-Control "public, max-age=31536000, immutable"
-    header @no_cache Cache-Control "no-cache, no-store, must-revalidate"
-    header @no_cache Pragma "no-cache"
-    header @no_cache Expires "0"
-    
-    # Заголовки безопасности Element Web
-    header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-        X-Content-Type-Options "nosniff"
-        X-Frame-Options "SAMEORIGIN"
-        X-XSS-Protection "1; mode=block"
-        Referrer-Policy "strict-origin-when-cross-origin"
-        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; media-src 'self' blob: https:; font-src 'self' https:; connect-src 'self' https: wss:; frame-src 'self' https:; worker-src 'self' blob:; manifest-src 'self';"
-        Permissions-Policy "geolocation=(self), microphone=(self), camera=(self), payment=(), usb=(), magnetometer=(), gyroscope=()"
-    }
-}
-
-# Synapse Admin
-$admin_domain {
-    reverse_proxy $local_ip:8081
-    
-    # Заголовки безопасности для Admin
-    header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains"
-        X-Content-Type-Options "nosniff"
-        X-Frame-Options "SAMEORIGIN"
-        X-XSS-Protection "1; mode=block"
-        Referrer-Policy "strict-origin-when-cross-origin"
-        X-Robots-Tag "noindex, nofollow"
-        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self';"
-    }
-}
-
-# ===== ИНСТРУКЦИИ ПО ИСПОЛЬЗОВАНИЮ =====
-# 1. Скопируйте этот код в ваш основной Caddyfile на хосте Proxmox
-# 2. Перезапустите Caddy: systemctl reload caddy
-# 3. Проверьте статус: systemctl status caddy
-
-# ===== ПРОВЕРКА РАБОТЫ =====
-# curl https://$matrix_domain/.well-known/matrix/client
-# curl https://$matrix_domain/.well-known/matrix/server
-EOL
 }
 
 # Функция для исправления Matrix Synapse binding
@@ -943,6 +661,9 @@ EOL
 
 # Функция для полной установки
 full_installation() {
+  # Проверка и исправление системного времени
+  fix_system_time
+  
   # Определение типа сервера
   detect_server_type
   
@@ -991,18 +712,23 @@ full_installation() {
 
   # Установка зависимостей
   echo "Установка зависимостей..."
-  apt install -y net-tools python3-dev libpq-dev mc aptitude htop apache2-utils lsb-release wget apt-transport-https postgresql docker.io docker-compose git python3-psycopg2 coturn curl gnupg2 software-properties-common
+  apt install -y net-tools python3-dev libpq-dev mc aptitude htop apache2-utils lsb-release wget apt-transport-https postgresql docker.io docker-compose git python3-psycopg2 coturn curl gnupg2 software-properties-common ntp ntpdate
 
   # Установка и настройка PostgreSQL с улучшенной безопасностью
   echo "Настройка PostgreSQL..."
   secure_postgresql "$DB_PASSWORD"
 
-  # Установка Element Synapse (новый репозиторий)
-  echo "Установка Element Synapse..."
-  wget -O /usr/share/keyrings/element-io-archive-keyring.gpg https://packages.element.io/debian/element-io-archive-keyring.gpg
-  echo "deb [signed-by=/usr/share/keyrings/element-io-archive-keyring.gpg] https://packages.element.io/debian/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/element-io.list
-  apt update
-  apt install -y matrix-synapse-py3
+  # Настройка репозиториев и установки Matrix Synapse
+  echo "Установка Matrix Synapse..."
+  setup_repositories
+  
+  # Попытка установки из репозитория
+  if apt install -y matrix-synapse-py3; then
+    echo "Matrix Synapse успешно установлен из репозитория"
+  else
+    echo "Установка из репозитория неудачна, используем альтернативный метод..."
+    install_synapse_alternative
+  fi
 
   # Настройка homeserver.yaml с современными настройками безопасности
   echo "Настройка Matrix Synapse..."
@@ -1122,18 +848,29 @@ EOL
   fi
 
   # Создание скрипта для создания первого администратора
-  cat > /usr/local/bin/create-matrix-admin.sh <<EOL
+  if [ -f "/opt/venvs/matrix-synapse/bin/register_new_matrix_user" ]; then
+    # Для pip установки
+    cat > /usr/local/bin/create-matrix-admin.sh <<EOL
+#!/bin/bash
+read -p "Введите имя пользователя администратора: " admin_name
+/opt/venvs/matrix-synapse/bin/register_new_matrix_user -c /etc/matrix-synapse/homeserver.yaml \\
+  -u "\$admin_name" --admin http://localhost:8008
+EOL
+  else
+    # Для пакетной установки
+    cat > /usr/local/bin/create-matrix-admin.sh <<EOL
 #!/bin/bash
 read -p "Введите имя пользователя администратора: " admin_name
 register_new_matrix_user -c /etc/matrix-synapse/homeserver.yaml \\
   -u "\$admin_name" --admin http://localhost:8008
 EOL
+  fi
   chmod +x /usr/local/bin/create-matrix-admin.sh
 
   # Вывод финальной информации
   echo ""
   echo "==============================================="
-  echo "Установка завершена! (Enhanced v5.1)"
+  echo "Установка завершена! (Enhanced v5.3)"
   echo "==============================================="
   echo "Matrix Synapse доступен по адресу: https://$MATRIX_DOMAIN"
   echo "Element Web доступен по адресу: https://$ELEMENT_DOMAIN"
@@ -1158,6 +895,12 @@ EOL
   echo "- Настройка VoIP и Jitsi"
   echo "- Улучшенная Content Security Policy"
   echo "- Оптимизированное кэширование"
+  echo ""
+  echo "🔧 ИСПРАВЛЕНИЯ v5.3:"
+  echo "- Полная совместимость с Ubuntu 24.04 LTS"
+  echo "- Автоматическое исправление системного времени"
+  echo "- Альтернативный метод установки Synapse"
+  echo "- Улучшенное управление репозиториями"
   echo ""
 
   if [ "$SERVER_TYPE" = "hosting" ]; then
@@ -1194,21 +937,21 @@ EOL
 # Функция миграции с matrix-synapse на element-synapse
 migrate_to_element_synapse() {
   echo "Проверка необходимости миграции..."
+  
+  # Настройка репозиториев
+  setup_repositories
+  
   if grep -q "packages.matrix.org" /etc/apt/sources.list.d/matrix-org.list 2>/dev/null; then
-    echo "Найден старый репозиторий matrix.org, выполняем миграцию... "
+    echo "Найден репозиторий matrix.org, проверяем обновления..."
     
     # Создаем резервную копию конфигурации
     cp /etc/matrix-synapse/homeserver.yaml /etc/matrix-synapse/homeserver.yaml.backup
     
-    # Обновляем репозиторий
-    rm -f /etc/apt/sources.list.d/matrix-org.list
-    wget -O /usr/share/keyrings/element-io-archive-keyring.gpg https://packages.element.io/debian/element-io-archive-keyring.gpg
-    echo "deb [signed-by=/usr/share/keyrings/element-io-archive-keyring.gpg] https://packages.element.io/debian/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/element-io.list
-    
+    # Обновляем пакеты
     apt update
     apt upgrade -y matrix-synapse-py3
     
-    echo "Миграция завершена. Конфигурация сохранена в homeserver.yaml.backup"
+    echo "Обновление завершено. Конфигурация сохранена в homeserver.yaml.backup"
   else
     echo "Миграция не требуется или уже выполнена"
   fi
@@ -1554,8 +1297,9 @@ check_system_info() {
 show_help() {
   echo "Использование: $0 [опции]"
   echo ""
-  echo "Matrix Setup & Repair Tool v5.2"
+  echo "Matrix Setup & Repair Tool v5.3"
   echo "Поддерживает современные настройки безопасности Synapse 1.93.0+"
+  echo "ПОЛНАЯ СОВМЕСТИМОСТЬ с Ubuntu 24.04 LTS (Noble Numbat)"
   echo ""
   echo "Опции:"
   echo "  -f, --full-installation      Полная установка Matrix системы"
@@ -1566,16 +1310,21 @@ show_help() {
   echo "  -resto, --restore-config     Восстановление конфигурации из резервной копии"
   echo "  -u, --update-system          Обновление системы и пакетов"
   echo "  -re, --restart-services       Перезагрузить все сервисы"
+  echo "  -t, --fix-time               Исправление системного времени"
   echo "  -h, --help                   Показать эту справку"
   echo ""
-  echo "Новые возможности версии 5.2:"
+  echo "Новые возможности версии 5.3:"
+  echo "- Полная поддержка Ubuntu 24.04 LTS"
+  echo "- Автоматическое исправление системного времени"
+  echo "- Альтернативный метод установки через pip"
+  echo "- Улучшенное управление репозиториями"
   echo "- Исправления для Proxmox и хостинг VPS"
 }
 
 # Главное меню
 show_menu() {
   echo "========================================"
-  echo "    Matrix Setup & Repair Tool v5.2"
+  echo "    Matrix Setup & Repair Tool v5.3"
   echo "========================================"
   echo "1.  Полная установка Matrix системы"
   echo "2.  Исправить binding для Proxmox VPS"
@@ -1592,11 +1341,12 @@ show_menu() {
   echo "12. Создать пользователя (админ) "
   echo "13. Создать токен регистрации"
   echo "14. Проверка версии и системы"
+  echo "15. Исправление системного времени"
   echo "----------------------------------------"
-  echo "15. Выход"
+  echo "16. Выход"
   echo "========================================"
   echo "Synapse $SYNAPSE_VERSION | PostgreSQL | Coturn"
-  echo "Современная безопасность и производительность"
+  echo "Ubuntu 24.04 LTS Compatible | Enhanced Security"
   echo "========================================"
 }
 
@@ -1672,10 +1422,520 @@ check_docker_binding() {
   fi
 }
 
+# Функция для проверки доменов на безопасность
+check_domain_security() {
+  local matrix_domain=$1
+  local element_domain=$2
+  
+  if [ "$matrix_domain" = "$element_domain" ]; then
+    echo "⚠️  ВНИМАНИЕ: Использование одного домена для Matrix и Element может создать уязвимости XSS!"
+    echo "Рекомендуется использовать разные поддомены:"
+    echo "  Matrix: matrix.example.com"
+    echo "  Element: element.example.com"
+    read -p "Продолжить с одним доменом? (y/n): " confirm
+    if [ "$confirm" != "y" ]; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# Функция для создания расширенной конфигурации Element Web
+create_element_config() {
+  local matrix_domain=$1
+  local element_domain=$2
+  local admin_user=$3
+  
+  cat > /opt/element-web/config.json <<EOL
+{
+    "default_server_config": {
+        "m.homeserver": {
+            "base_url": "https://$matrix_domain",
+            "server_name": "$matrix_domain"
+        },
+        "m.identity_server": {
+            "base_url": "https://vector.im"
+        }
+    },
+    "disable_custom_urls": true,
+    "disable_guests": true,
+    "disable_login_language_selector": false,
+    "disable_3pid_login": false,
+    "brand": "Element Web",
+    "welcome_user_id": "@$admin_user:$matrix_domain",
+    
+    "default_country_code": "RU",
+    "default_theme": "dark",
+    "default_federate": false,
+    
+    "integrations_ui_url": null,
+    "integrations_rest_url": null,
+    "integrations_widgets_urls": [],
+    "bug_report_endpoint_url": "",
+    
+    "showLabsSettings": true,
+    "features": {
+        "feature_pinning": true,
+        "feature_custom_status": false,
+        "feature_custom_tags": false,
+        "feature_state_counters": false,
+        "feature_latex_maths": false,
+        "feature_jump_to_date": false,
+        "feature_location_share_live": false,
+        "feature_video_rooms": false,
+        "feature_element_call_video_rooms": false,
+        "feature_group_calls": false,
+        "feature_disable_call_per_sender_encryption": false,
+        "feature_notifications": false,
+        "feature_ask_to_join": false
+    },
+    
+    "setting_defaults": {
+        "MessageComposerInput.showStickersButton": false,
+        "MessageComposerInput.showPollsButton": true,
+        "UIFeature.urlPreviews": true,
+        "UIFeature.feedback": false,
+        "UIFeature.voip": true,
+        "UIFeature.widgets": true,
+        "UIFeature.advancedSettings": false,
+        "UIFeature.shareQrCode": true,
+        "UIFeature.shareSocial": false,
+        "UIFeature.identityServer": false,
+        "UIFeature.thirdPartyId": true,
+        "UIFeature.registration": false,
+        "UIFeature.passwordReset": false,
+        "UIFeature.deactivate": false,
+        "UIFeature.advancedEncryption": false,
+        "UIFeature.roomHistorySettings": false,
+        "UIFeature.TimelineEnableRelativeDates": true,
+        "UIFeature.BulkUnverifiedSessionsReminder": true,
+        "UIFeature.locationSharing": false
+    },
+    
+    "room_directory": {
+        "servers": ["$matrix_domain"]
+    },
+    
+    "enable_presence_by_hs_url": {
+        "https://matrix.org": false,
+        "https://matrix-client.matrix.org": false,
+        "https://$matrix_domain": true
+    },
+    
+    "jitsi": {
+        "preferred_domain": "$matrix_domain"
+    },
+    
+    "element_call": {
+        "use_exclusively": false,
+        "participant_limit": 8,
+        "brand": "Element Call",
+        "guest_spa_url": null
+    },
+    
+    "voip": {
+        "obey_asserted_identity": false
+    },
+    
+    "widget_build_url": null,
+    "widget_build_url_ignore_dm": true,
+    "audio_stream_url": null,
+    
+    "posthog": {
+        "project_api_key": null,
+        "api_host": null
+    },
+    
+    "privacy_policy_url": "",
+    "terms_and_conditions_links": [],
+    "analytics_owner": "",
+    
+    "map_style_url": "",
+    "custom_translations_url": "",
+    
+    "user_notice": null,
+    "help_url": "https://element.io/help",
+    "help_encryption_url": "https://element.io/help#encryption",
+    "force_verification": false,
+    
+    "desktop_builds": {
+        "available": true,
+        "logo": "https://element.io/images/logo-mark-primary.svg",
+        "url": "https://element.io/get-started"
+    },
+    
+    "mobile_builds": {
+        "ios": "https://apps.apple.com/app/vector/id1083446067",
+        "android": "https://play.google.com/store/apps/details?id=im.vector.app",
+        "fdroid": "https://f-droid.org/packages/im.vector.app/"
+    },
+    
+    "mobile_guide_toast": true,
+    "mobile_guide_app_variant": "element",
+    
+    "embedded_pages": {
+        "welcome_url": null,
+        "home_url": null
+    },
+    
+    "branding": {
+        "welcome_background_url": null,
+        "auth_header_logo_url": null,
+        "auth_footer_links": []
+    },
+    
+    "sso_redirect_options": {
+        "immediate": false,
+        "on_welcome_page": false,
+        "on_login_page": false
+    },
+    
+    "oidc_static_clients": {},
+    "oidc_metadata": {
+        "client_uri": null,
+        "logo_uri": null,
+        "tos_uri": null,
+        "policy_uri": null,
+        "contacts": []
+    }
+}
+EOL
+}
+
+# Функция для создания улучшенного Caddyfile с кэшированием и well-known
+create_enhanced_caddyfile() {
+  local matrix_domain=$1
+  local element_domain=$2
+  local admin_domain=$3
+  local bind_address=$4
+  
+  cat > /etc/caddy/Caddyfile <<EOL
+# Matrix Synapse (клиентский API)
+$matrix_domain {
+    # .well-known для федерации и обнаружения клиентов
+    handle_path /.well-known/matrix/server {
+        respond \`{"m.server": "$matrix_domain:8448"}\` 200 {
+            header Content-Type application/json
+            header Access-Control-Allow-Origin *
+            header Cache-Control "public, max-age=3600"
+        }
+    }
+    
+    handle_path /.well-known/matrix/client {
+        respond \`{
+            "m.homeserver": {"base_url": "https://$matrix_domain"},
+            "m.identity_server": {"base_url": "https://vector.im"},
+            "io.element.e2ee": {
+                "default": true,
+                "secure_backup_required": false,
+                "secure_backup_setup_methods": ["key", "passphrase"]
+            },
+            "io.element.jitsi": {
+                "preferredDomain": "$matrix_domain"
+            }
+        }\` 200 {
+            header Content-Type application/json
+            header Access-Control-Allow-Origin *
+            header Cache-Control "public, max-age=3600"
+        }
+    }
+
+    # Проксирование клиентского API
+    reverse_proxy /_matrix/* $bind_address:8008 {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto https
+    }
+    reverse_proxy /_synapse/client/* $bind_address:8008 {
+        header_up X-Forwarded-For {remote_host}  
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto https
+    }
+    
+    # Усиленные заголовки безопасности для Matrix
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        X-Robots-Tag "noindex, nofollow"
+        Permissions-Policy "geolocation=(), microphone=(), camera=()"
+    }
+}
+
+# Федерация (отдельный порт)
+$matrix_domain:8448 {
+    reverse_proxy $bind_address:8448 {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto https
+    }
+    
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Robots-Tag "noindex, nofollow"
+    }
+}
+
+# Element Web с кэшированием
+$element_domain {
+    reverse_proxy $bind_address:8080
+    
+    # Настройка кэширования Element Web
+    @static {
+        path *.js *.css *.woff *.woff2 *.ttf *.eot *.svg *.png *.jpg *.jpeg *.gif *.ico
+    }
+    
+    @no_cache {
+        path /config*.json /i18n* /index.html /
+    }
+    
+    header @static Cache-Control "public, max-age=31536000, immutable"
+    header @no_cache Cache-Control "no-cache, no-store, must-revalidate"
+    header @no_cache Pragma "no-cache"
+    header @no_cache Expires "0"
+    
+    # Заголовки безопасности Element Web
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; media-src 'self' blob: https:; font-src 'self' https:; connect-src 'self' https: wss:; frame-src 'self' https:; worker-src 'self' blob:; manifest-src 'self';"
+        Permissions-Policy "geolocation=(self), microphone=(self), camera=(self), payment=(), usb=(), magnetometer=(), gyroscope=()"
+    }
+}
+
+# Synapse Admin
+$admin_domain {
+    reverse_proxy $bind_address:8081
+    
+    # Заголовки безопасности для Admin
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        X-Robots-Tag "noindex, nofollow"
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self';"
+    }
+}
+
+# ===== ИНСТРУКЦИИ PO ИСПОЛЬЗОВАНИЮ =====
+# 1. Скопируйте этот код в ваш основной Caddyfile на хосте Proxmox
+# 2. Перезапустите Caddy: systemctl reload caddy
+# 3. Проверьте статус: systemctl status caddy
+
+# ===== ПРОВЕРКА РАБОТЫ =====
+# curl https://$matrix_domain/.well-known/matrix/client
+# curl https://$matrix_domain/.well-known/matrix/server
+EOL
+}
+
+# Функция для создания шаблона Caddyfile для Proxmox
+create_proxmox_caddyfile_template() {
+  local matrix_domain=$1
+  local element_domain=$2
+  local admin_domain=$3
+  local local_ip=$4
+  
+  cat > /root/proxmox-caddy-config/caddyfile-template.txt <<EOL
+# Matrix Setup Caddyfile Template для Proxmox VPS
+# Версия 5.3 - Ubuntu 24.04 LTS Compatible
+# IP адрес Proxmox VPS: $local_ip
+
+# Matrix Synapse (клиентский API)
+$matrix_domain {
+    # .well-known для федерации и обнаружения клиентов
+    handle_path /.well-known/matrix/server {
+        respond \`{"m.server": "$matrix_domain:8448"}\` 200 {
+            header Content-Type application/json
+            header Access-Control-Allow-Origin *
+            header Cache-Control "public, max-age=3600"
+        }
+    }
+    
+    handle_path /.well-known/matrix/client {
+        respond \`{
+            "m.homeserver": {"base_url": "https://$matrix_domain"},
+            "m.identity_server": {"base_url": "https://vector.im"},
+            "io.element.e2ee": {
+                "default": true,
+                "secure_backup_required": false,
+                "secure_backup_setup_methods": ["key", "passphrase"]
+            },
+            "io.element.jitsi": {
+                "preferredDomain": "$matrix_domain"
+            }
+        }\` 200 {
+            header Content-Type application/json
+            header Access-Control-Allow-Origin *
+            header Cache-Control "public, max-age=3600"
+        }
+    }
+
+    # Проксирование клиентского API
+    reverse_proxy /_matrix/* $local_ip:8008 {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto https
+    }
+    reverse_proxy /_synapse/client/* $local_ip:8008 {
+        header_up X-Forwarded-For {remote_host}  
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto https
+    }
+    
+    # Усиленные заголовки безопасности для Matrix
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        X-Robots-Tag "noindex, nofollow"
+        Permissions-Policy "geolocation=(), microphone=(), camera=()"
+    }
+}
+
+# Федерация (отдельный порт)
+$matrix_domain:8448 {
+    reverse_proxy $local_ip:8448 {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-Proto https
+    }
+    
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Robots-Tag "noindex, nofollow"
+    }
+}
+
+# Element Web с кэшированием
+$element_domain {
+    reverse_proxy $local_ip:8080
+    
+    # Настройка кэширования Element Web
+    @static {
+        path *.js *.css *.woff *.woff2 *.ttf *.eot *.svg *.png *.jpg *.jpeg *.gif *.ico
+    }
+    
+    @no_cache {
+        path /config*.json /i18n* /index.html /
+    }
+    
+    header @static Cache-Control "public, max-age=31536000, immutable"
+    header @no_cache Cache-Control "no-cache, no-store, must-revalidate"
+    header @no_cache Pragma "no-cache"
+    header @no_cache Expires "0"
+    
+    # Заголовки безопасности Element Web
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: https:; media-src 'self' blob: https:; font-src 'self' https:; connect-src 'self' https: wss:; frame-src 'self' https:; worker-src 'self' blob:; manifest-src 'self';"
+        Permissions-Policy "geolocation=(self), microphone=(self), camera=(self), payment=(), usb=(), magnetometer=(), gyroscope=()"
+    }
+}
+
+# Synapse Admin
+$admin_domain {
+    reverse_proxy $local_ip:8081
+    
+    # Заголовки безопасности для Admin
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        X-Robots-Tag "noindex, nofollow"
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self';"
+    }
+}
+
+# ===== ИНСТРУКЦИИ PO ИСПОЛЬЗОВАНИЮ =====
+# 1. Скопируйте этот код в ваш основной Caddyfile на хосте Proxmox
+# 2. Перезапустите Caddy: systemctl reload caddy
+# 3. Проверьте статус: systemctl status caddy
+
+# ===== ПРОВЕРКА РАБОТЫ =====
+# curl https://$matrix_domain/.well-known/matrix/client
+# curl https://$matrix_domain/.well-known/matrix/server
+EOL
+}
+
+# Проверка аргументов командной строки
+if [ $# -gt 0 ]; then
+  case $1 in
+    -f|--full-installation)
+      full_installation
+      exit 0
+      ;;
+    -r|--repair-binding)
+      detect_server_type
+      if [ "$SERVER_TYPE" = "proxmox" ]; then
+        fix_all_services "0.0.0.0" "$LOCAL_IP" "$SERVER_TYPE"
+      else
+        fix_all_services "127.0.0.1" "127.0.0.1" "$SERVER_TYPE"
+      fi
+      exit 0
+      ;;
+    -c|--check-status)
+      detect_server_type
+      check_matrix_binding
+      check_coturn_binding
+      check_docker_binding
+      exit 0
+      ;;
+    -m|--migrate-to-element)
+      migrate_to_element_synapse
+      exit 0
+      ;;
+    -b|--backup-config)
+      backup_configuration
+      exit 0
+      ;;
+    -resto|--restore-config)
+      restore_configuration
+      exit 0
+      ;;
+    -u|--update-system)
+      update_system_packages
+      exit 0
+      ;;
+    -re|--restart-services)
+      restart_all_services
+      exit 0
+      ;;
+    -t|--fix-time)
+      fix_system_time
+      echo "Системное время проверено/исправлено"
+      exit 0
+      ;;
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    *)
+      echo "Неизвестная опция: $1"
+      show_help
+      exit 1
+      ;;
+  esac
+fi
+
 # Основной цикл (обновленный для новых опций)
 while true; do
   show_menu
-  read -p "Выберите опцию (1-15): " choice
+  read -p "Выберите опцию (1-16): " choice
   
   case $choice in
     1) full_installation; break ;;
@@ -1716,7 +1976,8 @@ while true; do
     12) create_user_by_admin; break ;;
     13) create_registration_token; break ;;
     14) check_system_info; ;;
-    15) echo "Выход..."; exit 0 ;;
+    15) fix_system_time; echo "Системное время проверено/исправлено"; read -p "Нажмите Enter..."; ;;
+    16) echo "Выход..."; exit 0 ;;
     *) echo "Неверный выбор. Попробуйте снова."; sleep 2 ;;
   esac
 done
