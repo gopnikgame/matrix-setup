@@ -471,28 +471,27 @@ services:
       retries: 3
     stop_grace_period: 15s
 
-  # Coturn TURN сервер (исправленная конфигурация)
+  # Coturn TURN сервер (ИСПРАВЛЕННАЯ конфигурация для быстрого запуска)
   coturn:
     image: coturn/coturn:latest
     container_name: matrix-coturn
     restart: unless-stopped
-    ports:
-      - "3478:3478/udp"
-      - "3478:3478/tcp"
-      - "5349:5349/udp"
-      - "5349:5349/tcp"
-      - "49152-65535:49152-65535/udp"
+    # Используем host сеть для лучшей производительности (рекомендация Docker Coturn)
+    network_mode: host
     volumes:
       - /opt/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
-    networks:
-      - matrix-network
-    command: ["-c", "/etc/coturn/turnserver.conf"]
-    depends_on:
-      - synapse
+      - coturn-data:/var/lib/coturn
+    environment:
+      # Автоматическое определение внешнего IP
+      - DETECT_EXTERNAL_IP=yes
+      - DETECT_RELAY_IP=yes
+    command: ["-c", "/etc/coturn/turnserver.conf", "--log-file=stdout", "-v"]
     stop_grace_period: 10s
 
 volumes:
   postgres-data:
+    driver: local
+  coturn-data:
     driver: local
 
 networks:
@@ -500,7 +499,7 @@ networks:
     driver: bridge
 EOL
 
-  echo "✅ Docker Compose конфигурация создана"
+  echo "✅ Docker Compose конфигурация создана (с оптимизированным Coturn)"
 }
 
 # Функция для создания конфигурации Element Web
@@ -618,71 +617,87 @@ EOL
   echo "✅ Конфигурация Synapse Admin создана"
 }
 
-# Функция для создания конфигурации Coturn (исправленная)
+# Функция для создания конфигурации Coturn (исправленная и оптимизированная)
 create_coturn_config() {
   local matrix_domain=$1
   local turn_secret=$2
   local public_ip=$3
   local local_ip=$4
   
-  echo "Создание конфигурации Coturn..."
+  echo "Создание оптимизированной конфигурации Coturn..."
   
   mkdir -p /opt/coturn
   
   cat > /opt/coturn/turnserver.conf <<EOL
-# Coturn TURN Server Configuration для Matrix
+# Coturn TURN Server Configuration для Matrix (оптимизированная)
+
+# Основные порты
 listening-port=3478
 tls-listening-port=5349
-listening-ip=0.0.0.0
-relay-ip=$local_ip
-external-ip=$public_ip
 
-# Диапазон портов для медиа релея
-min-port=49152
-max-port=65535
+# Сетевые настройки - автоматическое определение через переменные окружения
+listening-ip=0.0.0.0
+
+# Оптимизированный диапазон портов для Docker
+min-port=49160
+max-port=49200
 
 # Аутентификация
 use-auth-secret
 static-auth-secret=$turn_secret
 realm=$matrix_domain
 
-# Логирование
-verbose
-log-file=/var/log/turnserver.log
+# Логирование (выводим в stdout для Docker)
+no-stdout-log
+syslog
 
-# Безопасность - блокируем приватные IP
-denied-peer-ip=10.0.0.0-10.255.255.255
-denied-peer-ip=192.168.0.0-192.168.255.255
-denied-peer-ip=172.16.0.0-172.31.255.255
-denied-peer-ip=0.0.0.0-0.255.255.255
-denied-peer-ip=100.64.0.0-100.127.255.255
-denied-peer-ip=127.0.0.0-127.255.255.255
-denied-peer-ip=169.254.0.0-169.254.255.255
-denied-peer-ip=192.0.0.0-192.0.0.255
-denied-peer-ip=192.0.2.0-192.0.2.255
-denied-peer-ip=192.88.99.0-192.88.99.255
-denied-peer-ip=198.18.0.0-198.19.255.255
-denied-peer-ip=198.51.100.0-198.51.100.255
-denied-peer-ip=203.0.113.0-203.0.113.255
-denied-peer-ip=240.0.0.0-255.255.255.255
-
-# Разрешаем локальную сеть
-allowed-peer-ip=$local_ip
-
-# Ограничения пользователей
+# Оптимизация производительности
 no-multicast-peers
 no-cli
 no-loopback-peers
+no-tcp-relay
+
+# Ограничения пользователей (оптимизированные)
 user-quota=12
 total-quota=1200
 
-# Оптимизация
+# Безопасность - блокируем приватные IP диапазоны
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=224.0.0.0-255.255.255.255
+
+# Белый список - разрешаем публичные IP
+# (Docker автоматически определит external IP через DETECT_EXTERNAL_IP)
+
+# Оптимизация для Docker и Matrix
+no-tls
+no-dtls
+simple-log
+new-log-timestamp
+
+# Улучшенная производительность
+mobility
+no-stale-nonce
+
+# Ограничения времени
+max-allocate-lifetime=3600
+channel-lifetime=600
+
+# PID файл (внутри контейнера)
 pidfile=/var/run/turnserver.pid
-proc-user=root
-proc-group=root
+
+# Пользователь процесса
+proc-user=turnserver
+proc-group=turnserver
 EOL
 
-  echo "✅ Конфигурация Coturn создана"
+  echo "✅ Оптимизированная конфигурация Coturn создана"
+  echo "   - Сокращенный диапазон портов: 49160-49200 (40 портов)"
+  echo "   - Автоматическое определение внешнего IP"
+  echo "   - Оптимизация для Docker host сети"
 }
 
 # Функция для создания расширенного Caddyfile
@@ -935,9 +950,8 @@ full_installation() {
   # Установка прав доступа заранее
   chown -R 991:991 /opt/synapse-data
   
-  # Сначала генерируем БАЗОВУЮ конфигурацию и ключ через Docker
-  echo "Создание базовой конфигурации и ключа подписи через Synapse..."
-  docker run --rm \
+  # Сильно увеличиваем тайм-аут для первой генерации
+  timeout 300 docker run --rm \
     --mount type=bind,source=/opt/synapse-data,target=/data \
     -e SYNAPSE_SERVER_NAME="$MATRIX_DOMAIN" \
     -e SYNAPSE_REPORT_STATS=no \
@@ -1037,12 +1051,38 @@ full_installation() {
   fi
   
   echo "7. Запуск Coturn..."
-  if ! timeout 60 docker compose up -d coturn; then
-    echo "⚠️  Coturn запускается медленно или зависает. Проверяем логи:"
-    docker logs matrix-coturn --tail 20 2>/dev/null || echo "Coturn еще не создан"
-    echo "Пропускаем Coturn - можно настроить позже"
+  echo "   Попытка запуска Coturn с тайм-аутом 30 секунд..."
+  
+  # Запуск Coturn с коротким тайм-аутом
+  if timeout 30 docker compose up -d coturn; then
+    echo "   ✅ Coturn быстро запущен"
+    
+    # Дополнительная проверка что Coturn действительно работает
+    sleep 5
+    if docker ps | grep -q "matrix-coturn.*Up"; then
+      echo "   ✅ Coturn подтвержден как работающий"
+    else
+      echo "   ⚠️  Coturn запустился но может работать нестабильно"
+      echo "   Проверьте логи: docker logs matrix-coturn"
+    fi
+    
   else
-    echo "   ✅ Coturn запущен"
+    echo "   ⚠️  Coturn не запустился за 30 секунд"
+    echo "   Это может быть связано с проблемами сети или портов"
+    echo ""
+    echo "   🔧 Возможные решения:"
+    echo "   1. Проверьте что порты 3478/udp и 49160-49200/udp не заняты:"
+    echo "      netstat -tulpn | grep -E '(3478|4916[0-9]|4917[0-9]|4918[0-9]|4919[0-9]|4920[0-9])'"
+    echo ""
+    echo "   2. Попробуйте запустить Coturn вручную позже:"
+    echo "      cd /opt/synapse-config && docker compose up -d coturn"
+    echo ""
+    echo "   3. Проверьте логи Coturn:"
+    echo "      docker logs matrix-coturn"
+    echo ""
+    echo "   ⚠️  Matrix будет работать БЕЗ Coturn (только для звонков внутри локальной сети)"
+    echo "   Coturn нужен только для звонков через NAT/firewall"
+    echo ""
   fi
   
   # Проверка статуса всех контейнеров
@@ -1408,7 +1448,88 @@ update_containers() {
   check_status
 }
 
-# Добавим новую опцию в меню
+# Функция для управления Coturn отдельно
+manage_coturn() {
+  echo "=== Управление Coturn TURN сервером ==="
+  echo ""
+  echo "1. Статус Coturn"
+  echo "2. Запустить Coturn"
+  echo "3. Остановить Coturn"
+  echo "4. Перезапустить Coturn"
+  echo "5. Логи Coturn"
+  echo "6. Тест портов Coturn"
+  echo "7. Исправить конфигурацию Coturn"
+  echo "8. Назад"
+  echo ""
+  read -p "Выберите действие (1-8): " coturn_choice
+  
+  case $coturn_choice in
+    1)
+      echo "Статус Coturn:"
+      if docker ps | grep -q "matrix-coturn"; then
+        echo "✅ Coturn запущен"
+        docker ps --filter "name=matrix-coturn" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+      else
+        echo "❌ Coturn не запущен"
+        echo "Последний статус:"
+        docker ps -a --filter "name=matrix-coturn" --format "table {{.Names}}\t{{.Status}}"
+      fi
+      ;;
+    2)
+      echo "Запуск Coturn..."
+      cd /opt/synapse-config 2>/dev/null || { echo "❌ Конфигурация не найдена"; return 1; }
+      if timeout 30 docker compose up -d coturn; then
+        echo "✅ Coturn запущен"
+      else
+        echo "❌ Ошибка запуска Coturn"
+        echo "Проверьте логи: docker logs matrix-coturn"
+      fi
+      ;;
+    3)
+      echo "Остановка Coturn..."
+      docker stop matrix-coturn 2>/dev/null && echo "✅ Coturn остановлен" || echo "❌ Ошибка остановки"
+      ;;
+    4)
+      echo "Перезапуск Coturn..."
+      cd /opt/synapse-config 2>/dev/null || { echo "❌ Конфигурация не найдена"; return 1; }
+      docker compose restart coturn && echo "✅ Coturn перезапущен" || echo "❌ Ошибка перезапуска"
+      ;;
+    5)
+      echo "Логи Coturn (последние 50 строк, Ctrl+C для выхода):"
+      docker logs -f matrix-coturn --tail 50 2>/dev/null || echo "❌ Логи недоступны"
+      ;;
+    6)
+      echo "Проверка портов Coturn..."
+      echo "UDP порт 3478 (TURN):"
+      netstat -tulpn | grep ":3478" || echo "Порт 3478 не слушается"
+      echo ""
+      echo "UDP порты 49160-49200 (media relay):"
+      netstat -tulpn | grep -E ":(4916[0-9]|4917[0-9]|4918[0-9]|4919[0-9]|4920[0-9])" | head -5 || echo "Порты медиа не слушаются"
+      echo ""
+      echo "Если порты не слушаются, попробуйте перезапустить Coturn"
+      ;;
+    7)
+      echo "Исправление конфигурации Coturn..."
+      if [ -f "/opt/synapse-data/homeserver.yaml" ]; then
+        MATRIX_DOMAIN=$(grep "server_name:" /opt/synapse-data/homeserver.yaml | head -1 | sed 's/server_name: *"//' | sed 's/"//')
+        TURN_SECRET=$(grep "turn_shared_secret:" /opt/synapse-data/homeserver.yaml | cut -d'"' -f2)
+        PUBLIC_IP=$(curl -s -4 https://ifconfig.co || echo "auto-detect")
+        LOCAL_IP=$(hostname -I | awk '{print $1}')
+        
+        create_coturn_config "$MATRIX_DOMAIN" "$TURN_SECRET" "$PUBLIC_IP" "$LOCAL_IP"
+        echo "✅ Конфигурация обновлена, перезапустите Coturn"
+      else
+        echo "❌ Конфигурация Synapse не найдена"
+      fi
+      ;;
+    8) return 0 ;;
+    *) echo "❌ Неверный выбор" ;;
+  esac
+  
+  read -p "Нажмите Enter для продолжения..."
+}
+
+# Обновляем главное меню
 show_menu() {
   clear
   echo "=================================================================="
@@ -1425,14 +1546,16 @@ show_menu() {
   echo "8.  🆙 Обновить все контейнеры"
   echo "9.  🔍 Диагностика проблем контейнеров"
   echo "10. 🔑 Исправить ключ подписи Synapse"
-  echo "11. ❌ Выход"
+  echo "11. 📞 Управление Coturn (VoIP сервер)"
+  echo "12. ❌ Выход"
   echo "=================================================================="
 }
 
+# Обновляем основной цикл
 # Основной цикл
 while true; do
   show_menu
-  read -p "Выберите опцию (1-11): " choice
+  read -p "Выберите опцию (1-12): " choice
   
   case $choice in
     1) full_installation ;;
@@ -1445,7 +1568,8 @@ while true; do
     8) update_containers; read -p "Нажмите Enter для продолжения..." ;;
     9) diagnose_containers; read -p "Нажмите Enter для продолжения..." ;;
     10) fix_signing_key; read -p "Нажмите Enter для продолжения..." ;;
-    11) echo "👋 До свидания!"; exit 0 ;;
+    11) manage_coturn ;;
+    12) echo "👋 До свидания!"; exit 0 ;;
     *) echo "❌ Неверный выбор. Попробуйте снова."; sleep 2 ;;
   esac
 done

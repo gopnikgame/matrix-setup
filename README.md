@@ -36,6 +36,8 @@ wget -qO setup-matrix.sh https://raw.githubusercontent.com/gopnikgame/matrix-set
 - ✅ **systemd-python** - установка без systemd модуля если он недоступен
 - ✅ **pkg-config** - автоматическая установка необходимых зависимостей
 - ✅ **Сервисы** - автоматическое создание systemd конфигураций
+- ✅ **Signing key** - автоматическая генерация через Synapse в правильном формате
+- ✅ **Coturn оптимизация** - быстрый запуск с сокращенным диапазоном портов
 
 ### Быстрые команды:
 ```bash
@@ -47,6 +49,10 @@ sudo ./setup-matrix.sh -f
 
 # Проверка статуса
 sudo ./setup-matrix.sh -c
+
+# Управление Coturn отдельно (новое в v6.0)
+sudo ./setup-matrix.sh
+# Выберите опцию "11. 📞 Управление Coturn"
 ```
 
 ## 💳 Если есть желание поддержать развитие скрипта:
@@ -199,7 +205,7 @@ cd /opt/synapse-config && docker-compose pull && docker-compose up -d
 1. Войдите в Element Web
 2. Настройки → Labs
 3. Включите "New group call experience"
-4. Перезапустите Element Web
+4. Перезагрузите Element Web
 
 ## 📊 Мониторинг
 
@@ -284,4 +290,6 @@ E: Репозиторий «https://packages.element.io/debian noble Release» �
 - [Proxmox VPS Template](proxmox-caddyfile-template.txt)
 - [Synapse Admin Guide](synapse-admin-guide.md)
 - [Ubuntu 24.04 Troubleshooting](UBUNTU_24_04_TROUBLESHOOTING.md)
+- [Signing Key Troubleshooting](SIGNING_KEY_TROUBLESHOOTING.md)
+- [Coturn Troubleshooting](COTURN_TROUBLESHOOTING.md)
 
