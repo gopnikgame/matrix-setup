@@ -1547,15 +1547,51 @@ show_menu() {
   echo "9.  🔍 Диагностика проблем контейнеров"
   echo "10. 🔑 Исправить ключ подписи Synapse"
   echo "11. 📞 Управление Coturn (VoIP сервер)"
-  echo "12. ❌ Выход"
+  echo "12. ⚙️  Управление Synapse (федерация, регистрация)"
+  echo "13. ❌ Выход"
   echo "=================================================================="
+}
+
+# Функция запуска модуля управления Synapse
+manage_synapse_module() {
+  local manage_script="./manage-synapse.sh"
+  
+  # Проверяем существование модуля
+  if [ ! -f "$manage_script" ]; then
+    echo "❌ Модуль manage-synapse.sh не найден"
+    echo ""
+    echo "📥 Скачивание модуля управления Synapse..."
+    
+    if command -v wget >/dev/null 2>&1; then
+      wget -qO manage-synapse.sh https://raw.githubusercontent.com/gopnikgame/matrix-setup/main/manage-synapse.sh
+    elif command -v curl >/dev/null 2>&1; then
+      curl -sL https://raw.githubusercontent.com/gopnikgame/matrix-setup/main/manage-synapse.sh -o manage-synapse.sh
+    else
+      echo "❌ Не удалось скачать модуль (нет wget или curl)"
+      echo "Скачайте вручную: https://github.com/gopnikgame/matrix-setup/blob/main/manage-synapse.sh"
+      return 1
+    fi
+    
+    chmod +x manage-synapse.sh
+    echo "✅ Модуль управления скачан"
+  fi
+  
+  # Проверяем права на выполнение
+  if [ ! -x "$manage_script" ]; then
+    chmod +x "$manage_script"
+  fi
+  
+  # Запускаем модуль
+  echo "🚀 Запуск модуля управления Matrix Synapse..."
+  sleep 1
+  "$manage_script"
 }
 
 # Обновляем основной цикл
 # Основной цикл
 while true; do
   show_menu
-  read -p "Выберите опцию (1-12): " choice
+  read -p "Выберите опцию (1-13): " choice
   
   case $choice in
     1) full_installation ;;
@@ -1569,7 +1605,8 @@ while true; do
     9) diagnose_containers; read -p "Нажмите Enter для продолжения..." ;;
     10) fix_signing_key; read -p "Нажмите Enter для продолжения..." ;;
     11) manage_coturn ;;
-    12) echo "👋 До свидания!"; exit 0 ;;
+    12) manage_synapse_module ;;
+    13) echo "👋 До свидания!"; exit 0 ;;
     *) echo "❌ Неверный выбор. Попробуйте снова."; sleep 2 ;;
   esac
 done
