@@ -860,53 +860,124 @@ full_installation() {
   # Создание Docker Compose конфигурации
   create_docker_compose "$MATRIX_DOMAIN" "$DB_PASSWORD" "$BIND_ADDRESS"
   
-  # Запуск контейнеров поэтапно
+  # Запуск контейнеров поэтапно с диагностикой
   echo "Запуск Matrix сервисов поэтапно..."
   cd /opt/synapse-config
   
   echo "1. Скачивание образов..."
-  docker compose pull
+  if ! docker compose pull; then
+    echo "❌ Ошибка скачивания образов"
+    exit 1
+  fi
   
   echo "2. Запуск PostgreSQL..."
-  docker compose up -d postgres
+  if ! docker compose up -d postgres; then
+    echo "❌ Ошибка запуска PostgreSQL"
+    docker compose logs postgres
+    exit 1
+  fi
   
   echo "3. Ожидание готовности PostgreSQL..."
-  sleep 10
-  for i in {1..6}; do
+  for i in {1..12}; do
     if docker exec matrix-postgres pg_isready -U matrix >/dev/null 2>&1; then
-      echo "   PostgreSQL готов!"
+      echo "   ✅ PostgreSQL готов!"
       break
+    elif [ $i -eq 12 ]; then
+      echo "   ❌ PostgreSQL не запустился. Проверяем логи:"
+      docker logs matrix-postgres --tail 20
+      exit 1
     else
-      echo "   Ожидание PostgreSQL... ($i/6)"
+      echo "   Ожидание PostgreSQL... ($i/12)"
       sleep 5
     fi
   done
   
   echo "4. Запуск Synapse..."
-  docker compose up -d synapse
+  if ! docker compose up -d synapse; then
+    echo "❌ Ошибка запуска Synapse"
+    docker compose logs synapse
+    exit 1
+  fi
   
   echo "5. Ожидание готовности Synapse..."
-  sleep 20
-  for i in {1..12}; do
+  for i in {1..24}; do
+    # Проверяем healthcheck и API
     if curl -s http://localhost:8008/health >/dev/null 2>&1; then
-      echo "   Synapse готов!"
+      echo "   ✅ Synapse готов!"
       break
+    elif [ $i -eq 24 ]; then
+      echo "   ❌ Synapse не запустился. Диагностика:"
+      echo ""
+      echo "=== Статус контейнера ==="
+      docker ps --filter "name=matrix-synapse"
+      echo ""
+      echo "=== Последние логи Synapse ==="
+      docker logs matrix-synapse --tail 30
+      echo ""
+      echo "=== Проверка конфигурации ==="
+      docker exec matrix-synapse python -m synapse.config -c /data/homeserver.yaml 2>&1 || echo "Ошибка конфигурации"
+      echo ""
+      echo "=== Сетевые подключения ==="
+      docker exec matrix-synapse netstat -tlnp 2>/dev/null || echo "netstat недоступен"
+      exit 1
     else
-      echo "   Ожидание Synapse... ($i/12)"
+      echo "   Ожидание Synapse... ($i/24)"
       sleep 10
     fi
   done
   
   echo "6. Запуск веб-интерфейсов..."
-  docker compose up -d element-web synapse-admin
+  if ! docker compose up -d element-web synapse-admin; then
+    echo "❌ Ошибка запуска веб-интерфейсов"
+    docker compose logs element-web
+    docker compose logs synapse-admin
+    # Продолжаем, это не критично
+  fi
   
   echo "7. Запуск Coturn..."
-  docker compose up -d coturn
+  if ! timeout 60 docker compose up -d coturn; then
+    echo "⚠️  Coturn запускается медленно или зависает. Проверяем логи:"
+    docker logs matrix-coturn --tail 20 2>/dev/null || echo "Coturn еще не создан"
+    echo "Пропускаем Coturn - можно настроить позже"
+  else
+    echo "   ✅ Coturn запущен"
+  fi
   
-  # Проверка статуса
+  # Проверка статуса всех контейнеров
   echo ""
-  echo "Проверка статуса контейнеров..."
+  echo "=== Финальная проверка статуса ==="
   docker compose ps
+  
+  echo ""
+  echo "=== Проверка доступности сервисов ==="
+  
+  # Проверка Synapse API
+  if curl -s http://localhost:8008/_matrix/client/versions >/dev/null; then
+    echo "✅ Synapse API доступен"
+  else
+    echo "❌ Synapse API недоступен"
+  fi
+  
+  # Проверка Element Web
+  if curl -s http://localhost:8080/ >/dev/null; then
+    echo "✅ Element Web доступен"
+  else
+    echo "⚠️  Element Web недоступен"
+  fi
+  
+  # Проверка Synapse Admin
+  if curl -s http://localhost:8081/ >/dev/null; then
+    echo "✅ Synapse Admin доступен"
+  else
+    echo "⚠️  Synapse Admin недоступен"
+  fi
+  
+  # Проверка PostgreSQL
+  if docker exec matrix-postgres pg_isready -U matrix >/dev/null 2>&1; then
+    echo "✅ PostgreSQL работает"
+  else
+    echo "❌ PostgreSQL недоступен"
+  fi
   
   # Установка Caddy (только для hosting)
   install_caddy
@@ -914,7 +985,7 @@ full_installation() {
   # Финальная информация
   echo ""
   echo "================================================================="
-  echo "🎉 Установка Matrix v6.0 завершена успешно!"
+  echo "🎉 Установка Matrix v6.0 завершена!"
   echo "================================================================="
   echo ""
   echo "📋 Информация о доступе:"
@@ -937,15 +1008,91 @@ full_installation() {
   echo "  docker compose ps          # Статус"
   echo "  docker compose logs        # Логи"
   echo "  docker compose restart     # Перезапуск"
-  echo "  docker compose pull && docker compose up -d  # Обновление"
   echo ""
-  echo "⚠️  ВАЖНО: Дождитесь полной загрузки всех контейнеров (~2-3 минуты)"
+  echo "🔍 Диагностика (при проблемах):"
+  echo "  docker logs matrix-synapse --tail 50    # Логи Synapse"
+  echo "  docker logs matrix-postgres --tail 50   # Логи PostgreSQL"
+  echo "  docker logs matrix-coturn --tail 50     # Логи Coturn"
   echo ""
   if [ "$SERVER_TYPE" = "proxmox" ]; then
     echo "🌐 Для Proxmox VPS добавьте в Caddyfile хоста:"
     echo "   Порты: $LOCAL_IP:8008, $LOCAL_IP:8080, $LOCAL_IP:8081, $LOCAL_IP:8448"
   fi
   echo "================================================================="
+}
+
+# Функция диагностики проблем с контейнерами
+diagnose_containers() {
+  echo "=== Диагностика Matrix контейнеров ==="
+  echo ""
+  
+  cd /opt/synapse-config 2>/dev/null || { echo "❌ Конфигурация не найдена"; return 1; }
+  
+  echo "📊 Статус всех контейнеров:"
+  docker compose ps
+  echo ""
+  
+  echo "🔍 Детальная диагностика:"
+  
+  # Проверка каждого контейнера
+  for container in matrix-postgres matrix-synapse matrix-element-web matrix-synapse-admin matrix-coturn; do
+    echo ""
+    echo "--- $container ---"
+    
+    if docker ps | grep -q "$container"; then
+      echo "✅ Контейнер запущен"
+      
+      # Проверка healthcheck
+      health=$(docker inspect --format='{{.State.Health.Status}}' "$container" 2>/dev/null || echo "no healthcheck")
+      echo "Healthcheck: $health"
+      
+      # Последние логи
+      echo "Последние логи:"
+      docker logs "$container" --tail 10 2>&1 | sed 's/^/  /'
+      
+    else
+      echo "❌ Контейнер не запущен"
+      echo "Логи последнего запуска:"
+      docker logs "$container" --tail 15 2>&1 | sed 's/^/  /' || echo "  Логи недоступны"
+    fi
+  done
+  
+  echo ""
+  echo "🌐 Проверка сетевых портов:"
+  netstat -tlnp | grep -E "(8008|8080|8081|8448|3478)" | head -10
+  
+  echo ""
+  echo "💾 Использование дискового пространства:"
+  du -sh /opt/synapse-data /opt/synapse-config /opt/element-web /opt/synapse-admin /opt/coturn 2>/dev/null || echo "Несколько директорий недоступны"
+  
+  echo ""
+  echo "🔗 Проверка конфигурационных файлов:"
+  
+  # Проверка основных конфигов
+  if [ -f "/opt/synapse-data/homeserver.yaml" ]; then
+    echo "✅ homeserver.yaml существует ($(wc -l < /opt/synapse-data/homeserver.yaml) строк)"
+  else
+    echo "❌ homeserver.yaml отсутствует"
+  fi
+  
+  if [ -f "/opt/synapse-config/docker-compose.yml" ]; then
+    echo "✅ docker-compose.yml существует"
+  else
+    echo "❌ docker-compose.yml отсутствует"
+  fi
+  
+  if [ -f "/opt/element-web/config.json" ]; then
+    echo "✅ Element config.json существует"
+  else
+    echo "❌ Element config.json отсутствует"
+  fi
+  
+  echo ""
+  echo "🔧 Рекомендуемые действия:"
+  echo "  docker compose logs [service]     # Подробные логи сервиса"
+  echo "  docker compose restart [service]  # Перезапуск сервиса"
+  echo "  docker compose down && docker compose up -d  # Полный перезапуск"
+  echo "  docker exec -it matrix-synapse bash  # Вход в контейнер Synapse"
 }
 
 # Функция создания администратора
@@ -1027,26 +1174,7 @@ restart_services() {
   fi
 }
 
-# Функция показа меню
-show_menu() {
-  clear
-  echo "=================================================================="
-  echo "              Matrix Setup & Repair Tool v6.0"
-  echo "                    Enhanced Docker Edition"
-  echo "=================================================================="
-  echo "1.  🚀 Полная установка Matrix системы (Docker)"
-  echo "2.  📊 Проверить статус сервисов"
-  echo "3.  🔄 Перезапустить все сервисы"
-  echo "4.  👤 Создать пользователя (админ)"
-  echo "5.  🔧 Управление Docker контейнерами"
-  echo "6.  📋 Показать логи сервисов"
-  echo "7.  🔐 Показать секреты конфигурации"
-  echo "8.  🆙 Обновить все контейнеры"
-  echo "9.  ❌ Выход"
-  echo "=================================================================="
-}
-
-# Функция управления Docker
+# Функция управления Docker (полная реализация)
 manage_docker() {
   echo "=== Управление Docker контейнерами ==="
   echo ""
@@ -1063,15 +1191,24 @@ manage_docker() {
   cd /opt/synapse-config 2>/dev/null || { echo "❌ Конфигурация не найдена"; return 1; }
   
   case $docker_choice in
-    1) docker compose ps ;;
+    1) 
+      echo "Статус контейнеров:"
+      docker compose ps
+      ;;
     2) 
-      echo "Остановка контейнеров с таймаутом 30 секунд..."
+      echo "Остановка контейнеров с таймаутом 60 секунд..."
       timeout 60 docker compose stop || {
         echo "⚠️  Таймаут остановки, используйте принудительную остановку (опция 5)"
       }
       ;;
-    3) docker compose up -d ;;
-    4) docker compose restart ;;
+    3) 
+      echo "Запуск всех контейнеров..."
+      docker compose up -d
+      ;;
+    4) 
+      echo "Перезапуск всех контейнеров..."
+      docker compose restart
+      ;;
     5)
       echo "Принудительная остановка контейнеров..."
       docker stop matrix-synapse matrix-postgres matrix-element-web matrix-synapse-admin matrix-coturn 2>/dev/null || true
@@ -1087,7 +1224,7 @@ manage_docker() {
       fi
       ;;
     7) return 0 ;;
-    *) echo "Неверный выбор" ;;
+    *) echo "❌ Неверный выбор" ;;
   esac
   
   read -p "Нажмите Enter для продолжения..."
@@ -1108,17 +1245,33 @@ show_logs() {
   read -p "Выберите сервис (1-7): " log_choice
   
   case $log_choice in
-    1) docker logs -f matrix-synapse ;;
-    2) docker logs -f matrix-postgres ;;
-    3) docker logs -f matrix-element-web ;;
-    4) docker logs -f matrix-synapse-admin ;;
-    5) docker logs -f matrix-coturn ;;
+    1) 
+      echo "Логи Synapse (последние 50 строк, нажмите Ctrl+C для выхода):"
+      docker logs -f matrix-synapse --tail 50
+      ;;
+    2) 
+      echo "Логи PostgreSQL (последние 50 строк, нажмите Ctrl+C для выхода):"
+      docker logs -f matrix-postgres --tail 50
+      ;;
+    3) 
+      echo "Логи Element Web (последние 50 строк, нажмите Ctrl+C для выхода):"
+      docker logs -f matrix-element-web --tail 50
+      ;;
+    4) 
+      echo "Логи Synapse Admin (последние 50 строк, нажмите Ctrl+C для выхода):"
+      docker logs -f matrix-synapse-admin --tail 50
+      ;;
+    5) 
+      echo "Логи Coturn (последние 50 строк, нажмите Ctrl+C для выхода):"
+      docker logs -f matrix-coturn --tail 50
+      ;;
     6) 
       cd /opt/synapse-config 2>/dev/null || return 1
+      echo "Логи всех сервисов (нажмите Ctrl+C для выхода):"
       docker compose logs -f
       ;;
     7) return 0 ;;
-    *) echo "Неверный выбор" ;;
+    *) echo "❌ Неверный выбор" ;;
   esac
 }
 
@@ -1167,10 +1320,31 @@ update_containers() {
   check_status
 }
 
+# Добавим новую опцию в меню
+show_menu() {
+  clear
+  echo "=================================================================="
+  echo "              Matrix Setup & Repair Tool v6.0"
+  echo "                    Enhanced Docker Edition"
+  echo "=================================================================="
+  echo "1.  🚀 Полная установка Matrix системы (Docker)"
+  echo "2.  📊 Проверить статус сервисов"
+  echo "3.  🔄 Перезапустить все сервисы"
+  echo "4.  👤 Создать пользователя (админ)"
+  echo "5.  🔧 Управление Docker контейнерами"
+  echo "6.  📋 Показать логи сервисов"
+  echo "7.  🔐 Показать секреты конфигурации"
+  echo "8.  🆙 Обновить все контейнеры"
+  echo "9.  🔍 Диагностика проблем контейнеров"
+  echo "10. ❌ Выход"
+  echo "=================================================================="
+}
+
+# Обновим основной цикл
 # Основной цикл
 while true; do
   show_menu
-  read -p "Выберите опцию (1-9): " choice
+  read -p "Выберите опцию (1-10): " choice
   
   case $choice in
     1) full_installation ;;
@@ -1181,7 +1355,8 @@ while true; do
     6) show_logs ;;
     7) show_secrets ;;
     8) update_containers; read -p "Нажмите Enter для продолжения..." ;;
-    9) echo "👋 До свидания!"; exit 0 ;;
+    9) diagnose_containers; read -p "Нажмите Enter для продолжения..." ;;
+    10) echo "👋 До свидания!"; exit 0 ;;
     *) echo "❌ Неверный выбор. Попробуйте снова."; sleep 2 ;;
   esac
 done
