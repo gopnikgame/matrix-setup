@@ -111,6 +111,13 @@ create_synapse_config() {
   
   echo "Создание расширенной конфигурации Synapse..."
   
+  # Сохраняем существующий ключ подписи, если он уже есть
+  EXISTING_SIGNING_KEY=""
+  if [ -f "/opt/synapse-data/signing.key" ]; then
+    EXISTING_SIGNING_KEY=$(cat /opt/synapse-data/signing.key)
+    echo "✅ Найден существующий ключ подписи, сохраняем его"
+  fi
+  
   # Создание основного конфига
   cat > /opt/synapse-data/homeserver.yaml <<EOL
 # Matrix Synapse Configuration v6.0
@@ -257,6 +264,12 @@ report_stats: false
 log_config: "/data/log_config.yaml"
 EOL
 
+  # Восстанавливаем ключ подписи если он был
+  if [ -n "$EXISTING_SIGNING_KEY" ]; then
+    echo "$EXISTING_SIGNING_KEY" > /opt/synapse-data/signing.key
+    echo "✅ Ключ подписи восстановлен"
+  fi
+
   # Создание конфигурации логирования
   cat > /opt/synapse-data/log_config.yaml <<EOL
 version: 1
@@ -283,6 +296,80 @@ disable_existing_loggers: false
 EOL
 
   echo "✅ Расширенная конфигурация Synapse создана"
+}
+
+# Функция для исправления проблемы с ключом подписи
+fix_signing_key() {
+  echo "=== Исправление ключа подписи Synapse ==="
+  
+  if [ ! -d "/opt/synapse-data" ]; then
+    echo "❌ Директория /opt/synapse-data не найдена"
+    return 1
+  fi
+  
+  # Остановка контейнера Synapse
+  echo "Остановка Synapse контейнера..."
+  docker stop matrix-synapse 2>/dev/null || true
+  
+  # Удаление неправильного ключа
+  if [ -f "/opt/synapse-data/signing.key" ]; then
+    echo "Удаление некорректного ключа подписи..."
+    rm -f /opt/synapse-data/signing.key
+  fi
+  
+  # Определение домена из конфигурации
+  MATRIX_DOMAIN=""
+  if [ -f "/opt/synapse-data/homeserver.yaml" ]; then
+    MATRIX_DOMAIN=$(grep "server_name:" /opt/synapse-data/homeserver.yaml | head -1 | sed 's/server_name: *"//' | sed 's/"//')
+  fi
+  
+  if [ -z "$MATRIX_DOMAIN" ]; then
+    read -p "Введите домен Matrix сервера: " MATRIX_DOMAIN
+  fi
+  
+  echo "Домен Matrix: $MATRIX_DOMAIN"
+  
+  # Генерация нового ключа через Synapse
+  echo "Генерация нового ключа подписи через Synapse..."
+  docker run --rm \
+    --mount type=bind,source=/opt/synapse-data,target=/data \
+    -e SYNAPSE_SERVER_NAME="$MATRIX_DOMAIN" \
+    -e SYNAPSE_REPORT_STATS=no \
+    matrixdotorg/synapse:latest generate
+    
+  if [ $? -eq 0 ]; then
+    echo "✅ Новый ключ подписи успешно создан"
+    
+    # Восстановление прав доступа
+    chown -R 991:991 /opt/synapse-data
+    
+    # Запуск контейнера обратно
+    echo "Запуск Synapse контейнера..."
+    cd /opt/synapse-config 2>/dev/null
+    if [ -f "docker-compose.yml" ]; then
+      docker compose up -d synapse
+      echo "✅ Synapse перезапущен"
+      
+      # Проверка запуска
+      echo "Ожидание готовности Synapse..."
+      for i in {1..12}; do
+        if curl -s http://localhost:8008/health >/dev/null 2>&1; then
+          echo "✅ Synapse готов!"
+          break
+        elif [ $i -eq 12 ]; then
+          echo "⚠️  Synapse запускается медленно, проверьте логи: docker logs matrix-synapse"
+        else
+          echo "   Ожидание... ($i/12)"
+          sleep 5
+        fi
+      done
+    else
+      echo "⚠️  docker-compose.yml не найден, запустите контейнер вручную"
+    fi
+  else
+    echo "❌ Ошибка генерации ключа"
+    return 1
+  fi
 }
 
 # Функция для создания Docker Compose конфигурации (исправленная)
@@ -842,19 +929,34 @@ full_installation() {
   mkdir -p /opt/synapse-admin
   mkdir -p /opt/coturn
   
-  # Создание конфигураций
+  # ИСПРАВЛЕННАЯ ПОСЛЕДОВАТЕЛЬНОСТЬ: Генерация конфигурации через Synapse
+  echo "Генерация базовой конфигурации Synapse..."
+  
+  # Установка прав доступа заранее
+  chown -R 991:991 /opt/synapse-data
+  
+  # Сначала генерируем БАЗОВУЮ конфигурацию и ключ через Docker
+  echo "Создание базовой конфигурации и ключа подписи через Synapse..."
+  docker run --rm \
+    --mount type=bind,source=/opt/synapse-data,target=/data \
+    -e SYNAPSE_SERVER_NAME="$MATRIX_DOMAIN" \
+    -e SYNAPSE_REPORT_STATS=no \
+    matrixdotorg/synapse:$SYNAPSE_VERSION generate
+    
+  if [ $? -ne 0 ]; then
+    echo "❌ Ошибка генерации конфигурации"
+    exit 1
+  fi
+  
+  echo "✅ Базовая конфигурация и ключ подписи созданы"
+  
+  # ВАЖНО: Теперь создаем нашу улучшенную конфигурацию БЕЗ перезаписи ключа
   create_synapse_config "$MATRIX_DOMAIN" "$DB_PASSWORD" "$REGISTRATION_SHARED_SECRET" "$TURN_SECRET" "$ADMIN_USER"
   create_element_config "$MATRIX_DOMAIN" "$ADMIN_USER"
   create_synapse_admin_config "$MATRIX_DOMAIN"
   create_coturn_config "$MATRIX_DOMAIN" "$TURN_SECRET" "$PUBLIC_IP" "$LOCAL_IP"
   
-  # Генерация ключа подписи для Synapse
-  echo "Генерация ключа подписи..."
-  if [ ! -f "/opt/synapse-data/signing.key" ]; then
-    openssl genpkey -algorithm Ed25519 -out /opt/synapse-data/signing.key
-  fi
-  
-  # Установка прав доступа
+  # Восстановление прав доступа после создания конфигураций
   chown -R 991:991 /opt/synapse-data
   
   # Создание Docker Compose конфигурации
@@ -1003,21 +1105,7 @@ full_installation() {
   echo "  docker exec -it matrix-synapse register_new_matrix_user \\"
   echo "    -c /data/homeserver.yaml -u $ADMIN_USER --admin http://localhost:8008"
   echo ""
-  echo "🔧 Управление сервисами:"
-  echo "  cd /opt/synapse-config"
-  echo "  docker compose ps          # Статус"
-  echo "  docker compose logs        # Логи"
-  echo "  docker compose restart     # Перезапуск"
-  echo ""
-  echo "🔍 Диагностика (при проблемах):"
-  echo "  docker logs matrix-synapse --tail 50    # Логи Synapse"
-  echo "  docker logs matrix-postgres --tail 50   # Логи PostgreSQL"
-  echo "  docker logs matrix-coturn --tail 50     # Логи Coturn"
-  echo ""
-  if [ "$SERVER_TYPE" = "proxmox" ]; then
-    echo "🌐 Для Proxmox VPS добавьте в Caddyfile хоста:"
-    echo "   Порты: $LOCAL_IP:8008, $LOCAL_IP:8080, $LOCAL_IP:8081, $LOCAL_IP:8448"
-  fi
+  echo "ℹ️  Signing key был автоматически создан Synapse в правильном формате"
   echo "================================================================="
 }
 
@@ -1336,15 +1424,15 @@ show_menu() {
   echo "7.  🔐 Показать секреты конфигурации"
   echo "8.  🆙 Обновить все контейнеры"
   echo "9.  🔍 Диагностика проблем контейнеров"
-  echo "10. ❌ Выход"
+  echo "10. 🔑 Исправить ключ подписи Synapse"
+  echo "11. ❌ Выход"
   echo "=================================================================="
 }
 
-# Обновим основной цикл
 # Основной цикл
 while true; do
   show_menu
-  read -p "Выберите опцию (1-10): " choice
+  read -p "Выберите опцию (1-11): " choice
   
   case $choice in
     1) full_installation ;;
@@ -1356,7 +1444,8 @@ while true; do
     7) show_secrets ;;
     8) update_containers; read -p "Нажмите Enter для продолжения..." ;;
     9) diagnose_containers; read -p "Нажмите Enter для продолжения..." ;;
-    10) echo "👋 До свидания!"; exit 0 ;;
+    10) fix_signing_key; read -p "Нажмите Enter для продолжения..." ;;
+    11) echo "👋 До свидания!"; exit 0 ;;
     *) echo "❌ Неверный выбор. Попробуйте снова."; sleep 2 ;;
   esac
 done
