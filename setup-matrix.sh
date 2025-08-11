@@ -223,7 +223,6 @@ check_status() {
     echo "❌ Много проблем с сервисами ($RUNNING_COUNT/$TOTAL_COUNT)"
   fi
   
-  # Рекомендации
   if [ "$RUNNING_COUNT" -lt "$TOTAL_COUNT" ]; then
     echo ""
     echo "🔧 Рекомендации:"
@@ -233,19 +232,16 @@ check_status() {
   fi
 }
 
-# Функция для исправления проблемы с доменными конфигурациями Element Web
 fix_element_domain_config() {
   echo "=== Исправление проблемы с доменными конфигурациями Element Web ==="
   echo ""
   
-  # Определение домена Element из конфигурации
   ELEMENT_DOMAIN=""
   if [ -f "/etc/caddy/Caddyfile" ]; then
     ELEMENT_DOMAIN=$(grep -A 5 "Element Web Client" /etc/caddy/Caddyfile | grep "^[a-zA-Z]" | head -1 | cut -d' ' -f1)
   fi
   
   if [ -z "$ELEMENT_DOMAIN" ]; then
-    # Пытаемся определить из логов
     ELEMENT_DOMAIN=$(docker logs matrix-element-web 2>&1 | grep -o 'config\.[a-zA-Z0-9.-]*\.json' | head -1 | sed 's/config\.//' | sed 's/\.json//')
     if [ -n "$ELEMENT_DOMAIN" ]; then
       echo "📋 Домен Element определён из логов: $ELEMENT_DOMAIN"
@@ -263,7 +259,6 @@ fix_element_domain_config() {
   
   echo "🔧 Исправление конфигурации для домена: $ELEMENT_DOMAIN"
   
-  # Определение Matrix домена
   MATRIX_DOMAIN=""
   if [ -f "/opt/synapse-data/homeserver.yaml" ]; then
     MATRIX_DOMAIN=$(grep "server_name:" /opt/synapse-data/homeserver.yaml | head -1 | sed 's/server_name: *"//' | sed 's/"//')
@@ -275,16 +270,13 @@ fix_element_domain_config() {
   
   echo "Matrix домен: $MATRIX_DOMAIN"
   
-  # Остановка Element Web контейнера
   echo "Остановка Element Web контейнера..."
   docker stop matrix-element-web 2>/dev/null || true
   
-  # Создание доменной конфигурации Element Web
   echo "Создание доменной конфигурации Element Web..."
   
   mkdir -p /opt/element-web
   
-  # Создаём основную конфигурацию
   cat > /opt/element-web/config.json <<EOL
 {
     "default_server_config": {
@@ -369,27 +361,79 @@ fix_element_domain_config() {
 }
 EOL
   
-  # Создаём доменную конфигурацию (копию основной)
   cp /opt/element-web/config.json "/opt/element-web/config.$ELEMENT_DOMAIN.json"
   echo "✅ Создана доменная конфигурация: config.$ELEMENT_DOMAIN.json"
   
-  # Модифицируем Docker Compose для монтирования доменной конфигурации
   if [ -f "/opt/synapse-config/docker-compose.yml" ]; then
     echo "Обновление Docker Compose конфигурации..."
     
-    # Создаём backup конфигурации
-    cp /opt/synapse-config/docker-compose.yml /opt/synapse-config/docker-compose.yml.backup
+    cp /opt/synapse-config/docker-compose.yml /opt/synapse-config/docker-compose.yml.backup.$(date +%s)
     
-    # Обновляем конфигурацию Element Web для монтирования обоих файлов
-    sed -i '/element-web:/,/stop_grace_period: 15s/ {
-      /volumes:/,/networks:/ {
-        s|volumes:|volumes:\n      - /opt/element-web/config.json:/app/config.json:ro\n      - /opt/element-web/config.'$ELEMENT_DOMAIN'.json:/app/config.'$ELEMENT_DOMAIN'.json:ro|
-        /- \/opt\/element-web\/config\.json:/d
-      }
-    }' /opt/synapse-config/docker-compose.yml
+    if ! grep -q "config.$ELEMENT_DOMAIN.json" /opt/synapse-config/docker-compose.yml; then
+      echo "Добавление монтирования доменной конфигурации..."
+      
+      python3 << EOF
+import yaml
+import os
+
+compose_file = "/opt/synapse-config/docker-compose.yml"
+
+try:
+    with open(compose_file, 'r') as f:
+        content = f.read()
+    
+    # Заменяем volumes в секции element-web
+    lines = content.split('\n')
+    new_lines = []
+    in_element_web = False
+    in_volumes = False
+    volumes_added = False
+    
+    for line in lines:
+        if 'element-web:' in line:
+            in_element_web = True
+            new_lines.append(line)
+        elif in_element_web and line.strip().startswith('volumes:'):
+            in_volumes = True
+            new_lines.append(line)
+            # Добавляем оба монтирования
+            new_lines.append('      - /opt/element-web/config.json:/app/config.json:ro')
+            new_lines.append('      - /opt/element-web/config.$ELEMENT_DOMAIN.json:/app/config.$ELEMENT_DOMAIN.json:ro')
+            volumes_added = True
+        elif in_element_web and in_volumes and line.strip().startswith('- ') and 'config.json' in line:
+            # Пропускаем старые записи config.json
+            continue
+        elif in_element_web and not line.startswith('  ') and line.strip():
+            # Вышли из секции element-web
+            in_element_web = False
+            in_volumes = False
+            new_lines.append(line)
+        else:
+            new_lines.append(line)
+    
+    # Записываем обновленный файл
+    with open(compose_file, 'w') as f:
+        f.write('\n'.join(new_lines))
+    
+    print("✅ Docker Compose обновлен через Python")
+    
+except Exception as e:
+    print(f"❌ Ошибка Python обновления: {e}")
+    # Fallback: используем sed
+    os.system('sed -i "/element-web:/,/stop_grace_period: 15s/ { /- \/opt\/element-web\/config\.json/d; /volumes:/a\\      - /opt/element-web/config.json:/app/config.json:ro\\n      - /opt/element-web/config.$ELEMENT_DOMAIN.json:/app/config.$ELEMENT_DOMAIN.json:ro }" /opt/synapse-config/docker-compose.yml')
+    print("✅ Docker Compose обновлен через sed")
+EOF
+    else
+      echo "✅ Доменная конфигурация уже присутствует в Docker Compose"
+    fi
     
     echo "✅ Docker Compose конфигурация обновлена"
   fi
+  
+  # Проверяем права доступа на файлы конфигурации
+  echo "Проверка прав доступа..."
+  chown root:root /opt/element-web/config*.json
+  chmod 644 /opt/element-web/config*.json
   
   # Запуск Element Web контейнера
   echo "Запуск Element Web контейнера..."
@@ -426,6 +470,11 @@ EOL
       echo "✅ Доменная конфигурация доступна: /config.$ELEMENT_DOMAIN.json"
     else
       echo "❌ Доменная конфигурация недоступна"
+      echo "🔧 Диагностика:"
+      echo "   Проверка монтирования в контейнере..."
+      docker exec matrix-element-web ls -la /app/config*.json 2>/dev/null || echo "   Файлы не видны в контейнере"
+      echo "   Проверка файлов на хосте..."
+      ls -la /opt/element-web/config*.json 2>/dev/null || echo "   Файлы отсутствуют на хосте"
     fi
     
   else
@@ -452,6 +501,7 @@ EOL
   echo "   - Проверьте логи: docker logs matrix-element-web"
   echo "   - Убедитесь что reverse proxy правильно настроен"
   echo "   - Проверьте права доступа: ls -la /opt/element-web/"
+  echo "   - Проверьте Docker Compose: cat /opt/synapse-config/docker-compose.yml | grep -A 15 element-web"
   echo "================================================================="
 }
 
@@ -832,7 +882,7 @@ fix_signing_key() {
     # Восстановление прав доступа
     chown -R 991:991 /opt/synapse-data
     
-    # Запуск контейнера обратно
+    # Запуск контейера обратно
     echo "Запуск Synapse контейнера..."
     cd /opt/synapse-config 2>/dev/null
     if [ -f "docker-compose.yml" ]; then
@@ -2071,6 +2121,93 @@ manage_coturn() {
   read -p "Нажмите Enter для продолжения..."
 }
 
+# Функция для ручного исправления Docker Compose монтирования Element Web
+fix_element_web_docker_mount() {
+  echo "=== Ручное исправление монтирования Element Web ==="
+  echo ""
+  
+  # Проверяем наличие файлов
+  if [ ! -f "/opt/element-web/config.json" ]; then
+    echo "❌ Основной конфиг Element Web не найден"
+    return 1
+  fi
+  
+  # Определяем доменную конфигурацию
+  DOMAIN_CONFIG=$(find /opt/element-web -name "config.*.json" | head -1)
+  if [ -z "$DOMAIN_CONFIG" ]; then
+    echo "❌ Доменная конфигурация Element Web не найдена"
+    echo "Сначала запустите опцию 13 для создания доменной конфигурации"
+    return 1
+  fi
+  
+  DOMAIN_FILE=$(basename "$DOMAIN_CONFIG")
+  echo "📋 Найдена доменная конфигурация: $DOMAIN_FILE"
+  
+  # Остановка Element Web
+  echo "Остановка Element Web контейнера..."
+  docker stop matrix-element-web 2>/dev/null || true
+  
+  # Backup Docker Compose
+  cd /opt/synapse-config 2>/dev/null || { echo "❌ Конфигурация не найдена"; return 1; }
+  cp docker-compose.yml docker-compose.yml.backup.manual.$(date +%s)
+  
+  # Исправление через Python для точности
+  echo "Исправление Docker Compose конфигурации..."
+  
+python3 << EOF
+import re
+
+compose_file = "/opt/synapse-config/docker-compose.yml"
+
+try:
+    with open(compose_file, 'r') as f:
+        content = f.read()
+    
+    # Ищем секцию element-web и заменяем volumes
+    pattern = r'(element-web:.*?volumes:\s*\n)(.*?)(^\s{2}\w|\Z)'
+    
+    def replace_volumes(match):
+        prefix = match.group(1)
+        suffix = match.group(3) if match.group(3) and not match.group(3).strip() == '' else ''
+        
+        new_volumes = '''      - /opt/element-web/config.json:/app/config.json:ro
+      - /opt/element-web/$DOMAIN_FILE:/app/$DOMAIN_FILE:ro
+'''
+        return prefix + new_volumes + suffix
+    
+    new_content = re.sub(pattern, replace_volumes, content, flags=re.MULTILINE | re.DOTALL)
+    
+    with open(compose_file, 'w') as f:
+        f.write(new_content)
+    
+    print("✅ Docker Compose обновлен")
+    
+except Exception as e:
+    print(f"❌ Ошибка: {e}")
+EOF
+  
+  # Запуск Element Web
+  echo "Запуск Element Web..."
+  docker compose up -d element-web
+  
+  # Проверка
+  echo "Проверка результата..."
+  sleep 3
+  
+  if curl -s "http://localhost:8080/$DOMAIN_FILE" | grep -q "default_server_config"; then
+    echo "✅ Доменная конфигурация успешно доступна!"
+  else
+    echo "❌ Доменная конфигурация всё ещё недоступна"
+    echo ""
+    echo "🔧 Дополнительная диагностика:"
+    echo "Содержимое контейнера:"
+    docker exec matrix-element-web ls -la /app/config*.json
+    echo ""
+    echo "Монтирования в Docker Compose:"
+    grep -A 10 -B 2 "volumes:" docker-compose.yml | grep -A 12 element-web
+  fi
+}
+
 # Обновляем главное меню
 show_menu() {
   clear
@@ -2091,7 +2228,8 @@ show_menu() {
   echo "11. 📞 Управление Coturn (VoIP сервер)"
   echo "12. ⚙️  Управление Synapse (федерация, регистрация)"
   echo "13. 🌐 Исправить конфигурацию Element Web"
-  echo "14. ❌ Выход"
+  echo "14. 🛠️  Ручное исправление Docker монтирования Element Web"
+  echo "15. ❌ Выход"
   echo "=================================================================="
 }
 
@@ -2130,10 +2268,11 @@ manage_synapse_module() {
   "$manage_script"
 }
 
+
 # Основной цикл
 while true; do
   show_menu
-  read -p "Выберите опцию (1-14): " choice
+  read -p "Выберите опцию (1-15): " choice
   
   case $choice in
     1) full_installation ;;
@@ -2149,7 +2288,8 @@ while true; do
     11) manage_coturn ;;
     12) manage_synapse_module ;;
     13) fix_element_domain_config; read -p "Нажмите Enter для продолжения..." ;;
-    14) echo "👋 До свидания!"; exit 0 ;;
+    14) fix_element_web_docker_mount; read -p "Нажмите Enter для продолжения..." ;;
+    15) echo "👋 До свидания!"; exit 0 ;;
     *) echo "❌ Неверный выбор. Попробуйте снова."; sleep 2 ;;
   esac
 done
