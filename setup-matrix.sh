@@ -101,6 +101,273 @@ install_docker() {
   fi
 }
 
+# Функция проверки статуса Matrix сервисов
+check_status() {
+  echo "=== Статус Matrix сервисов ==="
+  echo ""
+  
+  # Проверка Docker
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "❌ Docker не установлен"
+    return 1
+  fi
+  
+  if ! systemctl is-active --quiet docker; then
+    echo "❌ Docker не запущен"
+    return 1
+  fi
+  
+  echo "✅ Docker работает: $(docker --version | cut -d' ' -f3 | tr -d ',')"
+  echo ""
+  
+  # Проверка конфигурации
+  if [ ! -f "/opt/synapse-config/docker-compose.yml" ]; then
+    echo "❌ Docker Compose конфигурация не найдена"
+    echo "   Запустите полную установку (опция 1)"
+    return 1
+  fi
+  
+  echo "📋 Статус контейнеров:"
+  cd /opt/synapse-config 2>/dev/null || { echo "❌ Конфигурация недоступна"; return 1; }
+  docker compose ps
+  echo ""
+  
+  # Проверка каждого сервиса
+  echo "🔍 Проверка доступности сервисов:"
+  
+  # PostgreSQL
+  if docker exec matrix-postgres pg_isready -U matrix >/dev/null 2>&1; then
+    echo "✅ PostgreSQL работает"
+  else
+    echo "❌ PostgreSQL недоступен"
+  fi
+  
+  # Synapse API
+  if curl -s -f http://localhost:8008/health >/dev/null 2>&1; then
+    echo "✅ Synapse API доступен"
+    
+    # Проверяем версию Synapse
+    SYNAPSE_VERSION_API=$(curl -s http://localhost:8008/_matrix/client/versions 2>/dev/null | python3 -c "import sys, json; print(json.load(sys.stdin).get('server', {}).get('version', 'unknown'))" 2>/dev/null || echo "неизвестна")
+    echo "   Версия Synapse: $SYNAPSE_VERSION_API"
+  else
+    echo "❌ Synapse API недоступен"
+  fi
+  
+  # Element Web
+  if curl -s -f http://localhost:8080/ >/dev/null 2>&1; then
+    echo "✅ Element Web доступен"
+  else
+    echo "❌ Element Web недоступен"
+  fi
+  
+  # Synapse Admin
+  if curl -s -f http://localhost:8081/ >/dev/null 2>&1; then
+    echo "✅ Synapse Admin доступен"
+  else
+    echo "❌ Synapse Admin недоступен"
+  fi
+  
+  # Coturn
+  if docker ps | grep -q "matrix-coturn.*Up"; then
+    echo "✅ Coturn запущен"
+    
+    # Проверка портов Coturn
+    if netstat -tulpn 2>/dev/null | grep -q ":3478"; then
+      echo "   Порт 3478 (TURN) слушается"
+    else
+      echo "   ⚠️  Порт 3478 не слушается"
+    fi
+  else
+    echo "❌ Coturn не запущен"
+  fi
+  
+  echo ""
+  echo "🌐 Сетевые порты:"
+  netstat -tlnp 2>/dev/null | grep -E "(8008|8080|8081|8448|3478)" | head -10 || echo "   Основные порты не слушаются"
+  
+  echo ""
+  echo "💾 Использование дискового пространства:"
+  if [ -d "/opt/synapse-data" ]; then
+    DATA_SIZE=$(du -sh /opt/synapse-data 2>/dev/null | cut -f1)
+    echo "   /opt/synapse-data: $DATA_SIZE"
+  fi
+  
+  # Проверка домена из конфигурации
+  if [ -f "/opt/synapse-data/homeserver.yaml" ]; then
+    MATRIX_DOMAIN=$(grep "server_name:" /opt/synapse-data/homeserver.yaml | head -1 | sed 's/server_name: *"//' | sed 's/"//')
+    echo ""
+    echo "🔗 Конфигурация:"
+    echo "   Matrix домен: $MATRIX_DOMAIN"
+    
+    # Проверка federation
+    FEDERATION_STATUS=$(grep -A 1 "federation_domain_whitelist:" /opt/synapse-data/homeserver.yaml | tail -1 | grep -q "^\s*$" && echo "отключена" || echo "настроена")
+    echo "   Федерация: $FEDERATION_STATUS"
+    
+    # Проверка регистрации
+    REGISTRATION_STATUS=$(grep "enable_registration:" /opt/synapse-data/homeserver.yaml | grep -q "true" && echo "открыта" || echo "закрыта")
+    echo "   Регистрация: $REGISTRATION_STATUS"
+  fi
+  
+  echo ""
+  echo "📊 Общий статус:"
+  
+  # Подсчет работающих сервисов
+  RUNNING_COUNT=$(docker ps --filter "name=matrix-" --format "{{.Names}}" | wc -l)
+  TOTAL_COUNT=5  # postgres, synapse, element-web, synapse-admin, coturn
+  
+  if [ "$RUNNING_COUNT" -eq "$TOTAL_COUNT" ]; then
+    echo "✅ Все сервисы работают ($RUNNING_COUNT/$TOTAL_COUNT)"
+  elif [ "$RUNNING_COUNT" -ge 3 ]; then
+    echo "⚠️  Большинство сервисов работает ($RUNNING_COUNT/$TOTAL_COUNT)"
+  else
+    echo "❌ Много проблем с сервисами ($RUNNING_COUNT/$TOTAL_COUNT)"
+  fi
+  
+  # Рекомендации
+  if [ "$RUNNING_COUNT" -lt "$TOTAL_COUNT" ]; then
+    echo ""
+    echo "🔧 Рекомендации:"
+    echo "   - Перезапустите сервисы (опция 3)"
+    echo "   - Проверьте логи (опция 6)"
+    echo "   - Запустите диагностику (опция 9)"
+  fi
+}
+
+# Функция создания пользователя (админ)
+create_admin_user() {
+  echo "=== Создание пользователя Matrix ==="
+  echo ""
+  
+  # Проверка что Synapse запущен
+  if ! curl -s http://localhost:8008/health >/dev/null 2>&1; then
+    echo "❌ Synapse недоступен. Сначала запустите Matrix сервисы."
+    echo "   Используйте опцию 3 (Перезапустить все сервисы)"
+    return 1
+  fi
+  
+  # Определение домена из конфигурации
+  MATRIX_DOMAIN=""
+  if [ -f "/opt/synapse-data/homeserver.yaml" ]; then
+    MATRIX_DOMAIN=$(grep "server_name:" /opt/synapse-data/homeserver.yaml | head -1 | sed 's/server_name: *"//' | sed 's/"//')
+  fi
+  
+  if [ -z "$MATRIX_DOMAIN" ]; then
+    echo "❌ Не удалось определить домен Matrix сервера"
+    read -p "Введите домен Matrix сервера: " MATRIX_DOMAIN
+  fi
+  
+  echo "📋 Информация:"
+  echo "   Matrix домен: $MATRIX_DOMAIN"
+  echo "   Пользователь будет создан как: @username:$MATRIX_DOMAIN"
+  echo ""
+  
+  # Запрос данных пользователя
+  read -p "Введите имя пользователя (только латинские буквы, цифры, - и _): " username
+  
+  # Валидация имени пользователя
+  if [[ ! "$username" =~ ^[a-zA-Z0-9._=-]+$ ]]; then
+    echo "❌ Неверное имя пользователя. Используйте только латинские буквы, цифры, точки, дефисы и подчеркивания."
+    return 1
+  fi
+  
+  read -p "Сделать пользователя администратором? (Y/n): " make_admin
+  
+  # Определение флага администратора
+  admin_flag=""
+  admin_text=""
+  if [[ $make_admin != [nN] ]]; then
+    admin_flag="--admin"
+    admin_text=" (администратор)"
+  fi
+  
+  echo ""
+  echo "🔄 Создание пользователя @$username:$MATRIX_DOMAIN$admin_text..."
+  echo ""
+  
+  # Создание пользователя через Docker
+  if docker exec -it matrix-synapse register_new_matrix_user \
+    -c /data/homeserver.yaml \
+    -u "$username" \
+    $admin_flag \
+    http://localhost:8008; then
+    
+    echo ""
+    echo "================================================================="
+    echo "✅ Пользователь успешно создан!"
+    echo "================================================================="
+    echo ""
+    echo "📋 Информация о пользователе:"
+    echo "   Полный ID: @$username:$MATRIX_DOMAIN"
+    echo "   Домен: $MATRIX_DOMAIN"
+    echo "   Тип: $([ -n "$admin_flag" ] && echo "Администратор" || echo "Обычный пользователь")"
+    echo ""
+    echo "🌐 Доступ к сервисам:"
+    
+    # Определение доменов для веб-интерфейсов
+    if [ -f "/opt/synapse-data/homeserver.yaml" ]; then
+      echo "   Matrix API: https://$MATRIX_DOMAIN"
+    fi
+    
+    if [ -f "/etc/caddy/Caddyfile" ]; then
+      ELEMENT_DOMAIN=$(grep -A 5 "Element Web Client" /etc/caddy/Caddyfile | grep "^[a-zA-Z]" | head -1 | cut -d' ' -f1)
+      ADMIN_DOMAIN=$(grep -A 5 "Synapse Admin Interface" /etc/caddy/Caddyfile | grep "^[a-zA-Z]" | head -1 | cut -d' ' -f1)
+      
+      if [ -n "$ELEMENT_DOMAIN" ]; then
+        echo "   Element Web: https://$ELEMENT_DOMAIN"
+      fi
+      
+      if [ -n "$ADMIN_DOMAIN" ] && [ -n "$admin_flag" ]; then
+        echo "   Synapse Admin: https://$ADMIN_DOMAIN"
+      fi
+    else
+      echo "   Element Web: http://localhost:8080 (локально)"
+      if [ -n "$admin_flag" ]; then
+        echo "   Synapse Admin: http://localhost:8081 (локально)"
+      fi
+    fi
+    
+    echo ""
+    echo "📱 Для подключения через клиенты:"
+    echo "   Homeserver: https://$MATRIX_DOMAIN"
+    echo "   Логин: @$username:$MATRIX_DOMAIN"
+    echo "   Пароль: [который вы установили]"
+    echo ""
+    
+    if [ -n "$admin_flag" ]; then
+      echo "👑 Администраторские возможности:"
+      echo "   - Управление пользователями через Synapse Admin"
+      echo "   - Создание комнат и управление ими"
+      echo "   - Настройка политик сервера"
+      echo "   - Доступ к статистике и мониторингу"
+      echo ""
+    fi
+    
+    echo "ℹ️  Рекомендации:"
+    echo "   - Используйте сложный пароль"
+    echo "   - Включите двухфакторную аутентификацию в клиенте"
+    echo "   - Проверьте доступность сервера через веб-интерфейс"
+    echo "================================================================="
+    
+    return 0
+  else
+    echo ""
+    echo "❌ Ошибка создания пользователя"
+    echo ""
+    echo "🔧 Возможные причины:"
+    echo "   - Synapse не готов (попробуйте через минуту)"
+    echo "   - Пользователь уже существует"
+    echo "   - Проблемы с базой данных"
+    echo "   - Неверная конфигурация"
+    echo ""
+    echo "🔍 Для диагностики:"
+    echo "   - Проверьте статус (опция 2)"
+    echo "   - Просмотрите логи Synapse (опция 6 → 1)"
+    echo "   - Запустите диагностику (опция 9)"
+    echo ""
+    return 1
+  fi
+}
+
 # Функция для создания улучшенной конфигурации Synapse
 create_synapse_config() {
   local matrix_domain=$1
@@ -999,7 +1266,7 @@ full_installation() {
       echo "   ✅ PostgreSQL готов!"
       break
     elif [ $i -eq 12 ]; then
-      echo "   ❌ PostgreSQL не запустился. Проверяем логи:"
+      echo "   ❌ PostgreSQL не запустился. Проверьте логи:"
       docker logs matrix-postgres --tail 20
       exit 1
     else
@@ -1091,7 +1358,7 @@ full_installation() {
   docker compose ps
   
   echo ""
-  echo "=== Проверка доступности сервисов ==="
+  echo "=== Проверьте доступность сервисов ==="
   
   # Проверка Synapse API
   if curl -s http://localhost:8008/_matrix/client/versions >/dev/null; then
@@ -1147,6 +1414,8 @@ full_installation() {
   echo ""
   echo "ℹ️  Signing key был автоматически создан Synapse в правильном формате"
   echo "================================================================="
+  
+  read -p "Нажмите Enter для продолжения..."
 }
 
 # Функция диагностики проблем с контейнерами
@@ -1187,7 +1456,7 @@ diagnose_containers() {
   
   echo ""
   echo "🌐 Проверка сетевых портов:"
-  netstat -tlnp | grep -E "(8008|8080|8081|8448|3478)" | head -10
+  netstat -tulpn | grep -E "(8008|8080|8081|8448|3478)" | head -10
   
   echo ""
   echo "💾 Использование дискового пространства:"
@@ -1223,65 +1492,64 @@ diagnose_containers() {
   echo "  docker exec -it matrix-synapse bash  # Вход в контейнер Synapse"
 }
 
-# Функция создания администратора
-create_admin_user() {
-  echo "=== Создание администратора ==="
+# Функция для последовательного запуска сервисов
+start_services_sequentially() {
+  cd /opt/synapse-config 2>/dev/null || { echo "❌ Конфигурация не найдена"; return 1; }
   
-  if ! docker ps | grep -q "matrix-synapse"; then
-    echo "❌ Matrix Synapse не запущен"
+  echo "Запуск сервисов в правильном порядке..."
+  
+  echo "1. Запуск PostgreSQL..."
+  if ! docker compose up -d postgres; then
+    echo "❌ Ошибка запуска PostgreSQL"
+    docker compose logs postgres
     return 1
   fi
   
-  read -p "Введите имя пользователя: " username
-  read -p "Сделать администратором? (Y/n): " make_admin
+  echo "2. Ожидание готовности PostgreSQL..."
+  for i in {1..12}; do
+    if docker exec matrix-postgres pg_isready -U matrix >/dev/null 2>&1; then
+      echo "   ✅ PostgreSQL готов!"
+      break
+    elif [ $i -eq 12 ]; then
+      echo "   ❌ PostgreSQL не запустился. Проверьте логи."
+      docker logs matrix-postgres --tail 20
+      return 1
+    else
+      echo "   Ожидание PostgreSQL... ($i/12)"
+      sleep 5
+    fi
+  done
   
-  admin_flag=""
-  if [[ $make_admin != [nN] ]]; then
-    admin_flag="--admin"
+  echo "3. Запуск Synapse..."
+  if ! docker compose up -d synapse; then
+    echo "❌ Ошибка запуска Synapse"
+    docker compose logs synapse
+    return 1
   fi
   
-  echo "Создание пользователя..."
-  docker exec -it matrix-synapse register_new_matrix_user \
-    -c /data/homeserver.yaml \
-    -u "$username" \
-    $admin_flag \
-    http://localhost:8008
-    
-  if [ $? -eq 0 ]; then
-    echo "✅ Пользователь @$username успешно создан"
-  else
-    echo "❌ Ошибка создания пользователя"
-  fi
-}
-
-# Функция проверки статуса
-check_status() {
-  echo "=== Статус Matrix сервисов ==="
-  echo ""
+  echo "4. Ожидание готовности Synapse..."
+  for i in {1..24}; do
+    if curl -s http://localhost:8008/health >/dev/null 2>&1; then
+      echo "   ✅ Synapse готов!"
+      break
+    elif [ $i -eq 24 ]; then
+      echo "   ❌ Synapse не запустился. Проверьте логи."
+      docker logs matrix-synapse --tail 30
+      return 1
+    else
+      echo "   Ожидание Synapse... ($i/24)"
+      sleep 10
+    fi
+  done
   
-  if command -v docker >/dev/null 2>&1; then
-    echo "🐳 Docker контейнеры:"
-    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" --filter "name=matrix"
-    echo ""
-    
-    echo "📊 Использование ресурсов:"
-    docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}" --filter "name=matrix"
-    echo ""
-    
-    echo "🏥 Healthcheck статус:"
-    for container in matrix-synapse matrix-postgres matrix-element-web matrix-synapse-admin; do
-      if docker ps | grep -q "$container"; then
-        health=$(docker inspect --format='{{.State.Health.Status}}' "$container" 2>/dev/null || echo "no healthcheck")
-        echo "  $container: $health"
-      fi
-    done
-  else
-    echo "❌ Docker не установлен"
+  echo "5. Запуск остальных сервисов..."
+  if ! docker compose up -d; then
+    echo "⚠️  Возникли ошибки при запуске остальных сервисов."
+    echo "Проверьте их статус и логи."
   fi
   
-  echo ""
-  echo "🌐 Сетевые порты:"
-  netstat -tlnp | grep -E "(8008|8080|8081|8448|3478)" | head -10
+  echo "✅ Все сервисы запущены."
+  docker compose ps
 }
 
 # Функция перезапуска сервисов
@@ -1290,12 +1558,13 @@ restart_services() {
   
   if [ -f "/opt/synapse-config/docker-compose.yml" ]; then
     cd /opt/synapse-config
-    echo "Перезапуск Docker контейнеров..."
-    docker compose restart
-    echo "✅ Сервисы перезапущены"
+    echo "Остановка всех контейнеров..."
+    docker compose stop
+    echo "Последовательный запуск сервисов..."
+    start_services_sequentially
     
     echo "Ожидание готовности..."
-    sleep 15
+    sleep 5
     check_status
   else
     echo "❌ Docker Compose конфигурация не найдена"
@@ -1330,12 +1599,12 @@ manage_docker() {
       }
       ;;
     3) 
-      echo "Запуск всех контейнеров..."
-      docker compose up -d
+      echo "Запуск всех контейнеров в правильном порядке..."
+      start_services_sequentially
       ;;
     4) 
       echo "Перезапуск всех контейнеров..."
-      docker compose restart
+      restart_services
       ;;
     5)
       echo "Принудительная остановка контейнеров..."
