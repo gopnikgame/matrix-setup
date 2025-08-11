@@ -233,6 +233,228 @@ check_status() {
   fi
 }
 
+# Функция для исправления проблемы с доменными конфигурациями Element Web
+fix_element_domain_config() {
+  echo "=== Исправление проблемы с доменными конфигурациями Element Web ==="
+  echo ""
+  
+  # Определение домена Element из конфигурации
+  ELEMENT_DOMAIN=""
+  if [ -f "/etc/caddy/Caddyfile" ]; then
+    ELEMENT_DOMAIN=$(grep -A 5 "Element Web Client" /etc/caddy/Caddyfile | grep "^[a-zA-Z]" | head -1 | cut -d' ' -f1)
+  fi
+  
+  if [ -z "$ELEMENT_DOMAIN" ]; then
+    # Пытаемся определить из логов
+    ELEMENT_DOMAIN=$(docker logs matrix-element-web 2>&1 | grep -o 'config\.[a-zA-Z0-9.-]*\.json' | head -1 | sed 's/config\.//' | sed 's/\.json//')
+    if [ -n "$ELEMENT_DOMAIN" ]; then
+      echo "📋 Домен Element определён из логов: $ELEMENT_DOMAIN"
+    else
+      read -p "Введите домен Element Web (например, app.bla-bla.space): " ELEMENT_DOMAIN
+    fi
+  else
+    echo "📋 Домен Element найден в Caddyfile: $ELEMENT_DOMAIN"
+  fi
+  
+  if [ -z "$ELEMENT_DOMAIN" ]; then
+    echo "❌ Не удалось определить домен Element Web"
+    return 1
+  fi
+  
+  echo "🔧 Исправление конфигурации для домена: $ELEMENT_DOMAIN"
+  
+  # Определение Matrix домена
+  MATRIX_DOMAIN=""
+  if [ -f "/opt/synapse-data/homeserver.yaml" ]; then
+    MATRIX_DOMAIN=$(grep "server_name:" /opt/synapse-data/homeserver.yaml | head -1 | sed 's/server_name: *"//' | sed 's/"//')
+  fi
+  
+  if [ -z "$MATRIX_DOMAIN" ]; then
+    read -p "Введите домен Matrix сервера: " MATRIX_DOMAIN
+  fi
+  
+  echo "Matrix домен: $MATRIX_DOMAIN"
+  
+  # Остановка Element Web контейнера
+  echo "Остановка Element Web контейнера..."
+  docker stop matrix-element-web 2>/dev/null || true
+  
+  # Создание доменной конфигурации Element Web
+  echo "Создание доменной конфигурации Element Web..."
+  
+  mkdir -p /opt/element-web
+  
+  # Создаём основную конфигурацию
+  cat > /opt/element-web/config.json <<EOL
+{
+    "default_server_config": {
+        "m.homeserver": {
+            "base_url": "https://$MATRIX_DOMAIN",
+            "server_name": "$MATRIX_DOMAIN"
+        },
+        "m.identity_server": {
+            "base_url": "https://vector.im"
+        }
+    },
+    "brand": "Element",
+    "integrations_ui_url": "https://scalar.vector.im/",
+    "integrations_rest_url": "https://scalar.vector.im/api",
+    "integrations_widgets_urls": [
+        "https://scalar.vector.im/_matrix/integrations/v1",
+        "https://scalar.vector.im/api",
+        "https://scalar-staging.vector.im/_matrix/integrations/v1",
+        "https://scalar-stAGING.vector.im/api"
+    ],
+    "hosting_signup_link": "https://element.io/matrix-services?utm_source=element-web&utm_medium=web",
+    "bug_report_endpoint_url": "https://element.io/bugreports/submit",
+    "uisi_autorageshake_app": "element-auto-uisi",
+    "showLabsSettings": true,
+    "piwik": false,
+    "roomDirectory": {
+        "servers": ["$MATRIX_DOMAIN"]
+    },
+    "enable_presence_by_hs_url": {
+        "https://matrix.org": false,
+        "https://matrix-client.matrix.org": false
+    },
+    "terms_and_conditions_links": [
+        {
+            "text": "Privacy Policy",
+            "url": "https://$MATRIX_DOMAIN/privacy"
+        },
+        {
+            "text": "Terms of Service", 
+            "url": "https://$MATRIX_DOMAIN/terms"
+        }
+    ],
+    "welcomeUserId": "@admin:$MATRIX_DOMAIN",
+    "default_federate": false,
+    "default_theme": "dark",
+    "features": {
+        "feature_new_room_decoration_ui": true,
+        "feature_pinning": "labs",
+        "feature_custom_status": "labs",
+        "feature_custom_tags": "labs",
+        "feature_state_counters": "labs",
+        "feature_many_profile_picture_sizes": true,
+        "feature_mjolnir": "labs",
+        "feature_custom_themes": "labs",
+        "feature_spaces": true,
+        "feature_spaces.all_rooms": true,
+        "feature_spaces.space_member_dms": true,
+        "feature_voice_messages": true,
+        "feature_location_share_live": true,
+        "feature_polls": true,
+        "feature_location_share": true,
+        "feature_thread": true,
+        "feature_latex_maths": true,
+        "feature_element_call_video_rooms": "labs",
+        "feature_group_calls": "labs",
+        "feature_disable_call_per_sender_encryption": "labs",
+        "feature_allow_screen_share_only_mode": "labs",
+        "feature_location_share_pin_drop": "labs",
+        "feature_video_rooms": "labs",
+        "feature_element_call": "labs",
+        "feature_new_device_manager": true,
+        "feature_bulk_redaction": "labs",
+        "feature_roomlist_preview_reactions_dms": true,
+        "feature_roomlist_preview_reactions_all": true
+    },
+    "element_call": {
+        "url": "https://call.element.io",
+        "participant_limit": 8,
+        "brand": "Element Call"
+    },
+    "map_style_url": "https://api.maptiler.com/maps/streets/style.json?key=fU3vlMsMn4Jb6dnEIFsx"
+}
+EOL
+  
+  # Создаём доменную конфигурацию (копию основной)
+  cp /opt/element-web/config.json "/opt/element-web/config.$ELEMENT_DOMAIN.json"
+  echo "✅ Создана доменная конфигурация: config.$ELEMENT_DOMAIN.json"
+  
+  # Модифицируем Docker Compose для монтирования доменной конфигурации
+  if [ -f "/opt/synapse-config/docker-compose.yml" ]; then
+    echo "Обновление Docker Compose конфигурации..."
+    
+    # Создаём backup конфигурации
+    cp /opt/synapse-config/docker-compose.yml /opt/synapse-config/docker-compose.yml.backup
+    
+    # Обновляем конфигурацию Element Web для монтирования обоих файлов
+    sed -i '/element-web:/,/stop_grace_period: 15s/ {
+      /volumes:/,/networks:/ {
+        s|volumes:|volumes:\n      - /opt/element-web/config.json:/app/config.json:ro\n      - /opt/element-web/config.'$ELEMENT_DOMAIN'.json:/app/config.'$ELEMENT_DOMAIN'.json:ro|
+        /- \/opt\/element-web\/config\.json:/d
+      }
+    }' /opt/synapse-config/docker-compose.yml
+    
+    echo "✅ Docker Compose конфигурация обновлена"
+  fi
+  
+  # Запуск Element Web контейнера
+  echo "Запуск Element Web контейнера..."
+  cd /opt/synapse-config 2>/dev/null
+  if [ -f "docker-compose.yml" ]; then
+    docker compose up -d element-web
+    echo "✅ Element Web перезапущен"
+    
+    # Проверка запуска
+    echo "Ожидание готовности Element Web..."
+    for i in {1..12}; do
+      if curl -s http://localhost:8080/ >/dev/null 2>&1; then
+        echo "✅ Element Web готов!"
+        break
+      elif [ $i -eq 12 ]; then
+        echo "⚠️  Element Web запускается медленно, проверьте логи: docker logs matrix-element-web"
+      else
+        echo "   Ожидание... ($i/12)"
+        sleep 5
+      fi
+    done
+    
+    # Проверка доступности доменного конфига
+    echo ""
+    echo "🔍 Проверка доступности конфигураций:"
+    
+    if curl -s "http://localhost:8080/config.json" >/dev/null 2>&1; then
+      echo "✅ Основная конфигурация доступна: /config.json"
+    else
+      echo "❌ Основная конфигурация недоступна"
+    fi
+    
+    if curl -s "http://localhost:8080/config.$ELEMENT_DOMAIN.json" >/dev/null 2>&1; then
+      echo "✅ Доменная конфигурация доступна: /config.$ELEMENT_DOMAIN.json"
+    else
+      echo "❌ Доменная конфигурация недоступна"
+    fi
+    
+  else
+    echo "⚠️  docker-compose.yml не найден, запустите контейнер вручную"
+  fi
+  
+  echo ""
+  echo "================================================================="
+  echo "✅ Исправление конфигурации Element Web завершено!"
+  echo "================================================================="
+  echo ""
+  echo "📋 Что было сделано:"
+  echo "   - Создана основная конфигурация: /opt/element-web/config.json"
+  echo "   - Создана доменная конфигурация: /opt/element-web/config.$ELEMENT_DOMAIN.json"
+  echo "   - Обновлена Docker Compose конфигурация"
+  echo "   - Перезапущен Element Web контейнер"
+  echo ""
+  echo "🌐 Проверьте доступность:"
+  echo "   - http://localhost:8080/config.json"
+  echo "   - http://localhost:8080/config.$ELEMENT_DOMAIN.json"
+  echo "   - https://$ELEMENT_DOMAIN (если настроен reverse proxy)"
+  echo ""
+  echo "🔧 Если проблема повторяется:"
+  echo "   - Проверьте логи: docker logs matrix-element-web"
+  echo "   - Убедитесь что reverse proxy правильно настроен"
+  echo "   - Проверьте права доступа: ls -la /opt/element-web/"
+  echo "================================================================="
+}
+
 # Функция создания пользователя (админ)
 create_admin_user() {
   echo "=== Создание пользователя Matrix ==="
@@ -796,7 +1018,7 @@ create_element_config() {
         "https://scalar.vector.im/_matrix/integrations/v1",
         "https://scalar.vector.im/api",
         "https://scalar-staging.vector.im/_matrix/integrations/v1",
-        "https://scalar-staging.vector.im/api"
+        "https://scalar-stAGING.vector.im/api"
     ],
     "hosting_signup_link": "https://element.io/matrix-services?utm_source=element-web&utm_medium=web",
     "bug_report_endpoint_url": "https://element.io/bugreports/submit",
@@ -1443,6 +1665,27 @@ diagnose_containers() {
       health=$(docker inspect --format='{{.State.Health.Status}}' "$container" 2>/dev/null || echo "no healthcheck")
       echo "Healthcheck: $health"
       
+      # Специальная проверка для Element Web
+      if [ "$container" = "matrix-element-web" ] && [ "$health" = "unhealthy" ]; then
+        echo ""
+        echo "🔍 Анализ проблем Element Web:"
+        
+        # Проверка логов на доменные конфигурации
+        DOMAIN_CONFIG_ERROR=$(docker logs "$container" 2>&1 | grep -o 'config\.[a-zA-Z0-9.-]*\.json.*404' | head -1)
+        if [ -n "$DOMAIN_CONFIG_ERROR" ]; then
+          MISSING_DOMAIN=$(echo "$DOMAIN_CONFIG_ERROR" | grep -o 'config\.[a-zA-Z0-9.-]*\.json' | sed 's/config\.//' | sed 's/\.json//')
+          echo "   ❌ Проблема: Отсутствует доменная конфигурация для $MISSING_DOMAIN"
+          echo "   💡 Решение: Используйте опцию '13. 🌐 Исправить конфигурацию Element Web'"
+        fi
+        
+        # Проверка доступности основной конфигурации
+        if curl -s http://localhost:8080/config.json >/dev/null 2>&1; then
+          echo "   ✅ Основная конфигурация доступна"
+        else
+          echo "   ❌ Основная конфигурация недоступна"
+        fi
+      fi
+      
       # Последние логи
       echo "Последние логи:"
       docker logs "$container" --tail 10 2>&1 | sed 's/^/  /'
@@ -1480,6 +1723,15 @@ diagnose_containers() {
   
   if [ -f "/opt/element-web/config.json" ]; then
     echo "✅ Element config.json существует"
+    
+    # Проверка доменных конфигураций
+    DOMAIN_CONFIGS=$(find /opt/element-web -name "config.*.json" 2>/dev/null | wc -l)
+    if [ "$DOMAIN_CONFIGS" -gt 0 ]; then
+      echo "   Доменных конфигураций: $DOMAIN_CONFIGS"
+      find /opt/element-web -name "config.*.json" 2>/dev/null | sed 's/^/     - /'
+    else
+      echo "   ⚠️  Доменные конфигурации отсутствуют (могут потребоваться)"
+    fi
   else
     echo "❌ Element config.json отсутствует"
   fi
@@ -1490,6 +1742,28 @@ diagnose_containers() {
   echo "  docker compose restart [service]  # Перезапуск сервиса"
   echo "  docker compose down && docker compose up -d  # Полный перезапуск"
   echo "  docker exec -it matrix-synapse bash  # Вход в контейнер Synapse"
+  
+  # Автоматические рекомендации на основе проблем
+  echo ""
+  echo "🚨 Автоматические рекомендации:"
+  
+  # Проверка на проблемы Element Web
+  if docker logs matrix-element-web 2>&1 | grep -q "config\.[a-zA-Z0-9.-]*\.json.*404"; then
+    echo "   ⚠️  Обнаружены проблемы с доменными конфигурациями Element Web"
+    echo "      → Используйте опцию '13. 🌐 Исправить конфигурацию Element Web'"
+  fi
+  
+  # Проверка на проблемы Coturn
+  if ! docker ps | grep -q "matrix-coturn.*Up"; then
+    echo "   ⚠️  Coturn не запущен - VoIP звонки могут не работать"
+    echo "      → Используйте опцию '11. 📞 Управление Coturn (VoIP сервер)'"
+  fi
+  
+  # Проверка на проблемы Synapse
+  if ! curl -s http://localhost:8008/health >/dev/null 2>&1; then
+    echo "   ❌ Synapse API недоступен - критическая проблема"
+    echo "      → Используйте опцию '3. 🔄 Перезапустить все сервисы'"
+  fi
 }
 
 # Функция для последовательного запуска сервисов
@@ -1618,8 +1892,7 @@ manage_docker() {
         timeout 60 docker compose down || docker stop matrix-synapse matrix-postgres matrix-element-web matrix-synapse-admin matrix-coturn 2>/dev/null
         docker compose down --remove-orphans
         echo "✅ Контейнеры удалены"
-      fi
-      ;;
+      fi ;;
     7) return 0 ;;
     *) echo "❌ Неверный выбор" ;;
   esac
@@ -1816,8 +2089,9 @@ show_menu() {
   echo "9.  🔍 Диагностика проблем контейнеров"
   echo "10. 🔑 Исправить ключ подписи Synapse"
   echo "11. 📞 Управление Coturn (VoIP сервер)"
-  echo "12. ⚙️  Управление Synapse (федерация, регистрация)"
-  echo "13. ❌ Выход"
+  echo "12. 🔧 Управление Synapse (федерация, регистрация)"
+  echo "13. 🌐 Исправить конфигурацию Element Web"
+  echo "14. ❌ Выход"
   echo "=================================================================="
 }
 
@@ -1860,7 +2134,7 @@ manage_synapse_module() {
 # Основной цикл
 while true; do
   show_menu
-  read -p "Выберите опцию (1-13): " choice
+  read -p "Выберите опцию (1-14): " choice
   
   case $choice in
     1) full_installation ;;
@@ -1875,7 +2149,8 @@ while true; do
     10) fix_signing_key; read -p "Нажмите Enter для продолжения..." ;;
     11) manage_coturn ;;
     12) manage_synapse_module ;;
-    13) echo "👋 До свидания!"; exit 0 ;;
+    13) fix_element_domain_config; read -p "Нажмите Enter для продолжения..." ;;
+    14) echo "👋 До свидания!"; exit 0 ;;
     *) echo "❌ Неверный выбор. Попробуйте снова."; sleep 2 ;;
   esac
 done
