@@ -10,7 +10,16 @@ LIB_VERSION="3.0.0"
 PROJECT_NAME="Matrix Setup"
 
 # Подключение общей библиотеки
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Сначала определяем реальный путь к скрипту, учитывая символические ссылки
+if [[ -L "${BASH_SOURCE[0]}" ]]; then
+    # Если это символическая ссылка, получаем реальный путь
+    REAL_SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+else
+    # Если это обычный файл
+    REAL_SCRIPT_PATH="${BASH_SOURCE[0]}"
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$REAL_SCRIPT_PATH")" && pwd)"
 COMMON_LIB="${SCRIPT_DIR}/common/common_lib.sh"
 
 if [ ! -f "$COMMON_LIB" ]; then
@@ -25,6 +34,12 @@ if [ ! -f "$COMMON_LIB" ]; then
     echo "  │   ├── core_install.sh"
     echo "  │   └── element_web.sh"
     echo "  └── manager-matrix.sh"
+    echo ""
+    echo "Отладочная информация:"
+    echo "  BASH_SOURCE[0]: ${BASH_SOURCE[0]}"
+    echo "  Символическая ссылка: $([[ -L "${BASH_SOURCE[0]}" ]] && echo "Да" || echo "Нет")"
+    echo "  REAL_SCRIPT_PATH: $REAL_SCRIPT_PATH"
+    echo "  SCRIPT_DIR: $SCRIPT_DIR"
     exit 1
 fi
 
@@ -702,7 +717,7 @@ manage_synapse_service() {
     safe_echo "${BOLD}Доступные действия:${NC}"
     safe_echo "${GREEN}1.${NC} Запустить"
     safe_echo "${GREEN}2.${NC} Остановить"
-    safe_echo "${GREEN}3.${NC} Перезапустить"
+    safe_echo "${GREEN}3.${NC} Перезагрузить"
     safe_echo "${GREEN}4.${NC} Показать логи"
     safe_echo "${GREEN}5.${NC} Проверить конфигурацию"
     safe_echo "${GREEN}6.${NC} Назад"
