@@ -1,0 +1,338 @@
+{
+    "_comment": "Конфигурация Element Web для различных типов развертывания",
+    
+    "_deployment_info": {
+        "hosting": "Облачный хостинг с публичными доменами",
+        "home_server": "Домашний сервер за NAT",
+        "proxmox": "Виртуализированная среда Proxmox", 
+        "vps": "Виртуальный приватный сервер"
+    },
+    
+    "default_server_config": {
+        "_comment": "Основная конфигурация homeserver",
+        "m.homeserver": {
+            "base_url": "https://matrix.example.com",
+            "server_name": "example.com"
+        },
+        "m.identity_server": {
+            "base_url": "https://vector.im"
+        }
+    },
+    
+    "_server_config_examples": {
+        "hosting": {
+            "m.homeserver": {
+                "base_url": "https://matrix.example.com"
+            }
+        },
+        "home_server": {
+            "m.homeserver": {
+                "base_url": "https://matrix.local.domain"
+            }
+        },
+        "proxmox": {
+            "m.homeserver": {
+                "base_url": "https://matrix.proxmox.local"
+            }
+        }
+    },
+    
+    "disable_custom_urls": false,
+    "_disable_custom_urls_comment": "Позволяет пользователям указывать свой homeserver",
+    
+    "disable_guests": true,
+    "_disable_guests_comment": "Отключает гостевой доступ для безопасности",
+    
+    "disable_login_language_selector": false,
+    "_language_comment": "Показывает селектор языка на странице входа",
+    
+    "disable_3pid_login": false,
+    "_3pid_comment": "Разрешает вход по email/телефону",
+    
+    "brand": "Element",
+    "_brand_comment": "Название бренда, отображаемое в интерфейсе",
+    
+    "integrations_ui_url": "https://scalar.vector.im/",
+    "integrations_rest_url": "https://scalar.vector.im/api",
+    "integrations_widgets_urls": [
+        "https://scalar.vector.im/_matrix/integrations/v1",
+        "https://scalar.vector.im/api",
+        "https://scalar-staging.vector.im/_matrix/integrations/v1",
+        "https://scalar-staging.vector.im/api"
+    ],
+    "_integrations_comment": "Конфигурация Scalar - менеджера интеграций",
+    
+    "default_country_code": "RU",
+    "_country_comment": "Код страны по умолчанию для телефонных номеров",
+    
+    "show_labs_settings": true,
+    "_labs_comment": "Показывает экспериментальные функции в настройках",
+    
+    "features": {
+        "_comment": "Лабораторные функции Element Web",
+        "feature_pinning": true,
+        "feature_custom_status": true,
+        "feature_custom_tags": true,
+        "feature_state_counters": true,
+        "feature_many_integration_managers": true,
+        "feature_mjolnir": true,
+        "feature_dm_verification": true,
+        "feature_bridge_state": true,
+        "feature_groups": true,
+        "feature_custom_themes": true,
+        "feature_jump_to_date": false,
+        "feature_location_share_live": false,
+        "feature_video_rooms": false,
+        "feature_element_call_video_rooms": false,
+        "feature_group_calls": false,
+        "feature_ask_to_join": false,
+        "feature_new_room_list": false
+    },
+    
+    "_features_descriptions": {
+        "feature_pinning": "Закрепление сообщений",
+        "feature_custom_status": "Пользовательские статусы",
+        "feature_mjolnir": "Расширенная блокировка пользователей",
+        "feature_dm_verification": "Верификация в личных сообщениях",
+        "feature_bridge_state": "Информация о мостах",
+        "feature_custom_themes": "Пользовательские темы",
+        "feature_jump_to_date": "Переход к дате в истории",
+        "feature_location_share_live": "Геолокация в реальном времени",
+        "feature_video_rooms": "Видео комнаты",
+        "feature_group_calls": "Групповые звонки"
+    },
+    
+    "default_theme": "light",
+    "_theme_options": ["light", "dark", "custom-theme-name"],
+    
+    "room_directory": {
+        "servers": ["matrix.example.com"]
+    },
+    "_room_directory_comment": "Серверы для поиска публичных комнат",
+    
+    "enable_presence_by_hs_url": {
+        "https://matrix.example.com": true
+    },
+    "_presence_comment": "Включает показ онлайн статуса для указанных серверов",
+    
+    "terms_and_conditions_links": [
+        {
+            "text": "Privacy Policy",
+            "url": "https://element.io/privacy"
+        },
+        {
+            "text": "Cookie Policy", 
+            "url": "https://element.io/cookie-policy"
+        }
+    ],
+    "_terms_comment": "Ссылки на пользовательские соглашения",
+    
+    "mobile_guide_toast": true,
+    "_mobile_guide_comment": "Предложение скачать мобильное приложение",
+    "_mobile_deployment_settings": {
+        "hosting": true,
+        "home_server": false,
+        "proxmox": false,
+        "vps": true
+    },
+    
+    "desktop_builds": {
+        "available": true,
+        "logo": "themes/element/img/logos/element-logo.svg",
+        "url": "https://element.io/get-started"
+    },
+    
+    "mobile_builds": {
+        "ios": "https://apps.apple.com/app/vector/id1083446067",
+        "android": "https://play.google.com/store/apps/details?id=im.vector.app",
+        "fdroid": "https://f-droid.org/packages/im.vector.app/"
+    },
+    "_builds_comment": "Ссылки для скачивания десктопных и мобильных приложений",
+    
+    "jitsi": {
+        "preferred_domain": "meet.element.io"
+    },
+    "_jitsi_alternatives": {
+        "element_hosted": "meet.element.io",
+        "jitsi_official": "meet.jit.si",
+        "self_hosted": "jitsi.your-domain.com"
+    },
+    
+    "jitsi_widget": {
+        "skip_built_in_welcome_screen": false
+    },
+    "_jitsi_widget_comment": "Настройки виджета Jitsi",
+    
+    "element_call": {
+        "use_exclusively": false,
+        "participant_limit": 8,
+        "brand": "Element Call"
+    },
+    "_element_call_comment": "Настройки нативных звонков Element Call",
+    
+    "voip": {
+        "obey_asserted_identity": false
+    },
+    "_voip_comment": "VoIP настройки (только для доверенных сред)",
+    
+    "map_style_url": "https://api.maptiler.com/maps/streets/style.json?key=get_your_own_OpIi9ZULNHzrAhtHqqKZ",
+    "_map_comment": "URL стиля карт для геолокации (требует API ключ)",
+    
+    "setting_defaults": {
+        "_comment": "Настройки по умолчанию для пользователей",
+        "breadcrumbs": true,
+        "MessageComposerInput.showStickersButton": true,
+        "MessageComposerInput.showPollsButton": true,
+        "showReadReceipts": true,
+        "showTwelveHourTimestamps": false,
+        "alwaysShowTimestamps": false,
+        "showRedactions": true,
+        "enableSyntaxHighlightLanguageDetection": true,
+        "expandCodeByDefault": false,
+        "scrollToBottomOnMessageSent": true,
+        "Pill.shouldShowPillAvatar": true,
+        "Pill.shouldShowTooltip": true,
+        "TextualBody.enableBigEmoji": true,
+        "VideoView.flipVideoHorizontally": false,
+        "UIFeature.urlPreviews": true,
+        "UIFeature.feedback": true,
+        "UIFeature.voip": true,
+        "UIFeature.widgets": true,
+        "UIFeature.advancedSettings": true,
+        "UIFeature.shareQrCode": true,
+        "UIFeature.shareSocial": true,
+        "UIFeature.identityServer": true,
+        "UIFeature.thirdPartyId": true,
+        "UIFeature.registration": true,
+        "UIFeature.passwordReset": true,
+        "UIFeature.deactivate": true,
+        "UIFeature.advancedEncryption": true,
+        "UIFeature.roomHistorySettings": true
+    },
+    
+    "_ui_features_descriptions": {
+        "UIFeature.urlPreviews": "Предварительный просмотр ссылок",
+        "UIFeature.feedback": "Форма обратной связи",
+        "UIFeature.voip": "Голосовые и видео звонки",
+        "UIFeature.widgets": "Виджеты в комнатах",
+        "UIFeature.advancedSettings": "Расширенные настройки",
+        "UIFeature.registration": "Регистрация новых пользователей",
+        "UIFeature.passwordReset": "Сброс пароля",
+        "UIFeature.identityServer": "Функции сервера идентификации"
+    },
+    
+    "posthog": {
+        "project_api_key": null,
+        "api_host": null
+    },
+    "_analytics_comment": "Настройки аналитики PostHog (null = отключено)",
+    
+    "sentry": {
+        "dsn": null,
+        "environment": null
+    },
+    "_sentry_comment": "Настройки отчетов об ошибках Sentry",
+    
+    "privacy_policy_url": "https://element.io/privacy",
+    "_privacy_comment": "Ссылка на политику конфиденциальности",
+    
+    "bug_report_endpoint_url": "https://element.io/bugreports/submit",
+    "uisi_autorageshake_app": "element-auto-uisi",
+    "existing_issues_url": "https://github.com/element-hq/element-web/issues",
+    "new_issue_url": "https://github.com/element-hq/element-web/issues/new/choose",
+    "_bug_report_comment": "Настройки для отправки отчетов об ошибках",
+    
+    "help_url": "https://element.io/help",
+    "help_encryption_url": "https://element.io/help#encryption",
+    "_help_comment": "Ссылки на документацию и помощь",
+    
+    "force_verification": false,
+    "_verification_comment": "Принудительная верификация новых входов",
+    
+    "branding": {
+        "_comment": "Настройки брендинга и внешнего вида",
+        "welcome_background_url": null,
+        "auth_header_logo_url": null,
+        "auth_footer_links": []
+    },
+    
+    "embedded_pages": {
+        "_comment": "Пользовательские страницы",
+        "welcome_url": null,
+        "home_url": null,
+        "login_for_welcome": false
+    },
+    
+    "sso_redirect_options": {
+        "_comment": "Настройки SSO редиректов",
+        "immediate": false,
+        "on_welcome_page": false,
+        "on_login_page": false
+    },
+    "_sso_comment": "Настройки автоматических редиректов для SSO",
+    
+    "oidc_static_clients": {
+        "_comment": "Статические OIDC клиенты",
+        "_example": {
+            "https://auth.example.com/": {
+                "client_id": "element-web-client"
+            }
+        }
+    },
+    
+    "oidc_metadata": {
+        "_comment": "Метаданные для динамической регистрации OIDC",
+        "client_uri": null,
+        "logo_uri": null,
+        "tos_uri": null,
+        "policy_uri": null,
+        "contacts": []
+    },
+    
+    "widget_build_url": null,
+    "_widget_build_comment": "URL для динамической генерации виджетов",
+    
+    "audio_stream_url": null,
+    "_audio_stream_comment": "URL для аудио стриминга в Jitsi (экспериментально)",
+    
+    "logout_redirect_url": null,
+    "_logout_redirect_comment": "URL для редиректа после выхода (для SSO)",
+    
+    "welcome_user_id": null,
+    "_welcome_user_comment": "DEPRECATED: ID пользователя для автоматического DM",
+    
+    "custom_translations_url": null,
+    "_translations_comment": "URL для пользовательских переводов",
+    
+    "user_notice": {
+        "_comment": "Уведомление для пользователей",
+        "_example": {
+            "title": "Важное уведомление",
+            "description": "Описание уведомления",
+            "show_once": true
+        }
+    },
+    
+    "report_event": {
+        "_comment": "Настройки отчетов о событиях",
+        "admin_message_md": null
+    },
+    
+    "default_widget_container_height": 280,
+    "_widget_height_comment": "Высота контейнера виджетов по умолчанию в пикселях",
+    
+    "_security_recommendations": {
+        "use_https": "Всегда использовать HTTPS",
+        "update_regularly": "Регулярно обновлять Element Web",
+        "strong_passwords": "Использовать сильные пароли",
+        "monitor_logs": "Мониторить логи на подозрительную активность",
+        "backup_config": "Регулярно создавать резервные копии конфигурации"
+    },
+    
+    "_deployment_specific_notes": {
+        "hosting": "Настроить Let's Encrypt для SSL",
+        "home_server": "Использовать самоподписанные сертификаты или локальный CA",
+        "proxmox": "Настроить проброс портов и DNS", 
+        "vps": "Оптимизировать для ограниченных ресурсов"
+    }
+}

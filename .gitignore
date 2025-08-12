@@ -427,4 +427,16 @@ CHANGELOG_v6.0.md
 CHANGELOG_v6.0_SYNAPSE_MANAGEMENT.md
 SYNAPSE_MANAGEMENT_GUIDE.md
 test-menu.sh
-/docs
+docs/caddy-deployment-guide.md
+docs/coturn-setup-guide.md
+docs/development-summary.md
+docs/doc-element-synapse.txt
+docs/doc-element-web.txt
+docs/doc-synapse-admin.txt
+docs/element-web-caddy-integration.md
+docs/element-web-deployment-guide.md
+docs/element-web-fixes-summary.md
+docs/element-web-proxmox-architecture.md
+docs/modules-architecture.md
+docs/registration-control-guide.md
+docs/synapse-admin-guide.md
