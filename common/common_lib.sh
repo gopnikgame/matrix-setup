@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # Универсальная библиотека для bash-скриптов
-# Версия: 2.0.0
+# Версия: 2.1.0
 
 # Инициализация библиотеки
 init_lib() {
     # Настройки по умолчанию
     LIB_NAME=${LIB_NAME:-"Common Library"}
-    LIB_VERSION=${LIB_VERSION:-"2.0.0"}
+    LIB_VERSION=${LIB_VERSION:-"2.1.0"}
     
     # Пути (можно переопределить в основном скрипте)
     SCRIPT_DIR=${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
@@ -122,6 +122,139 @@ check_root() {
         exit 1
     fi
     return 0
+}
+
+# Функция для определения типа сервера
+detect_server_type() {
+    log "INFO" "Определение типа сервера..."
+    
+    # Получение публичного IP с таймаутом и несколькими источниками
+    local public_ip=""
+    local timeout=5
+    local ip_services=(
+        "https://ifconfig.co"
+        "https://api.ipify.org"
+        "https://ifconfig.me/ip"
+        "https://ipecho.net/plain"
+        "https://icanhazip.com"
+    )
+    
+    for service in "${ip_services[@]}"; do
+        public_ip=$(curl -s --connect-timeout "$timeout" --max-time "$timeout" -4 "$service" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+        if [[ -n "$public_ip" ]]; then
+            log "DEBUG" "Публичный IP получен через $service: $public_ip"
+            break
+        fi
+    done
+    
+    # Получение локального IP
+    local local_ip=$(hostname -I | awk '{print $1}' 2>/dev/null)
+    if [[ -z "$local_ip" ]]; then
+        local_ip=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
+    fi
+    
+    log "DEBUG" "Локальный IP: ${local_ip:-неопределен}"
+    log "DEBUG" "Публичный IP: ${public_ip:-неопределен}"
+    
+    # Проверка признаков конкретных платформ
+    if [[ -f "/etc/pve/version" ]] || [[ -d "/etc/pve" ]]; then
+        SERVER_TYPE="proxmox"
+        BIND_ADDRESS="0.0.0.0"
+        log "INFO" "Обнаружена среда Proxmox VE"
+    elif [[ -f "/proc/vz/version" ]] || [[ -d "/vz" ]]; then
+        SERVER_TYPE="openvz"
+        BIND_ADDRESS="0.0.0.0"
+        log "INFO" "Обнаружена OpenVZ/Virtuozzo среда"
+    elif [[ -f "/.dockerenv" ]]; then
+        SERVER_TYPE="docker"
+        BIND_ADDRESS="0.0.0.0"
+        log "INFO" "Обнаружена Docker среда"
+    elif [[ -n "$public_ip" ]] && [[ -n "$local_ip" ]]; then
+        # Проверка на приватные IP диапазоны
+        if echo "$local_ip" | grep -qE '^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.)|^127\.'; then
+            if [[ "$public_ip" != "$local_ip" ]]; then
+                # Сервер за NAT (домашний сервер/Proxmox)
+                SERVER_TYPE="home_server"
+                BIND_ADDRESS="0.0.0.0"
+                log "INFO" "Обнаружен домашний сервер за NAT"
+            else
+                # Маловероятно, но возможно
+                SERVER_TYPE="hosting"
+                BIND_ADDRESS="127.0.0.1"
+                log "INFO" "Обнаружен хостинг с приватным IP"
+            fi
+        else
+            # Публичный IP совпадает с локальным
+            SERVER_TYPE="hosting"
+            BIND_ADDRESS="127.0.0.1"
+            log "INFO" "Обнаружен облачный хостинг/VPS"
+        fi
+    elif [[ -n "$local_ip" ]] && echo "$local_ip" | grep -qE '^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.)|^127\.'; then
+        # Только локальный приватный IP
+        SERVER_TYPE="home_server"
+        BIND_ADDRESS="0.0.0.0"
+        log "INFO" "Обнаружен локальный сервер"
+    else
+        # Fallback к hosting
+        SERVER_TYPE="hosting"
+        BIND_ADDRESS="127.0.0.1"
+        log "WARN" "Тип сервера определить не удалось, используется 'hosting'"
+    fi
+    
+    # Дополнительные проверки окружения
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        local virt_type=$(systemd-detect-virt 2>/dev/null)
+        if [[ -n "$virt_type" ]] && [[ "$virt_type" != "none" ]]; then
+            log "DEBUG" "Обнаружена виртуализация: $virt_type"
+            case "$virt_type" in
+                "kvm"|"qemu"|"vmware"|"xen")
+                    if [[ "$SERVER_TYPE" == "hosting" ]]; then
+                        SERVER_TYPE="vps"
+                    fi
+                    ;;
+            esac
+        fi
+    fi
+    
+    # Экспорт переменных
+    export SERVER_TYPE BIND_ADDRESS PUBLIC_IP LOCAL_IP
+    
+    # Сохранение в конфигурацию
+    if [[ -n "$CONFIG_DIR" ]]; then
+        mkdir -p "$CONFIG_DIR"
+        {
+            echo "# Автоматически определенный тип сервера"
+            echo "# Сгенерировано: $(date '+%Y-%m-%d %H:%M:%S')"
+            echo "SERVER_TYPE=\"$SERVER_TYPE\""
+            echo "BIND_ADDRESS=\"$BIND_ADDRESS\""
+            echo "PUBLIC_IP=\"${public_ip:-}\""
+            echo "LOCAL_IP=\"${local_ip:-}\""
+        } > "$CONFIG_DIR/server_type.conf"
+    fi
+    
+    # Вывод результатов
+    log "SUCCESS" "Тип сервера определен как: $SERVER_TYPE"
+    [[ -n "$public_ip" ]] && log "INFO" "Публичный IP: $public_ip"
+    [[ -n "$local_ip" ]] && log "INFO" "Локальный IP: $local_ip"
+    log "INFO" "Bind адрес: $BIND_ADDRESS"
+    
+    return 0
+}
+
+# Загрузка типа сервера из конфигурации
+load_server_type() {
+    local config_file="$CONFIG_DIR/server_type.conf"
+    
+    if [[ -f "$config_file" ]]; then
+        source "$config_file"
+        log "DEBUG" "Тип сервера загружен из конфигурации: $SERVER_TYPE"
+        export SERVER_TYPE BIND_ADDRESS PUBLIC_IP LOCAL_IP
+        return 0
+    else
+        log "DEBUG" "Конфигурация типа сервера не найдена, выполняется определение"
+        detect_server_type
+        return $?
+    fi
 }
 
 # Проверка подключения к интернету
@@ -284,6 +417,15 @@ get_system_info() {
     
     safe_echo "\n${BOLD}${BLUE}Дисковое пространство:${NC}"
     df -h
+    
+    # Добавляем информацию о типе сервера
+    if [[ -n "${SERVER_TYPE:-}" ]]; then
+        safe_echo "\n${BOLD}${BLUE}Тип сервера:${NC}"
+        echo "$SERVER_TYPE"
+        [[ -n "${PUBLIC_IP:-}" ]] && echo "Публичный IP: $PUBLIC_IP"
+        [[ -n "${LOCAL_IP:-}" ]] && echo "Локальный IP: $LOCAL_IP"
+        echo "Bind адрес: ${BIND_ADDRESS:-не определен}"
+    fi
     
     return 0
 }
@@ -472,6 +614,9 @@ init_lib
 # 
 # # Подключение библиотеки
 # source "$(dirname "$0")/common/common_lib.sh"
+# 
+# # Определение типа сервера
+# load_server_type
 # 
 # # Основной код
 # print_header "Мой проект" "$GREEN"
