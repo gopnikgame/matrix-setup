@@ -680,11 +680,12 @@ manage_coturn() {
         safe_echo "${GREEN}5.${NC} Показать логи coturn"
         safe_echo "${GREEN}6.${NC} Проверить конфигурацию"
         safe_echo "${GREEN}7.${NC} Тестировать функциональность"
-        safe_echo "${GREEN}8.${NC} Пересоздать конфигурацию"
-        safe_echo "${GREEN}9.${NC} Назад в главное меню"
+        safe_echo "${GREEN}8.${NC} Диагностика сетевой доступности"
+        safe_echo "${GREEN}9.${NC} Пересоздать конфигурацию"
+        safe_echo "${GREEN}10.${NC} Назад в главное меню"
         
         echo
-        read -p "$(safe_echo "${YELLOW}Выберите действие (1-9): ${NC}")" choice
+        read -p "$(safe_echo "${YELLOW}Выберите действие (1-10): ${NC}")" choice
         
         case $choice in
             1)
@@ -730,6 +731,9 @@ manage_coturn() {
                 test_coturn_functionality
                 ;;
             8)
+                diagnose_turn_connectivity
+                ;;
+            9)
                 if ask_confirmation "Пересоздать конфигурацию coturn?"; then
                     create_coturn_config
                     if ask_confirmation "Перезапустить coturn для применения изменений?"; then
@@ -737,7 +741,7 @@ manage_coturn() {
                     fi
                 fi
                 ;;
-            9)
+            10)
                 return 0
                 ;;
             *)
@@ -746,7 +750,7 @@ manage_coturn() {
                 ;;
         esac
         
-        if [ $choice -ne 9 ]; then
+        if [ $choice -ne 10 ]; then
             read -p "Нажмите Enter для продолжения..."
         fi
     done
@@ -799,95 +803,461 @@ remove_coturn() {
     return 0
 }
 
-# Главная функция установки coturn
-main() {
-    print_header "COTURN TURN SERVER SETUP v1.0" "$GREEN"
+choose_turn_deployment() {
+    print_header "ВЫБОР СПОСОБА РАЗВЕРТЫВАНИЯ TURN" "$CYAN"
     
-    log "INFO" "Начало настройки coturn TURN сервера"
-    log "INFO" "Использование библиотеки: $LIB_NAME v$LIB_VERSION"
+    case "$SERVER_TYPE" in
+        "proxmox"|"home_server"|"docker"|"openvz")
+            safe_echo "${YELLOW}⚠️ ОБНАРУЖЕНА ПРОБЛЕМА С СЕТЕВОЙ КОНФИГУРАЦИЕЙ${NC}"
+            safe_echo "${RED}Для Proxmox за NAT требуются дополнительные порты:${NC}"
+            safe_echo "   - 3478 (TURN TCP/UDP)"
+            safe_echo "   - 5349 (TURN TLS TCP/UDP)"  
+            safe_echo "   - 49152-65535 (UDP relay range)"
+            echo
+            safe_echo "${BLUE}Доступные варианты:${NC}"
+            safe_echo "${GREEN}1.${NC} Установить локально (требует открытия портов на роутере)"
+            safe_echo "${GREEN}2.${NC} Использовать внешний TURN сервер (рекомендуется)"
+            safe_echo "${GREEN}3.${NC} Использовать публичный TURN сервер Matrix.org"
+            safe_echo "${GREEN}4.${NC} Отменить установку"
+            ;;
+        *)
+            # Для облачных серверов - стандартная установка
+            return 0
+            ;;
+    esac
     
-    # Выполнение этапов установки
-    local steps=(
-        "check_coturn_requirements:Проверка системных требований"
-        "get_turn_domain:Настройка домена TURN сервера"
-        "install_coturn:Установка coturn"
-        "create_coturn_config:Создание конфигурации"
-        "configure_coturn_service:Настройка службы"
-        "configure_coturn_firewall:Настройка файрвола"
-        "start_and_verify_coturn:Запуск и проверка"
-        "integrate_with_synapse:Интеграция с Synapse"
-        "test_coturn_functionality:Тестирование"
-    )
+    echo
+    read -p "$(safe_echo "${YELLOW}Выберите вариант (1-4): ${NC}")" deployment_choice
     
-    local total_steps=${#steps[@]}
-    local current_step=0
-    
-    for step_info in "${steps[@]}"; do
-        current_step=$((current_step + 1))
-        local step_func="${step_info%%:*}"
-        local step_name="${step_info##*:}"
-        
-        print_header "ЭТАП $current_step/$total_steps: $step_name" "$CYAN"
-        
-        if ! $step_func; then
-            log "ERROR" "Ошибка на этапе: $step_name"
-            log "ERROR" "Установка прервана"
+    case $deployment_choice in
+        1)
+            show_router_configuration_help
+            if ask_confirmation "Порты уже настроены на роутере?"; then
+                return 0  # Продолжить локальную установку
+            else
+                return 1  # Прервать установку
+            fi
+            ;;
+        2)
+            configure_external_turn_server
+            return $?
+            ;;
+        3)
+            configure_public_turn_server
+            return $?
+            ;;
+        4)
+            log "INFO" "Удаление TURN отменено пользователем"
             return 1
-        fi
-        
-        log "SUCCESS" "Этап завершён: $step_name"
-        echo
-    done
+            ;;
+        *)
+            log "ERROR" "Неверный выбор"
+            return 1
+            ;;
+    esac
+}
+
+# Функция помощи по настройке роутера (улучшенная версия)
+show_router_configuration_help() {
+    print_header "НАСТРОЙКА ПОРТОВ НА РОУТЕРЕ" "$YELLOW"
     
-    # Вывод итоговой информации
-    print_header "УСТАНОВКА COTURN ЗАВЕРШЕНА УСПЕШНО!" "$GREEN"
+    safe_echo "${BOLD}Для работы TURN сервера необходимо открыть следующие порты:${NC}"
+    echo
+    safe_echo "${CYAN}Основные порты TURN:${NC}"
+    safe_echo "   3478/tcp → ${LOCAL_IP}:3478"
+    safe_echo "   3478/udp → ${LOCAL_IP}:3478"
+    safe_echo "   5349/tcp → ${LOCAL_IP}:5349"  
+    safe_echo "   5349/udp → ${LOCAL_IP}:5349"
+    echo
+    safe_echo "${CYAN}UDP relay диапазон:${NC}"
+    safe_echo "   49152-65535/udp → ${LOCAL_IP}:49152-65535"
+    echo
+    safe_echo "${RED}⚠️ ВНИМАНИЕ: Диапазон 49152-65535/udp может быть большой нагрузкой${NC}"
+    safe_echo "${YELLOW}💡 Рекомендуется использовать внешний TURN сервер вместо локального${NC}"
+    echo
     
-    safe_echo "${GREEN}✅ Coturn TURN сервер установлен и настроен${NC}"
-    safe_echo "${BLUE}📋 Информация об установке:${NC}"
-    safe_echo "   ${BOLD}Тип сервера:${NC} $SERVER_TYPE"
+    # Добавляем специфичные инструкции для MikroTik
+    safe_echo "${BOLD}${BLUE}Инструкции для MikroTik RouterOS:${NC}"
+    echo
+    safe_echo "${CYAN}1. Настройка NAT правил через Winbox:${NC}"
+    safe_echo "   IP → Firewall → NAT → Add New"
+    safe_echo "   Chain: dstnat"
+    safe_echo "   Protocol: tcp"
+    safe_echo "   Dst. Port: 3478"
+    safe_echo "   Action: dst-nat"
+    safe_echo "   To Addresses: ${LOCAL_IP}"
+    safe_echo "   To Ports: 3478"
+    echo
+    safe_echo "${CYAN}2. Через командную строку MikroTik:${NC}"
+    safe_echo "   /ip firewall nat"
+    safe_echo "   add chain=dstnat protocol=tcp dst-port=3478 action=dst-nat to-addresses=${LOCAL_IP} to-ports=3478"
+    safe_echo "   add chain=dstnat protocol=udp dst-port=3478 action=dst-nat to-addresses=${LOCAL_IP} to-ports=3478"
+    safe_echo "   add chain=dstnat protocol=tcp dst-port=5349 action=dst-nat to-addresses=${LOCAL_IP} to-ports=5349"
+    safe_echo "   add chain=dstnat protocol=udp dst-port=5349 action=dst-nat to-addresses=${LOCAL_IP} to-ports=5349"
+    safe_echo "   add chain=dstnat protocol=udp dst-port=49152-65535 action=dst-nat to-addresses=${LOCAL_IP}"
+    echo
+    safe_echo "${CYAN}3. Разрешающие правила файрвола:${NC}"
+    safe_echo "   /ip firewall filter"
+    safe_echo "   add chain=forward protocol=tcp dst-port=3478 action=accept"
+    safe_echo "   add chain=forward protocol=udp dst-port=3478 action=accept"
+    safe_echo "   add chain=forward protocol=tcp dst-port=5349 action=accept"
+    safe_echo "   add chain=forward protocol=udp dst-port=5349 action=accept"
+    safe_echo "   add chain=forward protocol=udp dst-port=49152-65535 action=accept"
+    echo
+    safe_echo "${RED}⚠️ ВАЖНО: UDP диапазон 49152-65535 может создать проблемы безопасности!${NC}"
+    safe_echo "${YELLOW}Рекомендуется ограничить до меньшего диапазона, например 50000-51000${NC}"
+    echo
+    safe_echo "${BLUE}Альтернативный подход - ограниченный диапазон:${NC}"
+    safe_echo "   add chain=dstnat protocol=udp dst-port=50000-51000 action=dst-nat to-addresses=${LOCAL_IP}"
+    safe_echo "   add chain=forward protocol=udp dst-port=50000-51000 action=accept"
+    echo
+    safe_echo "${CYAN}И обновить конфигурацию coturn:${NC}"
+    safe_echo "   min-port=50000"
+    safe_echo "   max-port=51000"
+}
+
+# Функция настройки внешнего TURN сервера
+configure_external_turn_server() {
+    print_header "НАСТРОЙКА ВНЕШНЕГО TURN СЕРВЕРА" "$BLUE"
+    
+    safe_echo "${BLUE}Рекомендуемые провайдеры для TURN сервера:${NC}"
+    safe_echo "1. Hetzner Cloud (от 300₽/мес)"
+    safe_echo "2. DigitalOcean (от $4/мес)"
+    safe_echo "3. Vultr (от $2.50/мес)"
+    safe_echo "4. Свой VPS"
+    echo
+    
+    safe_echo "${YELLOW}Минимальные требования:${NC}"
+    safe_echo "• 512MB RAM"
+    safe_echo "• 1 CPU core"
+    safe_echo "• Публичный IPv4"
+    safe_echo "• Открытые порты 3478, 5349, 49152-65535"
+    echo
+    
+    read -p "$(safe_echo "${YELLOW}Введите IP адрес внешнего TURN сервера: ${NC}")" external_turn_ip
+    read -p "$(safe_echo "${YELLOW}Введите домен TURN сервера (или нажмите Enter для IP): ${NC}")" external_turn_domain
+    
+    # Валидация IP адреса
+    if [[ ! "$external_turn_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        log "ERROR" "Неверный формат IP адреса: $external_turn_ip"
+        return 1
+    fi
+    
+    TURN_DOMAIN="${external_turn_domain:-$external_turn_ip}"
+    echo "$TURN_DOMAIN" > "$CONFIG_DIR/turn_domain"
+    
+    # Сохраняем IP для использования в других функциях
+    export external_turn_ip
+    
+    # Генерация секрета для внешнего сервера
+    local turn_secret=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-32)
+    echo "$turn_secret" > "$CONFIG_DIR/coturn_secret"
+    chmod 600 "$CONFIG_DIR/coturn_secret"
+    
+    log "INFO" "Сгенерирован секрет TURN для внешнего сервера"
+    
+    # Создание скрипта установки для внешнего сервера
+    create_external_turn_install_script "$external_turn_ip" "$turn_secret"
+    
+    # Настройка Synapse для внешнего TURN
+    configure_synapse_for_external_turn
+    
+    print_header "ВНЕШНИЙ TURN СЕРВЕР НАСТРОЕН!" "$GREEN"
+    
+    safe_echo "${GREEN}✅ Конфигурация для внешнего TURN сервера готова${NC}"
+    safe_echo "${BLUE}📋 Информация:${NC}"
+    safe_echo "   ${BOLD}IP сервера:${NC} $external_turn_ip"
     safe_echo "   ${BOLD}Домен TURN:${NC} $TURN_DOMAIN"
-    safe_echo "   ${BOLD}Конфигурация:${NC} $COTURN_CONFIG_FILE"
-    safe_echo "   ${BOLD}Логи:${NC} journalctl -u coturn"
-    [[ -n "${PUBLIC_IP:-}" ]] && safe_echo "   ${BOLD}Публичный IP:${NC} $PUBLIC_IP"
-    [[ -n "${LOCAL_IP:-}" ]] && safe_echo "   ${BOLD}Локальный IP:${NC} $LOCAL_IP"
-    
+    safe_echo "   ${BOLD}Скрипт установки:${NC} $CONFIG_DIR/external_turn_install.sh"
     echo
     safe_echo "${YELLOW}📝 Следующие шаги:${NC}"
-    safe_echo "   1. ${CYAN}Перезапустите Matrix Synapse:${NC}"
-    safe_echo "      systemctl restart matrix-synapse"
-    echo
-    safe_echo "   2. ${CYAN}Проверьте работу TURN:${NC}"
-    safe_echo "      https://test.voip.librepush.net/"
-    echo
-    safe_echo "   3. ${CYAN}Настройте DNS (если используется домен):${NC}"
-    safe_echo "      A запись: $TURN_DOMAIN → ${PUBLIC_IP:-$LOCAL_IP}"
-    echo
-    safe_echo "   4. ${CYAN}Порты для файрвола:${NC}"
-    safe_echo "      3478/tcp,udp - TURN"
-    safe_echo "      5349/tcp,udp - TURN TLS"
-    safe_echo "      49152-65535/udp - UDP relay"
+    safe_echo "   1. ${CYAN}Скопируйте и запустите скрипт на внешнем сервере${NC}"
+    safe_echo "   2. ${CYAN}Убедитесь в доступности портов извне${NC}"
+    safe_echo "   3. ${CYAN}Перезапустите Matrix Synapse${NC}"
+    safe_echo "   4. ${CYAN}Протестируйте VoIP звонки${NC}"
     
+    return 0
+}
+
+# Функция использования публичного TURN
+configure_public_turn_server() {
+    print_header "НАСТРОЙКА ПУБЛИЧНОГО TURN СЕРВЕРА" "$GREEN"
+    
+    safe_echo "${BLUE}Использование публичного TURN сервера Matrix.org${NC}"
+    safe_echo "${YELLOW}⚠️ Это временное решение для тестирования${NC}"
+    safe_echo "${RED}Не рекомендуется для продакшена!${NC}"
     echo
-    safe_echo "${GREEN}🎉 Coturn готов для использования с Matrix!${NC}"
-    safe_echo "${BLUE}💡 VoIP звонки теперь будут работать даже за NAT/firewall${NC}"
+    
+    if ask_confirmation "Продолжить с публичным TURN сервером?"; then
+        TURN_DOMAIN="turn.matrix.org"
+        echo "$TURN_DOMAIN" > "$CONFIG_DIR/turn_domain"
+        
+        # Создание конфигурации для публичного TURN
+        local synapse_turn_config="$CONFIG_DIR/synapse_turn_config.yaml"
+        cat > "$synapse_turn_config" <<EOF
+# Public TURN server configuration (TEMPORARY SOLUTION)
+# Replace with your own TURN server for production use
+
+turn_uris:
+  - "turn:turn.matrix.org:3478?transport=udp"
+  - "turn:turn.matrix.org:3478?transport=tcp"
+  - "turns:turn.matrix.org:5349?transport=udp"
+  - "turns:turn.matrix.org:5349?transport=tcp"
+
+# This is a placeholder - you'll need to get actual credentials
+turn_shared_secret: "ask_matrix_org_for_credentials"
+turn_user_lifetime: 86400000
+turn_allow_guests: true
+EOF
+        
+        # Добавление в Synapse
+        local synapse_conf_d="/etc/matrix-synapse/conf.d"
+        if [[ -d "$synapse_conf_d" ]]; then
+            cp "$synapse_turn_config" "$synapse_conf_d/turn.yaml"
+            chown matrix-synapse:matrix-synapse "$synapse_conf_d/turn.yaml" 2>/dev/null || true
+        fi
+        
+        safe_echo "${GREEN}✅ Публичный TURN сервер настроен${NC}"
+        safe_echo "${YELLOW}📝 Замените на собственный TURN сервер как можно скорее${NC}"
+        
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Функция создания скрипта установки для внешнего сервера
+create_external_turn_install_script() {
+    local external_turn_ip="$1"
+    local turn_secret="$2"
+    local install_script="$CONFIG_DIR/external_turn_install.sh"
+    
+    log "INFO" "Создание скрипта установки для внешнего TURN сервера..."
+    
+    cat > "$install_script" <<EOF
+#!/bin/bash
+# Automatic Coturn TURN Server Installation Script
+# Generated by Matrix Setup Tool for external server
+# Target server: $external_turn_ip
+# Generated: $(date '+%Y-%m-%d %H:%M:%S')
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+echo -e "\${GREEN}═══════════════════════════════════════════════════════════════\${NC}"
+echo -e "\${GREEN}          COTURN TURN SERVER INSTALLATION SCRIPT              \${NC}"
+echo -e "\${GREEN}═══════════════════════════════════════════════════════════════\${NC}"
+echo
+
+# Check root privileges
+if [[ \$EUID -ne 0 ]]; then
+    echo -e "\${RED}Error: This script must be run as root\${NC}"
+    echo "Usage: sudo \$0"
+    exit 1
+fi
+
+# Update system
+echo -e "\${BLUE}Updating system packages...\${NC}"
+apt update && apt upgrade -y
+
+# Install coturn
+echo -e "\${BLUE}Installing coturn...\${NC}"
+apt install -y coturn
+
+# Create coturn configuration
+echo -e "\${BLUE}Creating coturn configuration...\${NC}"
+cat > /etc/turnserver.conf <<'TURN_EOF'
+# Coturn TURN Server Configuration
+# Generated for Matrix external TURN server
+# Server IP: $external_turn_ip
+# Generated: $(date '+%Y-%m-%d %H:%M:%S')
+
+# Basic settings
+listening-port=3478
+tls-listening-port=5349
+listening-ip=0.0.0.0
+external-ip=$external_turn_ip
+
+# Realm and authentication
+realm=$TURN_DOMAIN
+use-auth-secret
+static-auth-secret=$turn_secret
+
+# Logging
+syslog
+
+# Security settings
+no-tcp-relay
+
+# Block private IP addresses
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=192.0.0.0-192.0.0.255
+denied-peer-ip=192.0.2.0-192.0.2.255
+denied-peer-ip=192.88.99.0-192.88.99.255
+denied-peer-ip=198.18.0.0-198.19.255.255
+denied-peer-ip=198.51.100.0-198.51.100.255
+denied-peer-ip=203.0.113.0-203.0.113.255
+denied-peer-ip=240.0.0.0-255.255.255.255
+
+# Performance and security limits
+user-quota=12
+total-quota=1200
+max-bps=3000000
+
+# Disable TLS by default (can be enabled later)
+no-tls
+no-dtls
+
+# UDP relay port range
+min-port=49152
+max-port=65535
+
+# Additional options
+fingerprint
+mobility
+TURN_EOF
+
+# Set permissions
+chown root:root /etc/turnserver.conf
+chmod 644 /etc/turnserver.conf
+
+# Configure systemd service
+echo -e "\${BLUE}Configuring systemd service...\${NC}"
+systemctl enable coturn
+
+# Create service optimization
+mkdir -p /etc/systemd/system/coturn.service.d
+cat > /etc/systemd/system/coturn.service.d/matrix-optimization.conf <<'SYSTEMD_EOF'
+# Matrix TURN Server Optimizations
+[Unit]
+Description=Coturn TURN Server for Matrix (External)
+After=network.target
+
+[Service]
+# Performance limits
+LimitNOFILE=65536
+LimitNPROC=32768
+
+# Stability settings
+Restart=always
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+# Security settings
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log /var/run
+
+[Install]
+WantedBy=multi-user.target
+SYSTEMD_EOF
+
+# Reload systemd and start service
+systemctl daemon-reload
+systemctl start coturn
+
+# Configure firewall (UFW)
+if command -v ufw >/dev/null 2>&1; then
+    echo -e "\${BLUE}Configuring firewall...\${NC}"
+    ufw allow 3478/tcp comment "Coturn TURN TCP"
+    ufw allow 3478/udp comment "Coturn TURN UDP"  
+    ufw allow 5349/tcp comment "Coturn TURN TLS TCP"
+    ufw allow 5349/udp comment "Coturn TURN TLS UDP"
+    ufw allow 49152:65535/udp comment "Coturn UDP relay range"
+    echo -e "\${GREEN}UFW rules added for coturn\${NC}"
+else
+    echo -e "\${YELLOW}UFW not found. Configure firewall manually:\${NC}"
+    echo "  - Allow ports 3478/tcp, 3478/udp"
+    echo "  - Allow ports 5349/tcp, 5349/udp" 
+    echo "  - Allow ports 49152-65535/udp"
+fi
+
+# Verify installation
+echo -e "\${BLUE}Verifying installation...\${NC}"
+sleep 3
+
+if systemctl is-active --quiet coturn; then
+    echo -e "\${GREEN}✅ Coturn is running successfully!\${NC}"
+else
+    echo -e "\${RED}❌ Coturn failed to start\${NC}"
+    echo "Check logs: journalctl -u coturn -n 20"
+    exit 1
+fi
+
+# Check ports
+if ss -tlnp | grep -q ":3478 "; then
+    echo -e "\${GREEN}✅ Port 3478 is listening\${NC}"
+else
+    echo -e "\${YELLOW}⚠️  Port 3478 check failed\${NC}"
+fi
+
+if ss -tlnp | grep -q ":5349 "; then
+    echo -e "\${GREEN}✅ Port 5349 is listening\${NC}"
+else
+    echo -e "\${YELLOW}⚠️  Port 5349 check failed\${NC}"
+fi
+
+echo
+echo -e "\${GREEN}═══════════════════════════════════════════════════════════════\${NC}"
+echo -e "\${GREEN}           COTURN INSTALLATION COMPLETED SUCCESSFULLY!         \${NC}"
+echo -e "\${GREEN}═══════════════════════════════════════════════════════════════\${NC}"
+echo
+echo -e "\${BLUE}Server Information:\${NC}"
+echo "  TURN Domain: $TURN_DOMAIN"
+echo "  External IP: $external_turn_ip"
+echo "  Ports: 3478, 5349, 49152-65535"
+echo
+echo -e "\${BLUE}Configuration Files:\${NC}"
+echo "  Main config: /etc/turnserver.conf"
+echo "  Service override: /etc/systemd/system/coturn.service.d/"
+echo
+echo -e "\${BLUE}Management Commands:\${NC}"
+echo "  Status: systemctl status coturn"
+echo "  Logs: journalctl -u coturn -f"
+echo "  Restart: systemctl restart coturn"
+echo
+echo -e "\${YELLOW}Next Steps:\${NC}"
+echo "1. Verify external connectivity to ports 3478, 5349"
+echo "2. Test TURN server: https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/"
+echo "3. Configure Matrix Synapse to use this TURN server"
+echo
+echo -e "\${GREEN}TURN server is ready for Matrix integration!\${NC}"
+echo -e "\${BLUE}💡 VoIP звонки теперь будут работать даже за NAT/firewall${NC}"
     
     # Сохранение информации об установке
     set_config_value "$CONFIG_DIR/coturn.conf" "COTURN_INSTALLED" "true"
     set_config_value "$CONFIG_DIR/coturn.conf" "INSTALL_DATE" "$(date '+%Y-%m-%d %H:%M:%S')"
     set_config_value "$CONFIG_DIR/coturn.conf" "SERVER_TYPE" "$SERVER_TYPE"
     set_config_value "$CONFIG_DIR/coturn.conf" "TURN_DOMAIN" "$TURN_DOMAIN"
+    set_config_value "$CONFIG_DIR/coturn.conf" "TURN_DEPLOYMENT_MODE" "local"
     
     return 0
 }
 
-# Функция главного меню модуля
+# Функция главного меню модуля (обновленная версия)
 coturn_menu() {
     while true; do
         show_menu "УПРАВЛЕНИЕ COTURN TURN SERVER" \
-            "Установить coturn" \
+            "Установить coturn (автовыбор типа)" \
+            "Установить локально (принудительно)" \
+            "Настроить внешний TURN сервер" \
+            "Настроить публичный TURN сервер" \
             "Показать статус" \
             "Управление службой" \
             "Тестировать функциональность" \
+            "Диагностика сетевой доступности" \
             "Пересоздать конфигурацию" \
             "Удалить coturn" \
             "Назад в главное меню"
@@ -895,24 +1265,63 @@ coturn_menu() {
         local choice=$?
         
         case $choice in
-            1) main ;;
-            2) show_coturn_status ;;
-            3) manage_coturn ;;
-            4) test_coturn_functionality ;;
+            1) 
+                # Стандартная установка с автовыбором
+                main 
+                ;;
+            2) 
+                # Принудительная локальная установка (пропускаем choose_turn_deployment)
+                log "INFO" "Принудительная локальная установка coturn..."
+                if check_coturn_requirements && get_turn_domain; then
+                    install_coturn && create_coturn_config && configure_coturn_service && \
+                    configure_coturn_firewall && start_and_verify_coturn && \
+                    integrate_with_synapse && test_coturn_functionality
+                fi
+                ;;
+            3)
+                # Только настройка внешнего TURN сервера
+                if check_coturn_requirements; then
+                    configure_external_turn_server
+                fi
+                ;;
+            4)
+                # Только настройка публичного TURN сервера
+                if check_coturn_requirements; then
+                    configure_public_turn_server
+                fi
+                ;;
             5) 
+                show_coturn_status 
+                ;;
+            6) 
+                manage_coturn 
+                ;;
+            7) 
+                test_coturn_functionality 
+                ;;
+            8)
+                diagnose_turn_connectivity
+                ;;
+            9) 
                 if ask_confirmation "Пересоздать конфигурацию coturn?"; then
-                    get_turn_domain && create_coturn_config
+                    create_coturn_config
                     if ask_confirmation "Перезапустить coturn для применения изменений?"; then
                         restart_service coturn
                     fi
                 fi
                 ;;
-            6) remove_coturn ;;
-            7) break ;;
-            *) log "ERROR" "Неверный выбор" ;;
+            10) 
+                remove_coturn 
+                ;;
+            11) 
+                break 
+                ;;
+            *) 
+                log "ERROR" "Неверный выбор" 
+                ;;
         esac
         
-        if [ $choice -ne 7 ]; then
+        if [ $choice -ne 11 ]; then
             echo
             read -p "Нажмите Enter для продолжения..."
         fi
