@@ -442,3 +442,6 @@ docs/registration-control-guide.md
 docs/synapse-admin-guide.md
 SOLUTION_SUMMARY.md
 docs/user-management-guide.md
+fix-manager.sh
+HOTFIX-MANAGER-RESTART.md
+РЕШЕНИЕ-ПРОБЛЕМЫ-ЗАПУСКА.md
