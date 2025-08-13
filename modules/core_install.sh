@@ -424,6 +424,10 @@ include_files:
 macaroon_secret_key: "$macaroon_secret"
 form_secret: "$form_secret"
 
+# КРИТИЧЕСКИ ВАЖНО: Секрет регистрации для register_new_matrix_user
+# Этот секрет должен быть в основном файле, а не в include файлах
+registration_shared_secret: "$registration_secret"
+
 # Регистрация (по умолчанию отключена)
 enable_registration: false
 
@@ -515,11 +519,11 @@ database:
     keepalives_count: 3
 EOF
     
-    # Создание конфигурации регистрации
-    log "INFO" "Создание конфигурации регистрации..."
+    # Создание конфигурации регистрации (дополнительные настройки)
+    log "INFO" "Создание дополнительной конфигурации регистрации..."
     cat > "$SYNAPSE_CONFIG_DIR/conf.d/registration.yaml" <<EOF
-# Настройки регистрации и аутентификации
-registration_shared_secret: "$registration_secret"
+# Дополнительные настройки регистрации и аутентификации
+# ПРИМЕЧАНИЕ: registration_shared_secret находится в основном homeserver.yaml
 enable_registration: false
 registration_requires_token: false
 
@@ -818,12 +822,57 @@ create_admin_user() {
     
     log "INFO" "Создание административного пользователя..."
     
-    # Чтение секрета регистрации
-    if [ -f "$CONFIG_DIR/secrets.conf" ]; then
-        source "$CONFIG_DIR/secrets.conf"
-    else
-        log "ERROR" "Файл секретов не найден"
-        return 1
+    # Проверяем доступность API перед созданием пользователя
+    log "INFO" "Проверка доступности Synapse API..."
+    local api_attempts=0
+    local max_api_attempts=5
+    
+    while [ $api_attempts -lt $max_api_attempts ]; do
+        if curl -s -f http://localhost:8008/_matrix/client/versions >/dev/null 2>&1; then
+            log "SUCCESS" "Synapse API доступен"
+            break
+        fi
+        
+        api_attempts=$((api_attempts + 1))
+        if [ $api_attempts -eq $max_api_attempts ]; then
+            log "ERROR" "Synapse API недоступен после $max_api_attempts попыток"
+            log "INFO" "Проверьте логи: journalctl -u matrix-synapse -n 20"
+            return 1
+        fi
+        
+        log "DEBUG" "Ожидание API Synapse... ($api_attempts/$max_api_attempts)"
+        sleep 2
+    done
+    
+    # Проверяем наличие секрета регистрации в конфигурации
+    log "INFO" "Проверка секрета регистрации в конфигурации..."
+    if ! grep -q "registration_shared_secret:" "$SYNAPSE_CONFIG_DIR/homeserver.yaml"; then
+        log "ERROR" "Секрет регистрации не найден в homeserver.yaml"
+        log "INFO" "Попытка восстановления секрета из файла secrets.conf..."
+        
+        if [ -f "$CONFIG_DIR/secrets.conf" ]; then
+            source "$CONFIG_DIR/secrets.conf"
+            if [ -n "$REGISTRATION_SHARED_SECRET" ]; then
+                log "INFO" "Добавление секрета регистрации в homeserver.yaml..."
+                echo "registration_shared_secret: \"$REGISTRATION_SHARED_SECRET\"" >> "$SYNAPSE_CONFIG_DIR/homeserver.yaml"
+                
+                # Перезапускаем Synapse для применения изменений
+                log "INFO" "Перезапуск Synapse для применения изменений..."
+                if ! systemctl restart matrix-synapse; then
+                    log "ERROR" "Ошибка перезапуска Synapse"
+                    return 1
+                fi
+                
+                # Ждем запуска
+                sleep 5
+            else
+                log "ERROR" "Секрет регистрации не найден и в secrets.conf"
+                return 1
+            fi
+        else
+            log "ERROR" "Файл secrets.conf не найден"
+            return 1
+        fi
     fi
     
     # Запрос имени пользователя
@@ -832,6 +881,7 @@ create_admin_user() {
         
         if [[ ! "$admin_username" =~ ^[a-zA-Z0-9._=-]+$ ]]; then
             log "ERROR" "Неверный формат имени пользователя"
+            log "INFO" "Разрешены только: латинские буквы, цифры, точки, подчеркиния, дефисы"
             continue
         fi
         
@@ -840,184 +890,390 @@ create_admin_user() {
             continue
         fi
         
+        if [ ${#admin_username} -gt 50 ]; then
+            log "ERROR" "Имя пользователя слишком длинное (максимум 50 символов)"
+            continue
+        fi
+        
         break
     done
     
-    # Создание пользователя
+    # Создание пользователя с улучшенной обработкой ошибок
     log "INFO" "Создание администратора @$admin_username:$MATRIX_DOMAIN..."
     
-    if register_new_matrix_user \
+    # Проверяем различные варианты команды register_new_matrix_user
+    local register_command=""
+    
+    if command -v register_new_matrix_user >/dev/null 2>&1; then
+        register_command="register_new_matrix_user"
+    elif [ -x "/opt/venvs/matrix-synapse/bin/register_new_matrix_user" ]; then
+        register_command="/opt/venvs/matrix-synapse/bin/register_new_matrix_user"
+    else
+        log "ERROR" "Команда register_new_matrix_user не найдена"
+        log "INFO" "Попробуйте создать администратора вручную:"
+        log "INFO" "register_new_matrix_user -c $SYNAPSE_CONFIG_DIR/homeserver.yaml http://localhost:8008"
+        return 1
+    fi
+    
+    log "INFO" "Используем команду: $register_command"
+    
+    # Создаем временный файл для хранения вывода
+    local temp_output=$(mktemp)
+    
+    # Выполняем команду создания пользователя
+    if $register_command \
         -c "$SYNAPSE_CONFIG_DIR/homeserver.yaml" \
         -u "$admin_username" \
         --admin \
-        http://localhost:8008; then
+        http://localhost:8008 > "$temp_output" 2>&1; then
         
         log "SUCCESS" "Административный пользователь создан: @$admin_username:$MATRIX_DOMAIN"
         
         # Сохранение информации об администраторе
         echo "ADMIN_USER=$admin_username" >> "$CONFIG_DIR/secrets.conf"
         
+        # Показываем полезную информацию
+        echo
+        safe_echo "${GREEN}🎉 Администратор успешно создан!${NC}"
+        safe_echo "${BLUE}📋 Данные для входа:${NC}"
+        safe_echo "   ${BOLD}Пользователь:${NC} @$admin_username:$MATRIX_DOMAIN"
+        safe_echo "   ${BOLD}Сервер:${NC} $MATRIX_DOMAIN"
+        safe_echo "   ${BOLD}Логин через Element:${NC} https://app.element.io"
+        
+        # Очищаем временный файл
+        rm -f "$temp_output"
+        
     else
         log "ERROR" "Ошибка создания административного пользователя"
+        
+        # Показываем подробности ошибки
+        if [ -f "$temp_output" ]; then
+            log "DEBUG" "Вывод команды register_new_matrix_user:"
+            cat "$temp_output" | while read line; do
+                log "DEBUG" "$line"
+            done
+        fi
+        
+        # Даем рекомендации по устранению проблем
+        echo
+        safe_echo "${YELLOW}💡 Попробуйте следующее:${NC}"
+        safe_echo "1. ${CYAN}Проверьте статус Synapse:${NC}"
+        safe_echo "   systemctl status matrix-synapse"
+        safe_echo "2. ${CYAN}Проверьте логи Synapse:${NC}"
+        safe_echo "   journalctl -u matrix-synapse -n 20"
+        safe_echo "3. ${CYAN}Проверьте доступность API:${NC}"
+        safe_echo "   curl http://localhost:8008/_matrix/client/versions"
+        safe_echo "4. ${CYAN}Создайте администратора вручную:${NC}"
+        safe_echo "   register_new_matrix_user -c $SYNAPSE_CONFIG_DIR/homeserver.yaml http://localhost:8008"
+        
+        # Очищаем временный файл
+        rm -f "$temp_output"
+        
         return 1
     fi
     
     return 0
 }
 
-# Функция финальной настройки и проверки
-final_setup() {
-    print_header "ФИНАЛЬНАЯ НАСТРОЙКА" "$GREEN"
+# Функция диагностики проблем с регистрацией
+diagnose_registration_issues() {
+    print_header "ДИАГНОСТИКА ПРОБЛЕМ РЕГИСТРАЦИИ" "$YELLOW"
     
-    log "INFO" "Выполнение финальных настроек..."
+    log "INFO" "Проверка конфигурации регистрации..."
     
-    # Настройка файрвола (если установлен ufw)
-    if command -v ufw >/dev/null 2>&1; then
-        log "INFO" "Настройка правил файрвола..."
-        ufw allow 8008/tcp comment "Matrix Synapse HTTP"
-        ufw allow 8448/tcp comment "Matrix Synapse Federation"
+    local issues_found=0
+    
+    # Проверка 1: Наличие секрета регистрации в homeserver.yaml
+    echo
+    safe_echo "${CYAN}1. Проверка секрета регистрации в homeserver.yaml:${NC}"
+    
+    if grep -q "registration_shared_secret:" "$SYNAPSE_CONFIG_DIR/homeserver.yaml"; then
+        local secret_line=$(grep "registration_shared_secret:" "$SYNAPSE_CONFIG_DIR/homeserver.yaml")
+        if [[ "$secret_line" =~ registration_shared_secret:.*[a-zA-Z0-9] ]]; then
+            safe_echo "   ${GREEN}✓ Секрет регистрации найден и заполнен${NC}"
+        else
+            safe_echo "   ${RED}✗ Секрет регистрации пустой${NC}"
+            issues_found=$((issues_found + 1))
+        fi
+    else
+        safe_echo "   ${RED}✗ Секрет регистрации НЕ найден в homeserver.yaml${NC}"
+        issues_found=$((issues_found + 1))
+        
+        # Пытаемся восстановить из secrets.conf
+        if [ -f "$CONFIG_DIR/secrets.conf" ]; then
+            source "$CONFIG_DIR/secrets.conf"
+            if [ -n "$REGISTRATION_SHARED_SECRET" ]; then
+                safe_echo "   ${YELLOW}💡 Найден секрет в secrets.conf, можно восстановить${NC}"
+            fi
+        fi
     fi
     
-    # Создание скрипта для быстрого управления
-    log "INFO" "Создание скрипта управления..."
-    cat > "$CONFIG_DIR/matrix-control.sh" <<'EOF'
-#!/bin/bash
-# Скрипт управления Matrix Synapse
-
-case "$1" in
-    start)
-        systemctl start matrix-synapse
-        ;;
-    stop)
-        systemctl stop matrix-synapse
-        ;;
-    restart)
-        systemctl restart matrix-synapse
-        ;;
-    status)
-        systemctl status matrix-synapse
-        ;;
-    logs)
-        journalctl -u matrix-synapse -f
-        ;;
-    *)
-        echo "Использование: $0 {start|stop|restart|status|logs}"
-        exit 1
-        ;;
-esac
-EOF
+    # Проверка 2: Статус службы Synapse
+    echo
+    safe_echo "${CYAN}2. Проверка статуса службы Synapse:${NC}"
     
-    chmod +x "$CONFIG_DIR/matrix-control.sh"
-    
-    # Создание резервной копии конфигурации
-    log "INFO" "Создание резервной копии конфигурации..."
-    backup_file "$SYNAPSE_CONFIG_DIR" "synapse-config-initial"
-    
-    log "SUCCESS" "Финальная настройка завершена"
-    return 0
-}
-
-# Главная функция установки
-main() {
-    print_header "MATRIX SYNAPSE УСТАНОВЩИК v2.0.1" "$GREEN"
-    
-    log "INFO" "Начало установки Matrix Synapse"
-    log "INFO" "Использование библиотеки: $LIB_NAME v$LIB_VERSION"
-    
-    # Определение типа сервера в самом начале
-    load_server_type || return 1
-    
-    # Выполнение этапов установки
-    local steps=(
-        "check_system_requirements:Проверка системных требований"
-        "get_matrix_domain:Настройка доменного имени"
-        "update_system:Обновление системы"
-        "add_matrix_repository:Добавление репозитория Matrix"
-        "install_postgresql:Установка PostgreSQL"
-        "create_synapse_database:Создание базы данных"
-        "install_matrix_synapse:Установка Matrix Synapse"
-        "create_synapse_config:Создание конфигурации"
-        "start_and_verify_synapse:Запуск и проверка Synapse"
-        "final_setup:Финальная настройка"
-    )
-    
-    local total_steps=${#steps[@]}
-    local current_step=0
-    
-    for step_info in "${steps[@]}"; do
-        current_step=$((current_step + 1))
-        local step_func="${step_info%%:*}"
-        local step_name="${step_info##*:}"
+    if systemctl is-active --quiet matrix-synapse; then
+        safe_echo "   ${GREEN}✓ Synapse запущен${NC}"
         
-        print_header "ЭТАП $current_step/$total_steps: $step_name" "$CYAN"
+        # Проверяем время работы
+        local uptime=$(systemctl show matrix-synapse --property=ActiveEnterTimestamp --value)
+        safe_echo "   ${BLUE}ℹ Время запуска: $uptime${NC}"
+    else
+        safe_echo "   ${RED}✗ Synapse НЕ запущен${NC}"
+        issues_found=$((issues_found + 1))
+    fi
+    
+    # Проверка 3: Доступность API
+    echo
+    safe_echo "${CYAN}3. Проверка доступности API:${NC}"
+    
+    if curl -s -f http://localhost:8008/_matrix/client/versions >/dev/null 2>&1; then
+        safe_echo "   ${GREEN}✓ Client API доступен${NC}"
+    else
+        safe_echo "   ${RED}✗ Client API недоступен${NC}"
+        issues_found=$((issues_found + 1))
+    fi
+    
+    if curl -s -f http://localhost:8008/_synapse/admin/v1/server_version >/dev/null 2>&1; then
+        local version=$(curl -s http://localhost:8008/_synapse/admin/v1/server_version | grep -o '"server_version":"[^"]*' | cut -d'"' -f4)
+        safe_echo "   ${GREEN}✓ Admin API доступен (версия: ${version:-неизвестна})${NC}"
+    else
+        safe_echo "   ${RED}✗ Admin API недоступен${NC}"
+        issues_found=$((issues_found + 1))
+    fi
+    
+    # Проверка 4: Утилита register_new_matrix_user
+    echo
+    safe_echo "${CYAN}4. Проверка утилиты register_new_matrix_user:${NC}"
+    
+    if command -v register_new_matrix_user >/dev/null 2>&1; then
+        safe_echo "   ${GREEN}✓ Утилита register_new_matrix_user найдена в PATH${NC}"
+        local util_path=$(which register_new_matrix_user)
+        safe_echo "   ${BLUE}ℹ Путь: $util_path${NC}"
+    elif [ -x "/opt/venvs/matrix-synapse/bin/register_new_matrix_user" ]; then
+        safe_echo "   ${GREEN}✓ Утилита найдена в venv: /opt/venvs/matrix-synapse/bin/register_new_matrix_user${NC}"
+    else
+        safe_echo "   ${RED}✗ Утилита register_new_matrix_user НЕ найдена${NC}"
+        issues_found=$((issues_found + 1))
+    fi
+    
+    # Проверка 5: Права доступа к файлам
+    echo
+    safe_echo "${CYAN}5. Проверка прав доступа к конфигурации:${NC}"
+    
+    if [ -r "$SYNAPSE_CONFIG_DIR/homeserver.yaml" ]; then
+        safe_echo "   ${GREEN}✓ homeserver.yaml читается${NC}"
+        local file_owner=$(stat -c '%U:%G' "$SYNAPSE_CONFIG_DIR/homeserver.yaml")
+        safe_echo "   ${BLUE}ℹ Владелец: $file_owner${NC}"
+    else
+        safe_echo "   ${RED}✗ homeserver.yaml не читается${NC}"
+        issues_found=$((issues_found + 1))
+    fi
+    
+    # Проверка 6: База данных
+    echo
+    safe_echo "${CYAN}6. Проверка подключения к базе данных:${NC}"
+    
+    if systemctl is-active --quiet postgresql; then
+        safe_echo "   ${GREEN}✓ PostgreSQL запущен${NC}"
         
-        if ! $step_func; then
-            log "ERROR" "Ошибка на этапе: $step_name"
-            log "ERROR" "Установка прервана"
-            return 1
+        if sudo -u postgres psql -d synapse_db -c "SELECT 1;" >/dev/null 2>&1; then
+            safe_echo "   ${GREEN}✓ Подключение к базе synapse_db работает${NC}"
+        else
+            safe_echo "   ${RED}✗ Ошибка подключения к базе synapse_db${NC}"
+            issues_found=$((issues_found + 1))
+        fi
+    else
+        safe_echo "   ${RED}✗ PostgreSQL НЕ запущен${NC}"
+        issues_found=$((issues_found + 1))
+    fi
+    
+    # Итоговый отчет
+    echo
+    if [ $issues_found -eq 0 ]; then
+        safe_echo "${GREEN}🎉 Все проверки пройдены! Регистрация должна работать.${NC}"
+    else
+        safe_echo "${RED}❌ Найдено проблем: $issues_found${NC}"
+        echo
+        safe_echo "${YELLOW}💡 Рекомендации по устранению:${NC}"
+        
+        # Даем конкретные рекомендации
+        if ! grep -q "registration_shared_secret:" "$SYNAPSE_CONFIG_DIR/homeserver.yaml"; then
+            safe_echo "• ${CYAN}Добавить секрет регистрации в homeserver.yaml${NC}"
         fi
         
-        log "SUCCESS" "Этап завершён: $step_name"
-        echo
-    done
+        if ! systemctl is-active --quiet matrix-synapse; then
+            safe_echo "• ${CYAN}Запустить Synapse: systemctl start matrix-synapse${NC}"
+        fi
+        
+        if ! command -v register_new_matrix_user >/dev/null 2>&1; then
+            safe_echo "• ${CYAN}Переустановить matrix-synapse-py3 пакет${NC}"
+        fi
+    fi
     
-    # Вывод итоговой информации
-    print_header "УСТАНОВКА ЗАВЕРШЕНА УСПЕШНО!" "$GREEN"
+    return $issues_found
+}
+
+# Функция автоматического исправления проблем регистрации
+fix_registration_issues() {
+    print_header "АВТОМАТИЧЕСКОЕ ИСПРАВЛЕНИЕ ПРОБЛЕМ" "$GREEN"
     
-    safe_echo "${GREEN}✅ Matrix Synapse установлен и настроен${NC}"
-    safe_echo "${BLUE}📋 Информация об установке:${NC}"
-    safe_echo "   ${BOLD}Тип сервера:${NC} $SERVER_TYPE"
-    safe_echo "   ${BOLD}Bind адрес:${NC} $BIND_ADDRESS"
-    safe_echo "   ${BOLD}Домен сервера:${NC} $MATRIX_DOMAIN"
-    safe_echo "   ${BOLD}Конфигурация:${NC} $SYNAPSE_CONFIG_DIR/homeserver.yaml"
-    safe_echo "   ${BOLD}Данные:${NC} $SYNAPSE_DATA_DIR"
-    safe_echo "   ${BOLD}Логи:${NC} journalctl -u matrix-synapse"
-    [[ -n "${PUBLIC_IP:-}" ]] && safe_echo "   ${BOLD}Публичный IP:${NC} $PUBLIC_IP"
-    [[ -n "${LOCAL_IP:-}" ]] && safe_echo "   ${BOLD}Локальный IP:${NC} $LOCAL_IP"
+    log "INFO" "Попытка автоматического исправления проблем регистрации..."
+    
+    local fixes_applied=0
+    
+    # Исправление 1: Добавление секрета регистрации в homeserver.yaml
+    if ! grep -q "registration_shared_secret:" "$SYNAPSE_CONFIG_DIR/homeserver.yaml"; then
+        log "INFO" "Добавление секрета регистрации в homeserver.yaml..."
+        
+        if [ -f "$CONFIG_DIR/secrets.conf" ]; then
+            source "$CONFIG_DIR/secrets.conf"
+            if [ -n "$REGISTRATION_SHARED_SECRET" ]; then
+                # Добавляем секрет в правильное место конфигурации
+                sed -i '/^macaroon_secret_key:/a registration_shared_secret: "'"$REGISTRATION_SHARED_SECRET"'"' "$SYNAPSE_CONFIG_DIR/homeserver.yaml"
+                log "SUCCESS" "Секрет регистрации добавлен в homeserver.yaml"
+                fixes_applied=$((fixes_applied + 1))
+            else
+                log "WARN" "Секрет регистрации не найден в secrets.conf"
+            fi
+        else
+            log "WARN" "Файл secrets.conf не найден"
+        fi
+    fi
+    
+    # Исправление 2: Запуск Synapse если он остановлен
+    if ! systemctl is-active --quiet matrix-synapse; then
+        log "INFO" "Запуск службы Matrix Synapse..."
+        if systemctl start matrix-synapse; then
+            log "SUCCESS" "Matrix Synapse запущен"
+            fixes_applied=$((fixes_applied + 1))
+            
+            # Ждем готовности
+            sleep 5
+        else
+            log "ERROR" "Ошибка запуска Matrix Synapse"
+        fi
+    fi
+    
+    # Исправление 3: Запуск PostgreSQL если он остановлен
+    if ! systemctl is-active --quiet postgresql; then
+        log "INFO" "Запуск службы PostgreSQL..."
+        if systemctl start postgresql; then
+            log "SUCCESS" "PostgreSQL запущен"
+            fixes_applied=$((fixes_applied + 1))
+        else
+            log "ERROR" "Ошибка запуска PostgreSQL"
+        fi
+    fi
+    
+    # Исправление 4: Перезапуск Synapse для применения изменений
+    if [ $fixes_applied -gt 0 ]; then
+        log "INFO" "Перезапуск Synapse для применения изменений..."
+        if systemctl restart matrix-synapse; then
+            log "SUCCESS" "Synapse перезапущен"
+            
+            # Ждем готовности API
+            log "INFO" "Ожидание готовности API..."
+            local api_attempts=0
+            local max_attempts=10
+            
+            while [ $api_attempts -lt $max_attempts ]; do
+                if curl -s -f http://localhost:8008/_matrix/client/versions >/dev/null 2>&1; then
+                    log "SUCCESS" "API готов к работе"
+                    break
+                fi
+                
+                api_attempts=$((api_attempts + 1))
+                sleep 3
+            done
+        else
+            log "ERROR" "Ошибка перезапуска Synapse"
+        fi
+    fi
     
     echo
-    safe_echo "${YELLOW}📝 Следующие шаги:${NC}"
-    
-    case "$SERVER_TYPE" in
-        "proxmox"|"home_server"|"docker"|"openvz")
-            safe_echo "   ${BLUE}Для сервера за NAT ($SERVER_TYPE):${NC}"
-            safe_echo "   1. Настройте reverse proxy (Caddy) на хосте с публичным IP"
-            safe_echo "   2. Перенаправьте порты 80, 443, 8448 на этот сервер"
-            safe_echo "   3. Настройте DNS записи для домена $MATRIX_DOMAIN"
-            safe_echo "   4. Проверьте доступность федерации:"
-            safe_echo "      ${CYAN}curl https://federationtester.matrix.org/api/report?server_name=$MATRIX_DOMAIN${NC}"
-            ;;
-        *)
-            safe_echo "   ${BLUE}Для облачного сервера ($SERVER_TYPE):${NC}"
-            safe_echo "   1. Настройте reverse proxy (nginx/caddy) для HTTPS"
-            safe_echo "   2. Настройте DNS записи для вашего домена"
-            safe_echo "   3. Получите SSL сертификат (Let's Encrypt рекомендуется)"
-            ;;
-    esac
-    
-    safe_echo "   4. Создайте администратора командой:"
-    safe_echo "      ${CYAN}register_new_matrix_user -c $SYNAPSE_CONFIG_DIR/homeserver.yaml http://localhost:8008${NC}"
-    safe_echo "   5. Установите Element Web для веб-интерфейса"
-    
-    echo
-    safe_echo "${GREEN}🎉 Matrix Synapse готов к использованию!${NC}"
-    
-    # Сохранение информации об установке
-    set_config_value "$CONFIG_DIR/install.conf" "SYNAPSE_INSTALLED" "true"
-    set_config_value "$CONFIG_DIR/install.conf" "INSTALL_DATE" "$(date '+%Y-%m-%d %H:%M:%S')"
-    set_config_value "$CONFIG_DIR/install.conf" "SERVER_TYPE" "$SERVER_TYPE"
-    set_config_value "$CONFIG_DIR/install.conf" "MATRIX_DOMAIN" "$MATRIX_DOMAIN"
-    
-    # Опция создания администратора
-    echo
-    if ask_confirmation "Создать административного пользователя сейчас?"; then
-        create_admin_user
+    if [ $fixes_applied -gt 0 ]; then
+        safe_echo "${GREEN}✅ Применено исправлений: $fixes_applied${NC}"
+        safe_echo "${BLUE}💡 Попробуйте создать администратора снова${NC}"
+    else
+        safe_echo "${YELLOW}⚠️ Автоматические исправления не применены${NC}"
+        safe_echo "${BLUE}💡 Возможно, требуется ручное вмешательство${NC}"
     fi
     
     return 0
 }
 
-# Проверка, вызван ли скрипт напрямую
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main "$@"
+# Экспорт функций для использования в других модулях
+export -f create_admin_user
+export -f diagnose_registration_issues  
+export -f fix_registration_issues
+
+# Основной скрипт установки
+clear
+
+# Проверка системных требований
+check_system_requirements || exit 1
+
+# Получение доменного имени
+get_matrix_domain || exit 1
+
+# Обновление системы
+update_system || exit 1
+
+# Добавление репозитория Matrix
+add_matrix_repository || exit 1
+
+# Установка PostgreSQL
+install_postgresql || exit 1
+
+# Создание базы данных для Synapse
+create_synapse_database || exit 1
+
+# Установка Matrix Synapse
+install_matrix_synapse || exit 1
+
+# Создание базовой конфигурации Synapse
+create_synapse_config || exit 1
+
+# Запуск и проверка Synapse
+start_and_verify_synapse || exit 1
+
+# Опция создания администратора
+echo
+if ask_confirmation "Создать административного пользователя сейчас?"; then
+    if ! create_admin_user; then
+        echo
+        safe_echo "${YELLOW}❌ Не удалось создать администратора автоматически${NC}"
+        
+        if ask_confirmation "Запустить диагностику проблем регистрации?"; then
+            diagnose_registration_issues
+            
+            echo
+            if ask_confirmation "Попытаться автоматически исправить найденные проблемы?"; then
+                fix_registration_issues
+                
+                echo
+                if ask_confirmation "Попробовать создать администратора снова?"; then
+                    create_admin_user
+                fi
+            fi
+        fi
+        
+        # Показываем альтернативные способы
+        echo
+        safe_echo "${BLUE}📝 Альтернативные способы создания администратора:${NC}"
+        safe_echo "1. ${CYAN}Ручная команда:${NC}"
+        safe_echo "   register_new_matrix_user -c $SYNAPSE_CONFIG_DIR/homeserver.yaml http://localhost:8008"
+        safe_echo "2. ${CYAN}Через модуль управления регистрацией:${NC}"
+        safe_echo "   ./manager-matrix.sh → Управление регистрацией → Создать администратора"
+        safe_echo "3. ${CYAN}После настройки reverse proxy:${NC}"
+        safe_echo "   register_new_matrix_user -c $SYNAPSE_CONFIG_DIR/homeserver.yaml https://$MATRIX_DOMAIN"
+    fi
+else
+    echo
+    safe_echo "${BLUE}💡 Администратора можно создать позже командой:${NC}"
+    safe_echo "   ${CYAN}register_new_matrix_user -c $SYNAPSE_CONFIG_DIR/homeserver.yaml http://localhost:8008${NC}"
 fi
+
+log "INFO" "Установка и настройка Matrix Synapse завершены. Если возникли ошибки, проверьте логи и устраните проблемы."
+print_footer

@@ -1035,25 +1035,38 @@ main_menu() {
         echo
         safe_echo "${GREEN}3.${NC}  📊 Проверить статус системы"
         safe_echo "${GREEN}4.${NC}  ⚙️  Управление службами"
-        safe_echo "${GREEN}5.${NC}  🔧 Дополнительные компоненты"
+        safe_echo "${GREEN}5.${NC}  👥 Управление пользователями Matrix"
+        safe_echo "${GREEN}6.${NC}  🔧 Дополнительные компоненты"
         
         echo
         safe_echo "${BOLD}Инструменты:${NC}"
         echo
-        safe_echo "${GREEN}6.${NC}  📋 Показать конфигурацию"
-        safe_echo "${GREEN}7.${NC}  💾 Создать резервную копию"
-        safe_echo "${GREEN}8.${NC}  🔄 Обновить модули и библиотеку"
-        safe_echo "${GREEN}9.${NC}  🔍 Диагностика и устранение проблем"
-        safe_echo "${GREEN}10.${NC} 📖 Показать системную информацию"
+        safe_echo "${GREEN}7.${NC}  📋 Показать конфигурацию"
+        safe_echo "${GREEN}8.${NC}  💾 Создать резервную копию"
+        safe_echo "${GREEN}9.${NC}  🔄 Обновить модули и библиотеку"
+        safe_echo "${GREEN}10.${NC} 🔍 Диагностика и устранение проблем"
+        safe_echo "${GREEN}11.${NC} 📖 Показать системную информацию"
         
         echo
-        safe_echo "${GREEN}11.${NC} ❌ Выход"
+        safe_echo "${GREEN}12.${NC} ❌ Выход"
         
         echo
         
         # Показываем краткую информацию о статусе
         if systemctl is-active --quiet matrix-synapse 2>/dev/null; then
             safe_echo "${GREEN}💚 Matrix Synapse: активен${NC}"
+            
+            # Показываем количество пользователей если доступна база данных
+            if sudo -u postgres psql -d synapse_db -c "SELECT 1;" >/dev/null 2>&1; then
+                local total_users=$(sudo -u postgres psql -d synapse_db -t -c "SELECT COUNT(*) FROM users WHERE deactivated = 0;" 2>/dev/null | xargs)
+                local admin_users=$(sudo -u postgres psql -d synapse_db -t -c "SELECT COUNT(*) FROM users WHERE admin = 1 AND deactivated = 0;" 2>/dev/null | xargs)
+                
+                if [ -n "$total_users" ] && [ "$total_users" != "0" ]; then
+                    safe_echo "${BLUE}👥 Пользователей: $total_users (👑 админов: ${admin_users:-0})${NC}"
+                else
+                    safe_echo "${YELLOW}👥 Пользователи не созданы${NC}"
+                fi
+            fi
         else
             safe_echo "${RED}💔 Matrix Synapse: неактивен${NC}"
         fi
@@ -1065,7 +1078,7 @@ main_menu() {
         fi
         
         echo
-        read -p "$(safe_echo "${YELLOW}Выберите действие (1-11): ${NC}")" choice
+        read -p "$(safe_echo "${YELLOW}Выберите действие (1-12): ${NC}")" choice
         
         case $choice in
             1)
@@ -1081,26 +1094,29 @@ main_menu() {
                 manage_services
                 ;;
             5)
-                manage_additional_components
+                manage_matrix_users
                 ;;
             6)
-                show_configuration_info
+                manage_additional_components
                 ;;
             7)
-                create_backup
+                show_configuration_info
                 ;;
             8)
-                update_modules_and_library
+                create_backup
                 ;;
             9)
+                update_modules_and_library
+                ;;
+            10)
                 log "INFO" "Запуск диагностики..."
                 get_system_info
                 check_matrix_status
                 ;;
-            10)
+            11)
                 get_system_info
                 ;;
-            11)
+            12)
                 print_header "ЗАВЕРШЕНИЕ РАБОТЫ" "$GREEN"
                 log "INFO" "Спасибо за использование Matrix Setup Tool!"
                 safe_echo "${GREEN}До свидания! 👋${NC}"
@@ -1112,7 +1128,7 @@ main_menu() {
                 ;;
         esac
         
-        if [ $choice -ne 11 ]; then
+        if [ $choice -ne 12 ]; then
             echo
             read -p "Нажмите Enter для возврата в главное меню..."
         fi
@@ -1259,34 +1275,422 @@ update_modules_and_library() {
     return 0
 }
 
-# Главная функция
-main() {
-    # Инициализация
-    if ! initialize; then
-        log "ERROR" "Ошибка инициализации"
-        exit 1
+# Функция управления пользователями Matrix
+manage_matrix_users() {
+    # Сначала подключаем функции из core_install.sh если они не загружены
+    if ! command -v create_admin_user >/dev/null 2>&1; then
+        if [ -f "$MODULES_DIR/core_install.sh" ]; then
+            source "$MODULES_DIR/core_install.sh"
+        else
+            log "ERROR" "Модуль core_install.sh не найден"
+            return 1
+        fi
     fi
     
-    # Приветствие
-    print_header "ДОБРО ПОЖАЛОВАТЬ В MATRIX SETUP TOOL!" "$GREEN"
-    
-    log "INFO" "Запуск $LIB_NAME v$LIB_VERSION"
-    log "INFO" "Проект: $PROJECT_NAME"
-    
-    # Проверка обновлений при запуске
-    if ask_confirmation "Проверить наличие обновлений для модулей и библиотеки?"; then
-        update_modules_and_library
-        read -p "Нажмите Enter для продолжения..."
-    fi
-    
-    # Запуск главного меню
-    main_menu
+    while true; do
+        print_header "УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ MATRIX" "$MAGENTA"
+        
+        # Проверяем статус Synapse
+        if ! systemctl is-active --quiet matrix-synapse 2>/dev/null; then
+            safe_echo "${RED}❌ Matrix Synapse не запущен!${NC}"
+            safe_echo "${YELLOW}💡 Запустите Synapse через меню 'Управление службами' → 'Управление Matrix Synapse'${NC}"
+            echo
+            safe_echo "${GREEN}1.${NC} Попробовать запустить Matrix Synapse"
+            safe_echo "${GREEN}2.${NC} Назад в главное меню"
+            
+            echo
+            read -p "$(safe_echo "${YELLOW}Выберите действие (1-2): ${NC}")" choice
+            
+            case $choice in
+                1)
+                    log "INFO" "Попытка запуска Matrix Synapse..."
+                    if systemctl start matrix-synapse; then
+                        log "SUCCESS" "Matrix Synapse запущен"
+                        sleep 3
+                        continue
+                    else
+                        log "ERROR" "Не удалось запустить Matrix Synapse"
+                        log "INFO" "Проверьте логи: journalctl -u matrix-synapse -n 20"
+                        return 1
+                    fi
+                    ;;
+                2)
+                    return 0
+                    ;;
+                *)
+                    log "ERROR" "Неверный выбор"
+                    sleep 1
+                    continue
+                    ;;
+            esac
+        fi
+        
+        # Показываем текущий статус
+        safe_echo "${GREEN}✅ Matrix Synapse активен${NC}"
+        
+        # Показываем домен сервера
+        if [ -f "$CONFIG_DIR/domain" ]; then
+            local matrix_domain=$(cat "$CONFIG_DIR/domain")
+            safe_echo "${BLUE}🌐 Домен сервера: ${BOLD}$matrix_domain${NC}"
+        else
+            safe_echo "${RED}❌ Домен сервера не настроен${NC}"
+        fi
+        
+        # Проверяем доступность API
+        local api_available=false
+        if curl -s -f --connect-timeout 3 http://localhost:8008/_matrix/client/versions >/dev/null 2>&1; then
+            safe_echo "${GREEN}✅ Matrix API доступен${NC}"
+            api_available=true
+        else
+            safe_echo "${YELLOW}⚠️  Matrix API недоступен (возможно, Synapse ещё запускается)${NC}"
+        fi
+        
+        echo
+        safe_echo "${BOLD}Управление пользователями:${NC}"
+        safe_echo "${GREEN}1.${NC} 👤 Создать администратора"
+        safe_echo "${GREEN}2.${NC} 👥 Создать обычного пользователя"
+        safe_echo "${GREEN}3.${NC} 🔍 Диагностика проблем регистрации"
+        safe_echo "${GREEN}4.${NC} 🔧 Исправить проблемы регистрации"
+        safe_echo "${GREEN}5.${NC} 📊 Показать информацию о пользователях"
+        
+        echo
+        safe_echo "${BOLD}Дополнительные возможности:${NC}"
+        safe_echo "${GREEN}6.${NC} ⚙️  Настройка регистрации (полный модуль)"
+        safe_echo "${GREEN}7.${NC} 🔑 Управление токенами регистрации"
+        safe_echo "${GREEN}8.${NC} 📝 Показать команды для ручного управления"
+        safe_echo "${GREEN}9.${NC} ↩️  Назад в главное меню"
+        
+        echo
+        read -p "$(safe_echo "${YELLOW}Выберите действие (1-9): ${NC}")" choice
+        
+        case $choice in
+            1)
+                if [ "$api_available" = true ]; then
+                    create_admin_user
+                else
+                    safe_echo "${RED}❌ Matrix API недоступен. Дождитесь полного запуска Synapse.${NC}"
+                    safe_echo "${BLUE}💡 Попробуйте через 10-15 секунд или проверьте логи Synapse${NC}"
+                fi
+                ;;
+            2)
+                if [ "$api_available" = true ]; then
+                    create_regular_user
+                else
+                    safe_echo "${RED}❌ Matrix API недоступен. Дождитесь полного запуска Synapse.${NC}"
+                fi
+                ;;
+            3)
+                diagnose_registration_issues
+                ;;
+            4)
+                fix_registration_issues
+                ;;
+            5)
+                show_users_info
+                ;;
+            6)
+                run_module "registration_control"
+                ;;
+            7)
+                manage_registration_tokens
+                ;;
+            8)
+                show_manual_commands
+                ;;
+            9)
+                return 0
+                ;;
+            *)
+                log "ERROR" "Неверный выбор"
+                sleep 1
+                ;;
+        esac
+        
+        if [ $choice -ne 9 ]; then
+            echo
+            read -p "Нажмите Enter для продолжения..."
+        fi
+    done
 }
 
-# Обработка сигналов
-trap 'log "INFO" "Получен сигнал завершения, выходим..."; exit 0' SIGINT SIGTERM
+# Функция создания обычного пользователя
+create_regular_user() {
+    print_header "СОЗДАНИЕ ОБЫЧНОГО ПОЛЬЗОВАТЕЛЯ" "$BLUE"
+    
+    if ! systemctl is-active --quiet matrix-synapse; then
+        log "ERROR" "Matrix Synapse не запущен"
+        return 1
+    fi
+    
+    # Проверяем доступность API
+    if ! curl -s -f --connect-timeout 3 http://localhost:8008/_matrix/client/versions >/dev/null 2>&1; then
+        log "ERROR" "Matrix API недоступен"
+        return 1
+    fi
+    
+    # Получаем домен
+    if [ ! -f "$CONFIG_DIR/domain" ]; then
+        log "ERROR" "Домен сервера не настроен"
+        return 1
+    fi
+    
+    local matrix_domain=$(cat "$CONFIG_DIR/domain")
+    
+    log "INFO" "Создание обычного пользователя на домене: $matrix_domain"
+    
+    # Запрос имени пользователя
+    while true; do
+        read -p "$(safe_echo "${YELLOW}Введите имя пользователя (только латинские буквы и цифры): ${NC}")" username
+        
+        if [[ ! "$username" =~ ^[a-zA-Z0-9._=-]+$ ]]; then
+            log "ERROR" "Неверный формат имени пользователя"
+            log "INFO" "Разрешены только: латинские буквы, цифры, точки, подчеркивания, дефисы"
+            continue
+        fi
+        
+        if [ ${#username} -lt 3 ]; then
+            log "ERROR" "Имя пользователя должно содержать минимум 3 символа"
+            continue
+        fi
+        
+        if [ ${#username} -gt 50 ]; then
+            log "ERROR" "Имя пользователя слишком длинное (максимум 50 символов)"
+            continue
+        fi
+        
+        break
+    done
+    
+    # Проверяем различные варианты команды register_new_matrix_user
+    local register_command=""
+    
+    if command -v register_new_matrix_user >/dev/null 2>&1; then
+        register_command="register_new_matrix_user"
+    elif [ -x "/opt/venvs/matrix-synapse/bin/register_new_matrix_user" ]; then
+        register_command="/opt/venvs/matrix-synapse/bin/register_new_matrix_user"
+    else
+        log "ERROR" "Команда register_new_matrix_user не найдена"
+        log "INFO" "Попробуйте создать пользователя вручную:"
+        log "INFO" "register_new_matrix_user -c /etc/matrix-synapse/homeserver.yaml http://localhost:8008"
+        return 1
+    fi
+    
+    log "INFO" "Используем команду: $register_command"
+    log "INFO" "Создание пользователя @$username:$matrix_domain..."
+    
+    # Создаем временный файл для хранения вывода
+    local temp_output=$(mktemp)
+    
+    # Выполняем команду создания пользователя (БЕЗ флага --admin)
+    if $register_command \
+        -c /etc/matrix-synapse/homeserver.yaml \
+        -u "$username" \
+        http://localhost:8008 > "$temp_output" 2>&1; then
+        
+        log "SUCCESS" "Пользователь создан: @$username:$matrix_domain"
+        
+        # Показываем полезную информацию
+        echo
+        safe_echo "${GREEN}🎉 Пользователь успешно создан!${NC}"
+        safe_echo "${BLUE}📋 Данные для входа:${NC}"
+        safe_echo "   ${BOLD}Пользователь:${NC} @$username:$matrix_domain"
+        safe_echo "   ${BOLD}Сервер:${NC} $matrix_domain"
+        safe_echo "   ${BOLD}Тип:${NC} Обычный пользователь"
+        safe_echo "   ${BOLD}Логин через Element:${NC} https://app.element.io"
+        
+        # Если Element Web установлен локально
+        if [ -f "$CONFIG_DIR/element_domain" ]; then
+            local element_domain=$(cat "$CONFIG_DIR/element_domain")
+            safe_echo "   ${BOLD}Локальный Element:${NC} https://$element_domain"
+        fi
+        
+        # Очищаем временный файл
+        rm -f "$temp_output"
+        
+    else
+        log "ERROR" "Ошибка создания пользователя"
+        
+        # Показываем подробности ошибки
+        if [ -f "$temp_output" ]; then
+            log "DEBUG" "Вывод команды register_new_matrix_user:"
+            cat "$temp_output" | while read line; do
+                log "DEBUG" "$line"
+            done
+        fi
+        
+        # Даем рекомендации по устранению проблем
+        echo
+        safe_echo "${YELLOW}💡 Возможные решения:${NC}"
+        safe_echo "1. ${CYAN}Проверьте статус Synapse:${NC} systemctl status matrix-synapse"
+        safe_echo "2. ${CYAN}Проверьте логи Synapse:${NC} journalctl -u matrix-synapse -n 20"
+        safe_echo "3. ${CYAN}Проверьте API:${NC} curl http://localhost:8008/_matrix/client/versions"
+        safe_echo "4. ${CYAN}Запустите диагностику:${NC} через пункт меню"
+        
+        # Очищаем временный файл
+        rm -f "$temp_output"
+        
+        return 1
+    fi
+    
+    return 0
+}
 
-# Запуск если скрипт вызван напрямую
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main "$@"
-fi
+# Функция показа информации о пользователях
+show_users_info() {
+    print_header "ИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЯХ" "$CYAN"
+    
+    if ! systemctl is-active --quiet matrix-synapse; then
+        safe_echo "${RED}❌ Matrix Synapse не запущен${NC}"
+        return 1
+    fi
+    
+    # Показываем домен сервера
+    if [ -f "$CONFIG_DIR/domain" ]; then
+        local matrix_domain=$(cat "$CONFIG_DIR/domain")
+        safe_echo "${BLUE}🌐 Домен сервера: ${BOLD}$matrix_domain${NC}"
+    else
+        safe_echo "${RED}❌ Домен сервера не настроен${NC}"
+        return 1
+    fi
+    
+    echo
+    
+    # Информация из базы данных
+    safe_echo "${BOLD}${BLUE}Информация из базы данных:${NC}"
+    
+    if sudo -u postgres psql -d synapse_db -c "\dt" >/dev/null 2>&1; then
+        # Подсчёт пользователей
+        local total_users=$(sudo -u postgres psql -d synapse_db -t -c "SELECT COUNT(*) FROM users;" 2>/dev/null | xargs)
+        local admin_users=$(sudo -u postgres psql -d synapse_db -t -c "SELECT COUNT(*) FROM users WHERE admin = 1;" 2>/dev/null | xargs)
+        local active_users=$(sudo -u postgres psql -d synapse_db -t -c "SELECT COUNT(*) FROM users WHERE deactivated = 0;" 2>/dev/null | xargs)
+        
+        if [ -n "$total_users" ] && [ "$total_users" != "0" ]; then
+            safe_echo "  ${GREEN}👥 Всего пользователей: $total_users${NC}"
+            safe_echo "  ${YELLOW}👑 Администраторов: ${admin_users:-0}${NC}"
+            safe_echo "  ${GREEN}✅ Активных: ${active_users:-0}${NC}"
+            safe_echo "  ${RED}🚫 Деактивированных: $((total_users - active_users))${NC}"
+        else
+            safe_echo "  ${YELLOW}⚠️  Пользователи не найдены${NC}"
+        fi
+        
+        echo
+        
+        # Список администраторов
+        safe_echo "${BOLD}${BLUE}Администраторы:${NC}"
+        local admins=$(sudo -u postgres psql -d synapse_db -t -c "SELECT name FROM users WHERE admin = 1 AND deactivated = 0;" 2>/dev/null)
+        
+        if [ -n "$admins" ]; then
+            echo "$admins" | while read -r admin_name; do
+                if [ -n "$admin_name" ]; then
+                    admin_name=$(echo "$admin_name" | xargs)  # убираем лишние пробелы
+                    safe_echo "  ${GREEN}👑 $admin_name${NC}"
+                fi
+            done
+        else
+            safe_echo "  ${RED}❌ Администраторы не найдены${NC}"
+            safe_echo "  ${YELLOW}💡 Создайте администратора через пункт меню${NC}"
+        fi
+        
+        echo
+        
+        # Последние созданные пользователи (первые 5)
+        safe_echo "${BOLD}${BLUE}Последние пользователи:${NC}"
+        local recent_users=$(sudo -u postgres psql -d synapse_db -t -c "SELECT name, creation_ts FROM users WHERE deactivated = 0 ORDER BY creation_ts DESC LIMIT 5;" 2>/dev/null)
+        
+        if [ -n "$recent_users" ]; then
+            echo "$recent_users" | while IFS='|' read -r user_name creation_ts; do
+                if [ -n "$user_name" ] && [ -n "$creation_ts" ]; then
+                    user_name=$(echo "$user_name" | xargs)
+                    creation_ts=$(echo "$creation_ts" | xargs)
+                    
+                    # Конвертируем timestamp в читаемый формат
+                    local creation_date=$(date -d "@$((creation_ts / 1000))" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "неизвестно")
+                    
+                    safe_echo "  ${BLUE}👤 $user_name${NC} ${DIM}(создан: $creation_date)${NC}"
+                fi
+            done
+        else
+            safe_echo "  ${YELLOW}⚠️  Пользователи не найдены${NC}"
+        fi
+        
+    else
+        safe_echo "  ${RED}❌ Не удалось подключиться к базе данных${NC}"
+        safe_echo "  ${YELLOW}💡 Проверьте статус PostgreSQL: systemctl status postgresql${NC}"
+    fi
+    
+    echo
+    
+    # API информация (если доступен)
+    if curl -s -f --connect-timeout 3 http://localhost:8008/_matrix/client/versions >/dev/null 2>&1; then
+        safe_echo "${BOLD}${BLUE}Статус API:${NC}"
+        safe_echo "  ${GREEN}✅ Matrix API доступен${NC}"
+        
+        # Версия сервера
+        local server_version=$(curl -s --connect-timeout 3 http://localhost:8008/_synapse/admin/v1/server_version 2>/dev/null | grep -o '"server_version":"[^"]*' | cut -d'"' -f4)
+        if [ -n "$server_version" ]; then
+            safe_echo "  ${BLUE}ℹ️  Версия Synapse: $server_version${NC}"
+        fi
+        
+    else
+        safe_echo "${BOLD}${BLUE}Статус API:${NC}"
+        safe_echo "  ${RED}❌ Matrix API недоступен${NC}"
+        safe_echo "  ${YELLOW}💡 API требуется для создания пользователей${NC}"
+    fi
+    
+    echo
+    
+    # Полезные команды
+    safe_echo "${BOLD}${BLUE}Полезные команды:${NC}"
+    safe_echo "  ${CYAN}Создать администратора:${NC}"
+    safe_echo "    register_new_matrix_user -c /etc/matrix-synapse/homeserver.yaml --admin http://localhost:8008"
+    safe_echo "  ${CYAN}Создать пользователя:${NC}"
+    safe_echo "    register_new_matrix_user -c /etc/matrix-synapse/homeserver.yaml http://localhost:8008"
+    safe_echo "  ${CYAN}Создать пользователя с конкретным именем:${NC}"
+    safe_echo "    register_new_matrix_user -c /etc/matrix-synapse/homeserver.yaml -u username http://localhost:8008"
+    
+    echo
+    safe_echo "${BOLD}${BLUE}Управление через базу данных:${NC}"
+    safe_echo "${CYAN}# Подключиться к базе данных${NC}"
+    safe_echo "sudo -u postgres psql synapse_db"
+    safe_echo ""
+    safe_echo "${CYAN}# Показать всех пользователей${NC}"
+    safe_echo "sudo -u postgres psql -d synapse_db -c \"SELECT name, admin, deactivated FROM users;\""
+    safe_echo ""
+    safe_echo "${CYAN}# Сделать пользователя администратором${NC}"
+    safe_echo "sudo -u postgres psql -d synapse_db -c \"UPDATE users SET admin = 1 WHERE name = '@username:$matrix_domain';\""
+    safe_echo ""
+    safe_echo "${CYAN}# Деактивировать пользователя${NC}"
+    safe_echo "sudo -u postgres psql -d synapse_db -c \"UPDATE users SET deactivated = 1 WHERE name = '@username:$matrix_domain';\""
+    
+    echo
+    safe_echo "${BOLD}${BLUE}Управление службами:${NC}"
+    safe_echo "${CYAN}# Перезапустить Synapse${NC}"
+    safe_echo "systemctl restart matrix-synapse"
+    safe_echo ""
+    safe_echo "${CYAN}# Посмотреть логи Synapse${NC}"
+    safe_echo "journalctl -u matrix-synapse -f"
+    safe_echo ""
+    safe_echo "${CYAN}# Проверить статус всех служб Matrix${NC}"
+    safe_echo "systemctl status matrix-synapse postgresql nginx"
+    
+    echo
+    safe_echo "${BOLD}${BLUE}Диагностика:${NC}"
+    safe_echo "${CYAN}# Проверить доступность API${NC}"
+    safe_echo "curl http://localhost:8008/_matrix/client/versions"
+    safe_echo ""
+    safe_echo "${CYAN}# Проверить конфигурацию Synapse${NC}"
+    safe_echo "python3 -m synapse.config -c /etc/matrix-synapse/homeserver.yaml"
+    safe_echo ""
+    safe_echo "${CYAN}# Проверить открытые порты${NC}"
+    safe_echo "ss -tlnp | grep -E ':(8008|8448|5432|80|443)'"
+    
+    echo
+    safe_echo "${BOLD}${BLUE}Важные файлы и пути:${NC}"
+    safe_echo "${YELLOW}Конфигурация Synapse:${NC} /etc/matrix-synapse/homeserver.yaml"
+    safe_echo "${YELLOW}Логи Synapse:${NC} /var/lib/matrix-synapse/homeserver.log"
+    safe_echo "${YELLOW}Данные Synapse:${NC} /var/lib/matrix-synapse/"
+    safe_echo "${YELLOW}Конфигурация установщика:${NC} $CONFIG_DIR/"
+    safe_echo "${YELLOW}База данных:${NC} PostgreSQL, база synapse_db"
+    
+    return 0
+}
