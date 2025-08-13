@@ -71,11 +71,29 @@ check_system_requirements() {
     # Проверка подключения к интернету
     check_internet || return 1
     
-    # Проверка зависимостей
-    check_dependencies "curl" "wget" "lsb-release" "gpg" || {
-        log "INFO" "Установка базовых зависимостей..."
-        apt update && apt install -y curl wget lsb-release gpg apt-transport-https
-    }
+    # Проверка ТОЛЬКО критически важных зависимостей
+    # Остальные пакеты устанавливаем автоматически без проверки
+    local critical_commands=("curl" "wget")
+    local missing_critical=()
+    
+    for cmd in "${critical_commands[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing_critical+=("$cmd")
+        fi
+    done
+    
+    if [ ${#missing_critical[@]} -gt 0 ]; then
+        log "INFO" "Установка критически важных зависимостей: ${missing_critical[*]}"
+        if ! apt update; then
+            log "ERROR" "Ошибка обновления списка пакетов"
+            return 1
+        fi
+        
+        if ! apt install -y "${missing_critical[@]}"; then
+            log "ERROR" "Ошибка установки критически важных зависимостей"
+            return 1
+        fi
+    fi
     
     log "SUCCESS" "Системные требования проверены"
     return 0
@@ -144,7 +162,6 @@ update_system() {
         "curl"
         "wget" 
         "git"
-        "lsb-release"
         "apt-transport-https"
         "ca-certificates"
         "gnupg"
@@ -153,6 +170,12 @@ update_system() {
         "pwgen"
         "openssl"
     )
+    
+    # Добавляем lsb-release только если он нужен для определения кодового имени
+    if ! command -v lsb_release >/dev/null 2>&1; then
+        packages+=("lsb-release")
+        log "INFO" "Добавляем lsb-release для определения версии системы"
+    fi
     
     if ! apt install -y "${packages[@]}"; then
         log "ERROR" "Ошибка установки системных пакетов"
@@ -178,8 +201,49 @@ add_matrix_repository() {
         return 1
     fi
     
+    # Определение кодового имени дистрибутива
+    local codename=""
+    
+    if command -v lsb_release >/dev/null 2>&1; then
+        codename=$(lsb_release -cs)
+        log "INFO" "Кодовое имя дистрибутива (через lsb_release): $codename"
+    elif [ -f /etc/os-release ]; then
+        # Альтернативный способ через /etc/os-release
+        source /etc/os-release
+        codename="${VERSION_CODENAME:-$UBUNTU_CODENAME}"
+        
+        # Если всё ещё пусто, используем известные кодовые имена на основе ID и VERSION_ID
+        if [ -z "$codename" ]; then
+            case "$ID" in
+                "ubuntu")
+                    case "$VERSION_ID" in
+                        "20.04") codename="focal" ;;
+                        "22.04") codename="jammy" ;;
+                        "24.04") codename="noble" ;;
+                        *) codename="jammy" ;; # По умолчанию для Ubuntu
+                    esac
+                    ;;
+                "debian")
+                    case "$VERSION_ID" in
+                        "11") codename="bullseye" ;;
+                        "12") codename="bookworm" ;;
+                        *) codename="bullseye" ;; # По умолчанию для Debian
+                    esac
+                    ;;
+                *)
+                    codename="jammy" # Универсальный fallback
+                    ;;
+            esac
+        fi
+        
+        log "INFO" "Кодовое имя дистрибутива (через /etc/os-release): $codename"
+    else
+        # Последний fallback
+        codename="jammy"
+        log "WARN" "Не удалось определить кодовое имя, используем fallback: $codename"
+    fi
+    
     # Добавление репозитория
-    local codename=$(lsb_release -cs)
     local repo_line="deb [signed-by=$keyring_path] https://packages.matrix.org/debian/ $codename main"
     
     echo "$repo_line" | tee /etc/apt/sources.list.d/matrix-org.list > /dev/null
