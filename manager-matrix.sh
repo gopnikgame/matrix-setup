@@ -2024,20 +2024,40 @@ diagnose_registration_issues() {
     fi
     
     # 3. Проверка секрета регистрации
-    safe_echo "${BLUE}3. Проверка секрета регистрации:${NC}"
+    safe_echo "${BLUE}3. Проверка registration_shared_secret:${NC}"
     if grep -q "registration_shared_secret:" /etc/matrix-synapse/homeserver.yaml; then
-        safe_echo "   ${GREEN}✅ Секрет регистрации найден в homeserver.yaml${NC}"
+        safe_echo "   ${GREEN}✅ registration_shared_secret найден в homeserver.yaml${NC}"
     elif [ -f "/etc/matrix-synapse/conf.d/registration.yaml" ] && grep -q "registration_shared_secret:" /etc/matrix-synapse/conf.d/registration.yaml 2>/dev/null; then
-        safe_echo "   ${YELLOW}⚠️  Секрет регистрации найден в registration.yaml (может не работать)${NC}"
+        safe_echo "   ${YELLOW}⚠️  registration_shared_secret найден в registration.yaml (может не работать)${NC}"
         safe_echo "   ${BLUE}💡 Утилита register_new_matrix_user ищет секрет только в homeserver.yaml${NC}"
         ((issues_found++))
     else
-        safe_echo "   ${RED}❌ Секрет регистрации не найден${NC}"
+        safe_echo "   ${RED}❌ registration_shared_secret не найден${NC}"
         ((issues_found++))
     fi
     
-    # 4. Проверка утилиты register_new_matrix_user
-    safe_echo "${BLUE}4. Проверка утилиты регистрации:${NC}"
+    # 4. Проверка macaroon_secret_key
+    safe_echo "${BLUE}4. Проверка macaroon_secret_key:${NC}"
+    if grep -q "macaroon_secret_key:" /etc/matrix-synapse/homeserver.yaml; then
+        safe_echo "   ${GREEN}✅ macaroon_secret_key найден в homeserver.yaml${NC}"
+    else
+        safe_echo "   ${RED}❌ macaroon_secret_key не найден${NC}"
+        safe_echo "   ${YELLOW}💡 Этот ключ необходим для работы Synapse${NC}"
+        ((issues_found++))
+    fi
+    
+    # 5. Проверка form_secret
+    safe_echo "${BLUE}5. Проверка form_secret:${NC}"
+    if grep -q "form_secret:" /etc/matrix-synapse/homeserver.yaml; then
+        safe_echo "   ${GREEN}✅ form_secret найден в homeserver.yaml${NC}"
+    else
+        safe_echo "   ${RED}❌ form_secret не найден${NC}"
+        safe_echo "   ${YELLOW}💡 Этот ключ необходим для HTML форм${NC}"
+        ((issues_found++))
+    fi
+    
+    # 6. Проверка утилиты register_new_matrix_user
+    safe_echo "${BLUE}6. Проверка утилиты регистрации:${NC}"
     if command -v register_new_matrix_user >/dev/null 2>&1; then
         safe_echo "   ${GREEN}✅ Команда register_new_matrix_user доступна${NC}"
     elif [ -x "/opt/venvs/matrix-synapse/bin/register_new_matrix_user" ]; then
@@ -2047,8 +2067,8 @@ diagnose_registration_issues() {
         ((issues_found++))
     fi
     
-    # 5. Проверка прав доступа к конфигурации
-    safe_echo "${BLUE}5. Проверка прав доступа:${NC}"
+    # 7. Проверка прав доступа к конфигурации
+    safe_echo "${BLUE}7. Проверка прав доступа:${NC}"
     if [ -r "/etc/matrix-synapse/homeserver.yaml" ]; then
         safe_echo "   ${GREEN}✅ Файл homeserver.yaml доступен для чтения${NC}"
     else
@@ -2056,8 +2076,8 @@ diagnose_registration_issues() {
         ((issues_found++))
     fi
     
-    # 6. Проверка PostgreSQL
-    safe_echo "${BLUE}6. Проверка базы данных:${NC}"
+    # 8. Проверка PostgreSQL
+    safe_echo "${BLUE}8. Проверка базы данных:${NC}"
     if systemctl is-active --quiet postgresql; then
         if sudo -u postgres psql -d synapse_db -c "SELECT 1;" >/dev/null 2>&1; then
             safe_echo "   ${GREEN}✅ База данных synapse_db доступна${NC}"
@@ -2070,12 +2090,13 @@ diagnose_registration_issues() {
         ((issues_found++))
     fi
     
-    # 7. Проверка конфигурации Synapse
-    safe_echo "${BLUE}7. Проверка конфигурации Synapse:${NC}"
+    # 9. Проверка конфигурации Synapse
+    safe_echo "${BLUE}9. Проверка конфигурации Synapse:${NC}"
     if python3 -m synapse.config -c /etc/matrix-synapse/homeserver.yaml >/dev/null 2>&1; then
         safe_echo "   ${GREEN}✅ Конфигурация Synapse корректна${NC}"
     else
         safe_echo "   ${RED}❌ Ошибки в конфигурации Synapse${NC}"
+        safe_echo "   ${YELLOW}💡 Проверьте логи: python3 -m synapse.config -c /etc/matrix-synapse/homeserver.yaml${NC}"
         ((issues_found++))
     fi
     
@@ -2088,6 +2109,31 @@ diagnose_registration_issues() {
     else
         safe_echo "${RED}⚠️  Диагностика завершена: обнаружено проблем: $issues_found${NC}"
         safe_echo "${YELLOW}💡 Используйте функцию 'Исправить проблемы регистрации' для автоматического устранения.${NC}"
+        
+        # Показываем краткий список проблем для быстрого понимания
+        echo
+        safe_echo "${YELLOW}Обнаруженные проблемы:${NC}"
+        if ! systemctl is-active --quiet matrix-synapse; then
+            safe_echo "• Matrix Synapse не запущен"
+        fi
+        if ! curl -s -f --connect-timeout 3 http://localhost:8008/_matrix/client/versions >/dev/null 2>&1; then
+            safe_echo "• Matrix API недоступен"
+        fi
+        if ! grep -q "registration_shared_secret:" /etc/matrix-synapse/homeserver.yaml; then
+            safe_echo "• Отсутствует registration_shared_secret"
+        fi
+        if ! grep -q "macaroon_secret_key:" /etc/matrix-synapse/homeserver.yaml; then
+            safe_echo "• Отсутствует macaroon_secret_key"
+        fi
+        if ! grep -q "form_secret:" /etc/matrix-synapse/homeserver.yaml; then
+            safe_echo "• Отсутствует form_secret"
+        fi
+        if ! command -v register_new_matrix_user >/dev/null 2>&1 && [ ! -x "/opt/venvs/matrix-synapse/bin/register_new_matrix_user" ]; then
+            safe_echo "• Утилита register_new_matrix_user недоступна"
+        fi
+        if ! systemctl is-active --quiet postgresql; then
+            safe_echo "• PostgreSQL не запущен"
+        fi
     fi
     
     return $issues_found
@@ -2098,6 +2144,7 @@ fix_registration_issues() {
     print_header "ИСПРАВЛЕНИЕ ПРОБЛЕМ РЕГИСТРАЦИИ" "$GREEN"
     
     local fixes_applied=0
+    local need_restart=false
     
     safe_echo "${BOLD}Автоматическое исправление проблем...${NC}"
     echo
@@ -2114,9 +2161,16 @@ fix_registration_issues() {
         fi
     fi
     
-    # 2. Проверка и добавление секрета регистрации
+    # Создаем резервную копию конфигурации один раз
+    if [ ! -f "/etc/matrix-synapse/homeserver.yaml.backup.$(date +%Y%m%d)" ]; then
+        safe_echo "${BLUE}🔧 Создание резервной копии конфигурации...${NC}"
+        cp /etc/matrix-synapse/homeserver.yaml /etc/matrix-synapse/homeserver.yaml.backup.$(date +%Y%m%d_%H%M%S)
+        safe_echo "   ${GREEN}✅ Резервная копия создана${NC}"
+    fi
+    
+    # 2. Проверка и добавление registration_shared_secret
     if ! grep -q "registration_shared_secret:" /etc/matrix-synapse/homeserver.yaml 2>/dev/null; then
-        safe_echo "${BLUE}🔧 Добавление секрета регистрации в homeserver.yaml...${NC}"
+        safe_echo "${BLUE}🔧 Добавление registration_shared_secret в homeserver.yaml...${NC}"
         
         # Генерируем новый секрет если его нет
         local registration_secret=""
@@ -2126,24 +2180,22 @@ fix_registration_issues() {
         
         if [ -z "$registration_secret" ]; then
             registration_secret=$(openssl rand -hex 32)
-            safe_echo "   ${BLUE}💡 Сгенерирован новый секрет регистрации${NC}"
+            safe_echo "   ${BLUE}💡 Сгенерирован новый registration_shared_secret${NC}"
         fi
         
-        # Создаем резервную копию
-        cp /etc/matrix-synapse/homeserver.yaml /etc/matrix-synapse/homeserver.yaml.backup.$(date +%Y%m%d_%H%M%S)
-        
         # Добавляем секрет в homeserver.yaml
-        if ! grep -q "# Registration" /etc/matrix-synapse/homeserver.yaml; then
+        if ! grep -q "# Секреты безопасности" /etc/matrix-synapse/homeserver.yaml; then
             echo "" >> /etc/matrix-synapse/homeserver.yaml
-            echo "# Registration" >> /etc/matrix-synapse/homeserver.yaml
+            echo "# Секреты безопасности" >> /etc/matrix-synapse/homeserver.yaml
         fi
         
         # Удаляем старую строку если есть и добавляем новую
         sed -i '/^registration_shared_secret:/d' /etc/matrix-synapse/homeserver.yaml
         echo "registration_shared_secret: \"$registration_secret\"" >> /etc/matrix-synapse/homeserver.yaml
         
-        safe_echo "   ${GREEN}✅ Секрет регистрации добавлен в homeserver.yaml${NC}"
+        safe_echo "   ${GREEN}✅ registration_shared_secret добавлен в homeserver.yaml${NC}"
         ((fixes_applied++))
+        need_restart=true
         
         # Сохраняем секрет в конфигурации установщика
         mkdir -p /opt/matrix-install
@@ -2164,7 +2216,7 @@ fix_registration_issues() {
         
         if [ -z "$macaroon_secret" ]; then
             macaroon_secret=$(openssl rand -hex 32)
-            safe_echo "   ${BLUE}💡 Сгенерирован новый macaroon secret key${NC}"
+            safe_echo "   ${BLUE}💡 Сгенерирован новый macaroon_secret_key${NC}"
         fi
         
         # Добавляем macaroon_secret_key в homeserver.yaml
@@ -2179,6 +2231,7 @@ fix_registration_issues() {
         
         safe_echo "   ${GREEN}✅ macaroon_secret_key добавлен в homeserver.yaml${NC}"
         ((fixes_applied++))
+        need_restart=true
         
         # Сохраняем секрет в конфигурации установщика
         mkdir -p /opt/matrix-install
@@ -2199,7 +2252,7 @@ fix_registration_issues() {
         
         if [ -z "$form_secret" ]; then
             form_secret=$(openssl rand -hex 32)
-            safe_echo "   ${BLUE}💡 Сгенерирован новый form secret${NC}"
+            safe_echo "   ${BLUE}💡 Сгенерирован новый form_secret${NC}"
         fi
         
         # Добавляем form_secret в homeserver.yaml
@@ -2208,6 +2261,7 @@ fix_registration_issues() {
         
         safe_echo "   ${GREEN}✅ form_secret добавлен в homeserver.yaml${NC}"
         ((fixes_applied++))
+        need_restart=true
         
         # Сохраняем секрет в конфигурации установщика
         mkdir -p /opt/matrix-install
@@ -2216,46 +2270,43 @@ fix_registration_issues() {
         fi
     fi
     
-    # 5. Запуск Matrix Synapse если остановлен
-    if ! systemctl is-active --quiet matrix-synapse; then
-        safe_echo "${BLUE}🔧 Запуск Matrix Synapse...${NC}"
-        if systemctl start matrix-synapse; then
-            safe_echo "   ${GREEN}✅ Matrix Synapse запущен${NC}"
+    # 5. Перезапуск Matrix Synapse если были изменения или если он не запущен
+    if ! systemctl is-active --quiet matrix-synapse || [ "$need_restart" = true ]; then
+        if [ "$need_restart" = true ]; then
+            safe_echo "${BLUE}🔧 Перезапуск Matrix Synapse для применения изменений...${NC}"
+        else
+            safe_echo "${BLUE}🔧 Запуск Matrix Synapse...${NC}"
+        fi
+        
+        if systemctl restart matrix-synapse; then
+            safe_echo "   ${GREEN}✅ Matrix Synapse перезапущен${NC}"
             ((fixes_applied++))
             sleep 5  # Даем время на запуск
         else
-            safe_echo "   ${RED}❌ Не удалось запустить Matrix Synapse${NC}"
+            safe_echo "   ${RED}❌ Не удалось перезапустить Matrix Synapse${NC}"
+            safe_echo "   ${YELLOW}💡 Проверьте конфигурацию: python3 -m synapse.config -c /etc/matrix-synapse/homeserver.yaml${NC}"
             safe_echo "   ${YELLOW}💡 Проверьте логи: journalctl -u matrix-synapse -n 20${NC}"
-        fi
-        else
-        # Если Synapse работает, но мы изменили конфигурацию, перезапускаем его
-        if [ $fixes_applied -gt 0 ]; then
-            safe_echo "${BLUE}🔧 Перезапуск Matrix Synapse для применения изменений...${NC}"
-            if systemctl restart matrix-synapse; then
-                safe_echo "   ${GREEN}✅ Matrix Synapse перезапущен${NC}"
-                sleep 5  # Даем время на запуск
-            else
-                safe_echo "   ${RED}❌ Не удалось перезапустить Matrix Synapse${NC}"
-            fi
         fi
     fi
     
     # 6. Проверка доступности API
     safe_echo "${BLUE}🔧 Проверка доступности API...${NC}"
     local api_attempts=0
-    while [ $api_attempts -lt 10 ]; do
+    while [ $api_attempts -lt 12 ]; do
         if curl -s -f --connect-timeout 3 http://localhost:8008/_matrix/client/versions >/dev/null 2>&1; then
             safe_echo "   ${GREEN}✅ Matrix API доступен${NC}"
             break
         fi
-        safe_echo "   ${YELLOW}⏳ Ожидание запуска API... (попытка $((api_attempts + 1))/10)${NC}"
-        sleep 2
+        safe_echo "   ${YELLOW}⏳ Ожидание запуска API... (попытка $((api_attempts + 1))/12)${NC}"
+        sleep 3
         ((api_attempts++))
     done
     
-    if [ $api_attempts -eq 10 ]; then
+    if [ $api_attempts -eq 12 ]; then
         safe_echo "   ${RED}❌ Matrix API остается недоступным${NC}"
-        safe_echo "   ${YELLOW}💡 Проверьте логи служб: journalctl -u matrix-synapse -n 20${NC}"
+        safe_echo "   ${YELLOW}💡 Проверьте конфигурацию: python3 -m synapse.config -c /etc/matrix-synapse/homeserver.yaml${NC}"
+        safe_echo "   ${YELLOW}💡 Проверьте логи: journalctl -u matrix-synapse -n 20${NC}"
+        safe_echo "   ${YELLOW}💡 Возможно требуется ручная диагностика${NC}"
     fi
     
     echo
@@ -2264,6 +2315,26 @@ fix_registration_issues() {
     if [ $fixes_applied -gt 0 ]; then
         safe_echo "${GREEN}🎉 Исправление завершено: применено исправлений: $fixes_applied${NC}"
         safe_echo "${BLUE}💡 Повторите диагностику для проверки результатов.${NC}"
+        
+        # Показываем что было исправлено
+        echo
+        safe_echo "${BOLD}${BLUE}Внесённые изменения:${NC}"
+        if [ -f "/etc/matrix-synapse/homeserver.yaml.backup.$(date +%Y%m%d)" ]; then
+            safe_echo "• Создана резервная копия конфигурации"
+        fi
+        if grep -q "registration_shared_secret:" /etc/matrix-synapse/homeserver.yaml; then
+            safe_echo "• Добавлен registration_shared_secret"
+        fi
+        if grep -q "macaroon_secret_key:" /etc/matrix-synapse/homeserver.yaml; then
+            safe_echo "• Добавлен macaroon_secret_key"
+        fi
+        if grep -q "form_secret:" /etc/matrix-synapse/homeserver.yaml; then
+            safe_echo "• Добавлен form_secret"
+        fi
+        if systemctl is-active --quiet matrix-synapse; then
+            safe_echo "• Matrix Synapse запущен и работает"
+        fi
+        
     else
         safe_echo "${BLUE}ℹ️  Исправления не требовались или не были применены.${NC}"
         safe_echo "${YELLOW}💡 Если проблемы сохраняются, проверьте логи служб.${NC}"
