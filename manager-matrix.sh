@@ -491,7 +491,7 @@ check_matrix_status() {
             # Рекомендации по установке для разных типов серверов
             case "$SERVER_TYPE" in
                 "proxmox"|"home_server"|"docker"|"openvz")
-                    safe_echo "  ${BLUE}💡 Рекомендуется установить TURN для надежных звонков"
+                    safe_echo "  ${BLUE}💡 Рекомендуется установить TURN для надежных звонков${NC}"
                     ;;
                 *)
                     safe_echo "  ${BLUE}💡 TURN сервер рекомендуется для корпоративных сетей${NC}"
@@ -499,674 +499,6 @@ check_matrix_status() {
             esac
         fi
     fi
-    
-    echo
-    
-    # Проверка веб-серверов
-    safe_echo "${BOLD}${BLUE}Веб-серверы:${NC}"
-    local web_servers=("nginx" "apache2" "caddy")
-    local active_servers=0
-    
-    for server in "${web_servers[@]}"; do
-        if systemctl is-active --quiet "$server" 2>/dev/null; then
-            safe_echo "  ${GREEN}✅ $server: активен${NC}"
-            active_servers=$((active_servers + 1))
-            
-            # Дополнительная информация для Caddy
-            if [ "$server" = "caddy" ] && [ -f "/etc/caddy/Caddyfile" ]; then
-                if caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
-                    safe_echo "    ${GREEN}✅ Конфигурация Caddy корректна${NC}"
-                else
-                    safe_echo "    ${RED}❌ Ошибка в конфигурации Caddy${NC}"
-                fi
-            fi
-            
-        elif command -v "$server" >/dev/null 2>&1; then
-            safe_echo "  ${YELLOW}⚠️  $server: установлен, но не активен${NC}"
-        fi
-    done
-    
-    if [ $active_servers -eq 0 ]; then
-        safe_echo "  ${RED}❌ Нет активных веб-серверов${NC}"
-    elif [ $active_servers -gt 1 ]; then
-        safe_echo "  ${YELLOW}⚠️  Запущено несколько веб-серверов (возможны конфликты портов)${NC}"
-    fi
-    
-    echo
-    
-    # Проверка портов с учетом типа сервера
-    safe_echo "${BOLD}${BLUE}Сетевые порты:${NC}"
-    local ports=("8008:Matrix HTTP" "8448:Matrix Federation" "80:HTTP" "443:HTTPS" "5432:PostgreSQL")
-    
-    for port_info in "${ports[@]}"; do
-        local port="${port_info%%:*}"
-        local description="${port_info##*:}"
-        
-        if ss -tlnp | grep -q ":$port "; then
-            safe_echo "  ${GREEN}✅ Порт $port ($description): используется${NC}"
-            
-            # Показываем, на каких интерфейсах слушает порт
-            local listen_info=$(ss -tlnp | grep ":$port " | awk '{print $4}' | sort -u | tr '\n' ' ')
-            safe_echo "    ${DIM}Слушает на: $listen_info${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  Порт $port ($description): свободен${NC}"
-        fi
-    done
-    
-    echo
-    
-    # Проверка Coturn TURN сервера
-    safe_echo "${BOLD}${BLUE}Coturn TURN Server:${NC}"
-    if systemctl is-active --quiet coturn 2>/dev/null; then
-        safe_echo "  ${GREEN}✅ Служба запущена${NC}"
-        
-        # Проверка портов TURN
-        local turn_ports=("3478" "5349")
-        for port in "${turn_ports[@]}"; do
-            if ss -tlnp | grep -q ":$port "; then
-                safe_echo "  ${GREEN}✅ Порт $port (TURN): прослушивается${NC}"
-            else
-                safe_echo "  ${YELLOW}⚠️  Порт $port (TURN): не прослушивается${NC}"
-            fi
-        done
-        
-        # Проверка UDP relay диапазона
-        if ss -ulnp | grep -q ":4915[2-9]" || ss -ulnp | grep -q ":50000"; then
-            safe_echo "  ${GREEN}✅ UDP relay диапазон: активен${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  UDP relay диапазон: проверьте настройки${NC}"
-        fi
-        
-        # Информация о домене TURN
-        if [[ -f "$CONFIG_DIR/turn_domain" ]]; then
-            local turn_domain=$(cat "$CONFIG_DIR/turn_domain")
-            safe_echo "  ${BOLD}Домен TURN:${NC} $turn_domain"
-        fi
-        
-        # Проверка интеграции с Synapse
-        if [[ -f "/etc/matrix-synapse/conf.d/turn.yaml" ]]; then
-            safe_echo "  ${GREEN}✅ Интеграция с Synapse: настроена${NC}"
-        elif grep -q "turn_uris" /etc/matrix-synapse/homeserver.yaml 2>/dev/null; then
-            safe_echo "  ${GREEN}✅ Интеграция с Synapse: настроена (homeserver.yaml)${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  Интеграция с Synapse: не настроена${NC}"
-        fi
-        
-        # Показываем важность TURN для типа сервера
-        case "$SERVER_TYPE" in
-            "proxmox"|"home_server"|"docker"|"openvz")
-                safe_echo "  ${BLUE}ℹ️  TURN критически важен для NAT-серверов${NC}"
-                ;;
-            *)
-                safe_echo "  ${BLUE}ℹ️  TURN улучшает надежность VoIP звонков${NC}"
-                ;;
-        esac
-        
-    else
-        safe_echo "  ${RED}❌ Служба не запущена${NC}"
-        
-        # Проверяем, установлен ли coturn
-        if command -v turnserver >/dev/null 2>&1; then
-            safe_echo "  ${YELLOW}⚠️  Coturn установлен, но не запущен${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  Coturn не установлен${NC}"
-            
-            # Рекомендации по установке для разных типов серверов
-            case "$SERVER_TYPE" in
-                "proxmox"|"home_server"|"docker"|"openvz")
-                    safe_echo "  ${BLUE}💡 Рекомендуется установить TURN для надежных звонков"
-                    ;;
-                *)
-                    safe_echo "  ${BLUE}💡 TURN сервер рекомендуется для корпоративных сетей${NC}"
-                    ;;
-            esac
-        fi
-    fi
-    
-    echo
-    
-    # Проверка веб-серверов
-    safe_echo "${BOLD}${BLUE}Веб-серверы:${NC}"
-    local web_servers=("nginx" "apache2" "caddy")
-    local active_servers=0
-    
-    for server in "${web_servers[@]}"; do
-        if systemctl is-active --quiet "$server" 2>/dev/null; then
-            safe_echo "  ${GREEN}✅ $server: активен${NC}"
-            active_servers=$((active_servers + 1))
-            
-            # Дополнительная информация для Caddy
-            if [ "$server" = "caddy" ] && [ -f "/etc/caddy/Caddyfile" ]; then
-                if caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
-                    safe_echo "    ${GREEN}✅ Конфигурация Caddy корректна${NC}"
-                else
-                    safe_echo "    ${RED}❌ Ошибка в конфигурации Caddy${NC}"
-                fi
-            fi
-            
-        elif command -v "$server" >/dev/null 2>&1; then
-            safe_echo "  ${YELLOW}⚠️  $server: установлен, но не активен${NC}"
-        fi
-    done
-    
-    if [ $active_servers -eq 0 ]; then
-        safe_echo "  ${RED}❌ Нет активных веб-серверов${NC}"
-    elif [ $active_servers -gt 1 ]; then
-        safe_echo "  ${YELLOW}⚠️  Запущено несколько веб-серверов (возможны конфликты портов)${NC}"
-    fi
-    
-    echo
-    
-    # Проверка портов с учетом типа сервера
-    safe_echo "${BOLD}${BLUE}Сетевые порты:${NC}"
-    local ports=("8008:Matrix HTTP" "8448:Matrix Federation" "80:HTTP" "443:HTTPS" "5432:PostgreSQL")
-    
-    for port_info in "${ports[@]}"; do
-        local port="${port_info%%:*}"
-        local description="${port_info##*:}"
-        
-        if ss -tlnp | grep -q ":$port "; then
-            safe_echo "  ${GREEN}✅ Порт $port ($description): используется${NC}"
-            
-            # Показываем, на каких интерфейсах слушает порт
-            local listen_info=$(ss -tlnp | grep ":$port " | awk '{print $4}' | sort -u | tr '\n' ' ')
-            safe_echo "    ${DIM}Слушает на: $listen_info${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  Порт $port ($description): свободен${NC}"
-        fi
-    done
-    
-    echo
-    
-    # Проверка Coturn TURN сервера
-    safe_echo "${BOLD}${BLUE}Coturn TURN Server:${NC}"
-    if systemctl is-active --quiet coturn 2>/dev/null; then
-        safe_echo "  ${GREEN}✅ Служба запущена${NC}"
-        
-        # Проверка портов TURN
-        local turn_ports=("3478" "5349")
-        for port in "${turn_ports[@]}"; do
-            if ss -tlnp | grep -q ":$port "; then
-                safe_echo "  ${GREEN}✅ Порт $port (TURN): прослушивается${NC}"
-            else
-                safe_echo "  ${YELLOW}⚠️  Порт $port (TURN): не прослушивается${NC}"
-            fi
-        done
-        
-        # Проверка UDP relay диапазона
-        if ss -ulnp | grep -q ":4915[2-9]" || ss -ulnp | grep -q ":50000"; then
-            safe_echo "  ${GREEN}✅ UDP relay диапазон: активен${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  UDP relay диапазон: проверьте настройки${NC}"
-        fi
-        
-        # Информация о домене TURN
-        if [[ -f "$CONFIG_DIR/turn_domain" ]]; then
-            local turn_domain=$(cat "$CONFIG_DIR/turn_domain")
-            safe_echo "  ${BOLD}Домен TURN:${NC} $turn_domain"
-        fi
-        
-        # Проверка интеграции с Synapse
-        if [[ -f "/etc/matrix-synapse/conf.d/turn.yaml" ]]; then
-            safe_echo "  ${GREEN}✅ Интеграция с Synapse: настроена${NC}"
-        elif grep -q "turn_uris" /etc/matrix-synapse/homeserver.yaml 2>/dev/null; then
-            safe_echo "  ${GREEN}✅ Интеграция с Synapse: настроена (homeserver.yaml)${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  Интеграция с Synapse: не настроена${NC}"
-        fi
-        
-        # Показываем важность TURN для типа сервера
-        case "$SERVER_TYPE" in
-            "proxmox"|"home_server"|"docker"|"openvz")
-                safe_echo "  ${BLUE}ℹ️  TURN критически важен для NAT-серверов${NC}"
-                ;;
-            *)
-                safe_echo "  ${BLUE}ℹ️  TURN улучшает надежность VoIP звонков${NC}"
-                ;;
-        esac
-        
-    else
-        safe_echo "  ${RED}❌ Служба не запущена${NC}"
-        
-        # Проверяем, установлен ли coturn
-        if command -v turnserver >/dev/null 2>&1; then
-            safe_echo "  ${YELLOW}⚠️  Coturn установлен, но не запущен${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  Coturn не установлен${NC}"
-            
-            # Рекомендации по установке для разных типов серверов
-            case "$SERVER_TYPE" in
-                "proxmox"|"home_server"|"docker"|"openvz")
-                    safe_echo "  ${BLUE}💡 Рекомендуется установить TURN для надежных звонков"
-                    ;;
-                *)
-                    safe_echo "  ${BLUE}💡 TURN сервер рекомендуется для корпоративных сетей${NC}"
-                    ;;
-            esac
-        fi
-    fi
-    
-    echo
-    
-    # Проверка веб-серверов
-    safe_echo "${BOLD}${BLUE}Веб-серверы:${NC}"
-    local web_servers=("nginx" "apache2" "caddy")
-    local active_servers=0
-    
-    for server in "${web_servers[@]}"; do
-        if systemctl is-active --quiet "$server" 2>/dev/null; then
-            safe_echo "  ${GREEN}✅ $server: активен${NC}"
-            active_servers=$((active_servers + 1))
-            
-            # Дополнительная информация для Caddy
-            if [ "$server" = "caddy" ] && [ -f "/etc/caddy/Caddyfile" ]; then
-                if caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
-                    safe_echo "    ${GREEN}✅ Конфигурация Caddy корректна${NC}"
-                else
-                    safe_echo "    ${RED}❌ Ошибка в конфигурации Caddy${NC}"
-                fi
-            fi
-            
-        elif command -v "$server" >/dev/null 2>&1; then
-            safe_echo "  ${YELLOW}⚠️  $server: установлен, но не активен${NC}"
-        fi
-    done
-    
-    if [ $active_servers -eq 0 ]; then
-        safe_echo "  ${RED}❌ Нет активных веб-серверов${NC}"
-    elif [ $active_servers -gt 1 ]; then
-        safe_echo "  ${YELLOW}⚠️  Запущено несколько веб-серверов (возможны конфликты портов)${NC}"
-    fi
-    
-    echo
-    
-    # Проверка портов с учетом типа сервера
-    safe_echo "${BOLD}${BLUE}Сетевые порты:${NC}"
-    local ports=("8008:Matrix HTTP" "8448:Matrix Federation" "80:HTTP" "443:HTTPS" "5432:PostgreSQL")
-    
-    for port_info in "${ports[@]}"; do
-        local port="${port_info%%:*}"
-        local description="${port_info##*:}"
-        
-        if ss -tlnp | grep -q ":$port "; then
-            safe_echo "  ${GREEN}✅ Порт $port ($description): используется${NC}"
-            
-            # Показываем, на каких интерфейсах слушает порт
-            local listen_info=$(ss -tlnp | grep ":$port " | awk '{print $4}' | sort -u | tr '\n' ' ')
-            safe_echo "    ${DIM}Слушает на: $listen_info${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  Порт $port ($description): свободен${NC}"
-        fi
-    done
-    
-    echo
-    
-    # Проверка Coturn TURN сервера
-    safe_echo "${BOLD}${BLUE}Coturn TURN Server:${NC}"
-    if systemctl is-active --quiet coturn 2>/dev/null; then
-        safe_echo "  ${GREEN}✅ Служба запущена${NC}"
-        
-        # Проверка портов TURN
-        local turn_ports=("3478" "5349")
-        for port in "${turn_ports[@]}"; do
-            if ss -tlnp | grep -q ":$port "; then
-                safe_echo "  ${GREEN}✅ Порт $port (TURN): прослушивается${NC}"
-            else
-                safe_echo "  ${YELLOW}⚠️  Порт $port (TURN): не прослушивается${NC}"
-            fi
-        done
-        
-        # Проверка UDP relay диапазона
-        if ss -ulnp | grep -q ":4915[2-9]" || ss -ulnp | grep -q ":50000"; then
-            safe_echo "  ${GREEN}✅ UDP relay диапазон: активен${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  UDP relay диапазон: проверьте настройки${NC}"
-        fi
-        
-        # Информация о домене TURN
-        if [[ -f "$CONFIG_DIR/turn_domain" ]]; then
-            local turn_domain=$(cat "$CONFIG_DIR/turn_domain")
-            safe_echo "  ${BOLD}Домен TURN:${NC} $turn_domain"
-        fi
-        
-        # Проверка интеграции с Synapse
-        if [[ -f "/etc/matrix-synapse/conf.d/turn.yaml" ]]; then
-            safe_echo "  ${GREEN}✅ Интеграция с Synapse: настроена${NC}"
-        elif grep -q "turn_uris" /etc/matrix-synapse/homeserver.yaml 2>/dev/null; then
-            safe_echo "  ${GREEN}✅ Интеграция с Synapse: настроена (homeserver.yaml)${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  Интеграция с Synapse: не настроена${NC}"
-        fi
-        
-        # Показываем важность TURN для типа сервера
-        case "$SERVER_TYPE" in
-            "proxmox"|"home_server"|"docker"|"openvz")
-                safe_echo "  ${BLUE}ℹ️  TURN критически важен для NAT-серверов${NC}"
-                ;;
-            *)
-                safe_echo "  ${BLUE}ℹ️  TURN улучшает надежность VoIP звонков${NC}"
-                ;;
-        esac
-        
-    else
-        safe_echo "  ${RED}❌ Служба не запущена${NC}"
-        
-        # Проверяем, установлен ли coturn
-        if command -v turnserver >/dev/null 2>&1; then
-            safe_echo "  ${YELLOW}⚠️  Coturn установлен, но не запущен${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  Coturn не установлен${NC}"
-            
-            # Рекомендации по установке для разных типов серверов
-            case "$SERVER_TYPE" in
-                "proxmox"|"home_server"|"docker"|"openvz")
-                    safe_echo "  ${BLUE}💡 Рекомендуется установить TURN для надежных звонков"
-                    ;;
-                *)
-                    safe_echo "  ${BLUE}💡 TURN сервер рекомендуется для корпоративных сетей${NC}"
-                    ;;
-            esac
-        fi
-    fi
-    
-    echo
-    
-    # Проверка веб-серверов
-    safe_echo "${BOLD}${BLUE}Веб-серверы:${NC}"
-    local web_servers=("nginx" "apache2" "caddy")
-    local active_servers=0
-    
-    for server in "${web_servers[@]}"; do
-        if systemctl is-active --quiet "$server" 2>/dev/null; then
-            safe_echo "  ${GREEN}✅ $server: активен${NC}"
-            active_servers=$((active_servers + 1))
-            
-            # Дополнительная информация для Caddy
-            if [ "$server" = "caddy" ] && [ -f "/etc/caddy/Caddyfile" ]; then
-                if caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
-                    safe_echo "    ${GREEN}✅ Конфигурация Caddy корректна${NC}"
-                else
-                    safe_echo "    ${RED}❌ Ошибка в конфигурации Caddy${NC}"
-                fi
-            fi
-            
-        elif command -v "$server" >/dev/null 2>&1; then
-            safe_echo "  ${YELLOW}⚠️  $server: установлен, но не активен${NC}"
-        fi
-    done
-    
-    if [ $active_servers -eq 0 ]; then
-        safe_echo "  ${RED}❌ Нет активных веб-серверов${NC}"
-    elif [ $active_servers -gt 1 ]; then
-        safe_echo "  ${YELLOW}⚠️  Запущено несколько веб-серверов (возможны конфликты портов)${NC}"
-    fi
-    
-    echo
-    
-    # Проверка портов с учетом типа сервера
-    safe_echo "${BOLD}${BLUE}Сетевые порты:${NC}"
-    local ports=("8008:Matrix HTTP" "8448:Matrix Federation" "80:HTTP" "443:HTTPS" "5432:PostgreSQL")
-    
-    for port_info in "${ports[@]}"; do
-        local port="${port_info%%:*}"
-        local description="${port_info##*:}"
-        
-        if ss -tlnp | grep -q ":$port "; then
-            safe_echo "  ${GREEN}✅ Порт $port ($description): используется${NC}"
-            
-            # Показываем, на каких интерфейсах слушает порт
-            local listen_info=$(ss -tlnp | grep ":$port " | awk '{print $4}' | sort -u | tr '\n' ' ')
-            safe_echo "    ${DIM}Слушает на: $listen_info${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  Порт $port ($description): свободен${NC}"
-        fi
-    done
-    
-    echo
-    
-    # Проверка Coturn TURN сервера
-    safe_echo "${BOLD}${BLUE}Coturn TURN Server:${NC}"
-    if systemctl is-active --quiet coturn 2>/dev/null; then
-        safe_echo "  ${GREEN}✅ Служба запущена${NC}"
-        
-        # Проверка портов TURN
-        local turn_ports=("3478" "5349")
-        for port in "${turn_ports[@]}"; do
-            if ss -tlnp | grep -q ":$port "; then
-                safe_echo "  ${GREEN}✅ Порт $port (TURN): прослушивается${NC}"
-            else
-                safe_echo "  ${YELLOW}⚠️  Порт $port (TURN): не прослушивается${NC}"
-            fi
-        done
-        
-        # Проверка UDP relay диапазона
-        if ss -ulnp | grep -q ":4915[2-9]" || ss -ulnp | grep -q ":50000"; then
-            safe_echo "  ${GREEN}✅ UDP relay диапазон: активен${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  UDP relay диапазон: проверьте настройки${NC}"
-        fi
-        
-        # Информация о домене TURN
-        if [[ -f "$CONFIG_DIR/turn_domain" ]]; then
-            local turn_domain=$(cat "$CONFIG_DIR/turn_domain")
-            safe_echo "  ${BOLD}Домен TURN:${NC} $turn_domain"
-        fi
-        
-        # Проверка интеграции с Synapse
-        if [[ -f "/etc/matrix-synapse/conf.d/turn.yaml" ]]; then
-            safe_echo "  ${GREEN}✅ Интеграция с Synapse: настроена${NC}"
-        elif grep -q "turn_uris" /etc/matrix-synapse/homeserver.yaml 2>/dev/null; then
-            safe_echo "  ${GREEN}✅ Интеграция с Synapse: настроена (homeserver.yaml)${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  Интеграция с Synapse: не настроена${NC}"
-        fi
-        
-        # Показываем важность TURN для типа сервера
-        case "$SERVER_TYPE" in
-            "proxmox"|"home_server"|"docker"|"openvz")
-                safe_echo "  ${BLUE}ℹ️  TURN критически важен для NAT-серверов${NC}"
-                ;;
-            *)
-                safe_echo "  ${BLUE}ℹ️  TURN улучшает надежность VoIP звонков${NC}"
-                ;;
-        esac
-        
-    else
-        safe_echo "  ${RED}❌ Служба не запущена${NC}"
-        
-        # Проверяем, установлен ли coturn
-        if command -v turnserver >/dev/null 2>&1; then
-            safe_echo "  ${YELLOW}⚠️  Coturn установлен, но не запущен${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  Coturn не установлен${NC}"
-            
-            # Рекомендации по установке для разных типов серверов
-            case "$SERVER_TYPE" in
-                "proxmox"|"home_server"|"docker"|"openvz")
-                    safe_echo "  ${BLUE}💡 Рекомендуется установить TURN для надежных звонков"
-                    ;;
-                *)
-                    safe_echo "  ${BLUE}💡 TURN сервер рекомендуется для корпоративных сетей${NC}"
-                    ;;
-            esac
-        fi
-    fi
-    
-    echo
-    
-    # Проверка веб-серверов
-    safe_echo "${BOLD}${BLUE}Веб-серверы:${NC}"
-    local web_servers=("nginx" "apache2" "caddy")
-    local active_servers=0
-    
-    for server in "${web_servers[@]}"; do
-        if systemctl is-active --quiet "$server" 2>/dev/null; then
-            safe_echo "  ${GREEN}✅ $server: активен${NC}"
-            active_servers=$((active_servers + 1))
-            
-            # Дополнительная информация для Caddy
-            if [ "$server" = "caddy" ] && [ -f "/etc/caddy/Caddyfile" ]; then
-                if caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
-                    safe_echo "    ${GREEN}✅ Конфигурация Caddy корректна${NC}"
-                else
-                    safe_echo "    ${RED}❌ Ошибка в конфигурации Caddy${NC}"
-                fi
-            fi
-            
-        elif command -v "$server" >/dev/null 2>&1; then
-            safe_echo "  ${YELLOW}⚠️  $server: установлен, но не активен${NC}"
-        fi
-    done
-    
-    if [ $active_servers -eq 0 ]; then
-        safe_echo "  ${RED}❌ Нет активных веб-серверов${NC}"
-    elif [ $active_servers -gt 1 ]; then
-        safe_echo "  ${YELLOW}⚠️  Запущено несколько веб-серверов (возможны конфликты портов)${NC}"
-    fi
-    
-    echo
-    
-    # Проверка портов с учетом типа сервера
-    safe_echo "${BOLD}${BLUE}Сетевые порты:${NC}"
-    local ports=("8008:Matrix HTTP" "8448:Matrix Federation" "80:HTTP" "443:HTTPS" "5432:PostgreSQL")
-    
-    for port_info in "${ports[@]}"; do
-        local port="${port_info%%:*}"
-        local description="${port_info##*:}"
-        
-        if ss -tlnp | grep -q ":$port "; then
-            safe_echo "  ${GREEN}✅ Порт $port ($description): используется${NC}"
-            
-            # Показываем, на каких интерфейсах слушает порт
-            local listen_info=$(ss -tlnp | grep ":$port " | awk '{print $4}' | sort -u | tr '\n' ' ')
-            safe_echo "    ${DIM}Слушает на: $listen_info${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  Порт $port ($description): свободен${NC}"
-        fi
-    done
-    
-    echo
-    
-    # Проверка Coturn TURN сервера
-    safe_echo "${BOLD}${BLUE}Coturn TURN Server:${NC}"
-    if systemctl is-active --quiet coturn 2>/dev/null; then
-        safe_echo "  ${GREEN}✅ Служба запущена${NC}"
-        
-        # Проверка портов TURN
-        local turn_ports=("3478" "5349")
-        for port in "${turn_ports[@]}"; do
-            if ss -tlnp | grep -q ":$port "; then
-                safe_echo "  ${GREEN}✅ Порт $port (TURN): прослушивается${NC}"
-            else
-                safe_echo "  ${YELLOW}⚠️  Порт $port (TURN): не прослушивается${NC}"
-            fi
-        done
-        
-        # Проверка UDP relay диапазона
-        if ss -ulnp | grep -q ":4915[2-9]" || ss -ulnp | grep -q ":50000"; then
-            safe_echo "  ${GREEN}✅ UDP relay диапазон: активен${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  UDP relay диапазон: проверьте настройки${NC}"
-        fi
-        
-        # Информация о домене TURN
-        if [[ -f "$CONFIG_DIR/turn_domain" ]]; then
-            local turn_domain=$(cat "$CONFIG_DIR/turn_domain")
-            safe_echo "  ${BOLD}Домен TURN:${NC} $turn_domain"
-        fi
-        
-        # Проверка интеграции с Synapse
-        if [[ -f "/etc/matrix-synapse/conf.d/turn.yaml" ]]; then
-            safe_echo "  ${GREEN}✅ Интеграция с Synapse: настроена${NC}"
-        elif grep -q "turn_uris" /etc/matrix-synapse/homeserver.yaml 2>/dev/null; then
-            safe_echo "  ${GREEN}✅ Интеграция с Synapse: настроена (homeserver.yaml)${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  Интеграция с Synapse: не настроена${NC}"
-        fi
-        
-        # Показываем важность TURN для типа сервера
-        case "$SERVER_TYPE" in
-            "proxmox"|"home_server"|"docker"|"openvz")
-                safe_echo "  ${BLUE}ℹ️  TURN критически важен для NAT-серверов${NC}"
-                ;;
-            *)
-                safe_echo "  ${BLUE}ℹ️  TURN улучшает надежность VoIP звонков${NC}"
-                ;;
-        esac
-        
-    else
-        safe_echo "  ${RED}❌ Служба не запущена${NC}"
-        
-        # Проверяем, установлен ли coturn
-        if command -v turnserver >/dev/null 2>&1; then
-            safe_echo "  ${YELLOW}⚠️  Coturn установлен, но не запущен${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  Coturn не установлен${NC}"
-            
-            # Рекомендации по установке для разных типов серверов
-            case "$SERVER_TYPE" in
-                "proxmox"|"home_server"|"docker"|"openvz")
-                    safe_echo "  ${BLUE}💡 Рекомендуется установить TURN для надежных звонков"
-                    ;;
-                *)
-                    safe_echo "  ${BLUE}💡 TURN сервер рекомендуется для корпоративных сетей${NC}"
-                    ;;
-            esac
-        fi
-    fi
-    
-    echo
-    
-    # Проверка веб-серверов
-    safe_echo "${BOLD}${BLUE}Веб-серверы:${NC}"
-    local web_servers=("nginx" "apache2" "caddy")
-    local active_servers=0
-    
-    for server in "${web_servers[@]}"; do
-        if systemctl is-active --quiet "$server" 2>/dev/null; then
-            safe_echo "  ${GREEN}✅ $server: активен${NC}"
-            active_servers=$((active_servers + 1))
-            
-            # Дополнительная информация для Caddy
-            if [ "$server" = "caddy" ] && [ -f "/etc/caddy/Caddyfile" ]; then
-                if caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
-                    safe_echo "    ${GREEN}✅ Конфигурация Caddy корректна${NC}"
-                else
-                    safe_echo "    ${RED}❌ Ошибка в конфигурации Caddy${NC}"
-                fi
-            fi
-            
-        elif command -v "$server" >/dev/null 2>&1; then
-            safe_echo "  ${YELLOW}⚠️  $server: установлен, но не активен${NC}"
-        fi
-    done
-    
-    if [ $active_servers -eq 0 ]; then
-        safe_echo "  ${RED}❌ Нет активных веб-серверов${NC}"
-    elif [ $active_servers -gt 1 ]; then
-        safe_echo "  ${YELLOW}⚠️  Запущено несколько веб-серверов (возможны конфликты портов)${NC}"
-    fi
-    
-    echo
-    
-    # Проверка портов с учетом типа сервера
-    safe_echo "${BOLD}${BLUE}Сетевые порты:${NC}"
-    local ports=("8008:Matrix HTTP" "8448:Matrix Federation" "80:HTTP" "443:HTTPS" "5432:PostgreSQL")
-    
-    for port_info in "${ports[@]}"; do
-        local port="${port_info%%:*}"
-        local description="${port_info##*:}"
-        
-        if ss -tlnp | grep -q ":$port "; then
-            safe_echo "  ${GREEN}✅ Порт $port ($description): используется${NC}"
-            
-            # Показываем, на каких интерфейсах слушает порт
-            local listen_info=$(ss -tlnp | grep ":$port " | awk '{print $4}' | sort -u | tr '\n' ' ')
-            safe_echo "    ${DIM}Слушает на: $listen_info${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  Порт $port ($description): свободен${NC}"
-        fi
-    done
     
     echo
     
@@ -1928,7 +1260,7 @@ update_modules_and_library() {
         
         # Если обновились модули, перезагружаем их
         if [ $updated_files -gt 0 ] && [ "$file_rel_path" != "manager-matrix.sh" ]; then
-            log "INFO" "Для применения изменений в модулях рекомендуется перезапустить менеджер."
+            log "INFO" "Для применения изменений в модулях рекомендуется перезагрузить менеджер."
         fi
     else
         log "INFO" "Все модули, библиотека и менеджер уже в актуальном состоянии."
@@ -1986,6 +1318,7 @@ manage_matrix_users() {
             safe_echo "${BLUE}🌐 Домен сервера: ${BOLD}$matrix_domain${NC}"
         else
             safe_echo "${RED}❌ Домен сервера не настроен${NC}"
+            return 1
         fi
         
         # Проверяем доступность API
@@ -2143,7 +1476,7 @@ create_admin_user_local() {
         
         if [[ ! "$admin_username" =~ ^[a-zA-Z0-9._=-]+$ ]]; then
             log "ERROR" "Неверный формат имени пользователя"
-            log "INFO" "Разрешены только: латинские буквы, цифры, точки, подчеркивания, дефисы"
+            log "INFO" "Разрешены только: латинские буквы, цифры, точки, подчеркидения, дефисы"
             continue
         fi
         
@@ -2270,7 +1603,7 @@ create_regular_user() {
         
         if [[ ! "$username" =~ ^[a-zA-Z0-9._=-]+$ ]]; then
             log "ERROR" "Неверный формат имени пользователя"
-            log "INFO" "Разрешены только: латинские буквы, цифры, точки, подчеркивания, дефисы"
+            log "INFO" "Разрешены только: латинские буквы, цифры, точки, подчеркидения, дефисы"
             continue
         fi
         
@@ -2692,7 +2025,7 @@ diagnose_registration_issues() {
     
     # 3. Проверка секрета регистрации
     safe_echo "${BLUE}3. Проверка секрета регистрации:${NC}"
-    if grep -q "registration_shared_secret:" /etc/matrix-synapse/homeserver.yaml 2>/dev/null; then
+    if grep -q "registration_shared_secret:" /etc/matrix-synapse/homeserver.yaml; then
         safe_echo "   ${GREEN}✅ Секрет регистрации найден в homeserver.yaml${NC}"
     elif [ -f "/etc/matrix-synapse/conf.d/registration.yaml" ] && grep -q "registration_shared_secret:" /etc/matrix-synapse/conf.d/registration.yaml 2>/dev/null; then
         safe_echo "   ${YELLOW}⚠️  Секрет регистрации найден в registration.yaml (может не работать)${NC}"
@@ -2788,7 +2121,7 @@ fix_registration_issues() {
         # Генерируем новый секрет если его нет
         local registration_secret=""
         if [ -f "/opt/matrix-install/secrets.conf" ]; then
-            registration_secret=$(grep "REGISTRATION_SECRET=" /opt/matrix-install/secrets.conf 2>/dev/null | cut -d'=' -f2 | tr -d '"')
+            registration_secret=$(grep "REGISTRATION_SHARED_SECRET=" /opt/matrix-install/secrets.conf 2>/dev/null | cut -d'=' -f2 | tr -d '"')
         fi
         
         if [ -z "$registration_secret" ]; then
@@ -2814,12 +2147,76 @@ fix_registration_issues() {
         
         # Сохраняем секрет в конфигурации установщика
         mkdir -p /opt/matrix-install
-        if ! grep -q "REGISTRATION_SECRET=" /opt/matrix-install/secrets.conf 2>/dev/null; then
-            echo "REGISTRATION_SECRET=\"$registration_secret\"" >> /opt/matrix-install/secrets.conf
+        if ! grep -q "REGISTRATION_SHARED_SECRET=" /opt/matrix-install/secrets.conf 2>/dev/null; then
+            echo "REGISTRATION_SHARED_SECRET=\"$registration_secret\"" >> /opt/matrix-install/secrets.conf
         fi
     fi
     
-    # 3. Запуск Matrix Synapse если остановлен
+    # 3. Проверка и добавление macaroon_secret_key
+    if ! grep -q "macaroon_secret_key:" /etc/matrix-synapse/homeserver.yaml 2>/dev/null; then
+        safe_echo "${BLUE}🔧 Добавление macaroon_secret_key в homeserver.yaml...${NC}"
+        
+        # Генерируем новый macaroon secret
+        local macaroon_secret=""
+        if [ -f "/opt/matrix-install/secrets.conf" ]; then
+            macaroon_secret=$(grep "MACAROON_SECRET_KEY=" /opt/matrix-install/secrets.conf 2>/dev/null | cut -d'=' -f2 | tr -d '"')
+        fi
+        
+        if [ -z "$macaroon_secret" ]; then
+            macaroon_secret=$(openssl rand -hex 32)
+            safe_echo "   ${BLUE}💡 Сгенерирован новый macaroon secret key${NC}"
+        fi
+        
+        # Добавляем macaroon_secret_key в homeserver.yaml
+        if ! grep -q "# Секреты безопасности" /etc/matrix-synapse/homeserver.yaml; then
+            echo "" >> /etc/matrix-synapse/homeserver.yaml
+            echo "# Секреты безопасности" >> /etc/matrix-synapse/homeserver.yaml
+        fi
+        
+        # Удаляем старую строку если есть и добавляем новую
+        sed -i '/^macaroon_secret_key:/d' /etc/matrix-synapse/homeserver.yaml
+        echo "macaroon_secret_key: \"$macaroon_secret\"" >> /etc/matrix-synapse/homeserver.yaml
+        
+        safe_echo "   ${GREEN}✅ macaroon_secret_key добавлен в homeserver.yaml${NC}"
+        ((fixes_applied++))
+        
+        # Сохраняем секрет в конфигурации установщика
+        mkdir -p /opt/matrix-install
+        if ! grep -q "MACAROON_SECRET_KEY=" /opt/matrix-install/secrets.conf 2>/dev/null; then
+            echo "MACAROON_SECRET_KEY=\"$macaroon_secret\"" >> /opt/matrix-install/secrets.conf
+        fi
+    fi
+    
+    # 4. Проверка и добавление form_secret
+    if ! grep -q "form_secret:" /etc/matrix-synapse/homeserver.yaml 2>/dev/null; then
+        safe_echo "${BLUE}🔧 Добавление form_secret в homeserver.yaml...${NC}"
+        
+        # Генерируем новый form secret
+        local form_secret=""
+        if [ -f "/opt/matrix-install/secrets.conf" ]; then
+            form_secret=$(grep "FORM_SECRET=" /opt/matrix-install/secrets.conf 2>/dev/null | cut -d'=' -f2 | tr -d '"')
+        fi
+        
+        if [ -z "$form_secret" ]; then
+            form_secret=$(openssl rand -hex 32)
+            safe_echo "   ${BLUE}💡 Сгенерирован новый form secret${NC}"
+        fi
+        
+        # Добавляем form_secret в homeserver.yaml
+        sed -i '/^form_secret:/d' /etc/matrix-synapse/homeserver.yaml
+        echo "form_secret: \"$form_secret\"" >> /etc/matrix-synapse/homeserver.yaml
+        
+        safe_echo "   ${GREEN}✅ form_secret добавлен в homeserver.yaml${NC}"
+        ((fixes_applied++))
+        
+        # Сохраняем секрет в конфигурации установщика
+        mkdir -p /opt/matrix-install
+        if ! grep -q "FORM_SECRET=" /opt/matrix-install/secrets.conf 2>/dev/null; then
+            echo "FORM_SECRET=\"$form_secret\"" >> /opt/matrix-install/secrets.conf
+        fi
+    fi
+    
+    # 5. Запуск Matrix Synapse если остановлен
     if ! systemctl is-active --quiet matrix-synapse; then
         safe_echo "${BLUE}🔧 Запуск Matrix Synapse...${NC}"
         if systemctl start matrix-synapse; then
@@ -2830,7 +2227,7 @@ fix_registration_issues() {
             safe_echo "   ${RED}❌ Не удалось запустить Matrix Synapse${NC}"
             safe_echo "   ${YELLOW}💡 Проверьте логи: journalctl -u matrix-synapse -n 20${NC}"
         fi
-    else
+        else
         # Если Synapse работает, но мы изменили конфигурацию, перезапускаем его
         if [ $fixes_applied -gt 0 ]; then
             safe_echo "${BLUE}🔧 Перезапуск Matrix Synapse для применения изменений...${NC}"
@@ -2843,7 +2240,7 @@ fix_registration_issues() {
         fi
     fi
     
-    # 4. Проверка доступности API
+    # 6. Проверка доступности API
     safe_echo "${BLUE}🔧 Проверка доступности API...${NC}"
     local api_attempts=0
     while [ $api_attempts -lt 10 ]; do
