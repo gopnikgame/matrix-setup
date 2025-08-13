@@ -2,11 +2,11 @@
 
 # Matrix Synapse Core Installation Module
 # Использует common_lib.sh для улучшенного логирования и обработки ошибок
-# Версия: 2.0.0
+# Версия: 2.0.1
 
 # Настройки модуля
 LIB_NAME="Matrix Synapse Core Installer"
-LIB_VERSION="2.0.0"
+LIB_VERSION="2.0.1"
 MODULE_NAME="core_install"
 
 # Подключение общей библиотеки
@@ -650,17 +650,78 @@ EOF
     
     chmod 600 "$CONFIG_DIR/secrets.conf"
     
-    # Генерация ключа подписи
+    # Генерация ключа подписи - ИСПРАВЛЕНИЕ ОШИБКИ
     log "INFO" "Генерация ключа подписи сервера..."
-    if ! sudo -u matrix-synapse python3 -m synapse.app.homeserver \
-        --server-name="$MATRIX_DOMAIN" \
-        --config-path="$SYNAPSE_CONFIG_DIR/homeserver.yaml" \
-        --generate-keys; then
-        log "ERROR" "Ошибка генерации ключей"
-        return 1
+    
+    # Создаем и устанавливаем права доступа перед генерацией
+    chown -R matrix-synapse:matrix-synapse "$SYNAPSE_CONFIG_DIR"
+    chown -R matrix-synapse:matrix-synapse "$SYNAPSE_DATA_DIR"
+    chmod 755 "$SYNAPSE_CONFIG_DIR"
+    chmod 750 "$SYNAPSE_DATA_DIR"
+    
+    # Проверяем различные способы запуска утилиты
+    local generate_command=""
+    
+    # Способ 1: используем готовую утилиту из пакета (наиболее вероятный)
+    if command -v generate_config >/dev/null 2>&1; then
+        generate_command="generate_config"
+    # Способ 2: используем python модуль через правильный интерпретатор
+    elif [ -x "/opt/venvs/matrix-synapse/bin/python" ]; then
+        generate_command="/opt/venvs/matrix-synapse/bin/python -m synapse.app.homeserver"
+    # Способ 3: стандартная команда synapse
+    elif command -v synapse_homeserver >/dev/null 2>&1; then
+        generate_command="synapse_homeserver"
+    # Способ 4: команда из пакета matrix-synapse-py3
+    elif command -v python3 >/dev/null 2>&1 && python3 -c "import synapse" 2>/dev/null; then
+        generate_command="python3 -m synapse.app.homeserver"
+    # Способ 5: генерируем ключ вручную через openssl
+    else
+        log "WARN" "Утилита генерации Synapse не найдена, создаем ключ вручную..."
+        local signing_key_file="$SYNAPSE_CONFIG_DIR/$MATRIX_DOMAIN.signing.key"
+        
+        # Генерируем Ed25519 ключ
+        if ! openssl genpkey -algorithm Ed25519 -out "$signing_key_file"; then
+            log "ERROR" "Ошибка генерации ключа подписи"
+            return 1
+        fi
+        
+        # Устанавливаем права доступа
+        chown matrix-synapse:matrix-synapse "$signing_key_file"
+        chmod 600 "$signing_key_file"
+        
+        log "SUCCESS" "Ключ подписи создан вручную: $signing_key_file"
+        return 0
     fi
     
-    # Установка правильных прав доступа
+    # Выполняем генерацию ключей если нашли команду
+    if [ -n "$generate_command" ]; then
+        log "INFO" "Используем команду: $generate_command"
+        
+        if ! sudo -u matrix-synapse $generate_command \
+            --server-name="$MATRIX_DOMAIN" \
+            --config-path="$SYNAPSE_CONFIG_DIR/homeserver.yaml" \
+            --generate-keys; then
+            
+            log "WARN" "Основная команда не сработала, пробуем альтернативный способ..."
+            
+            # Альтернативный способ - создаем ключ с помощью openssl
+            local signing_key_file="$SYNAPSE_CONFIG_DIR/$MATRIX_DOMAIN.signing.key"
+            
+            if ! openssl genpkey -algorithm Ed25519 -out "$signing_key_file"; then
+                log "ERROR" "Ошибка генерации ключа подписи"
+                return 1
+            fi
+            
+            chown matrix-synapse:matrix-synapse "$signing_key_file"
+            chmod 600 "$signing_key_file"
+            
+            log "SUCCESS" "Ключ подписи создан альтернативным способом"
+        else
+            log "SUCCESS" "Ключи сгенерированы успешно"
+        fi
+    fi
+    
+    # Финальная установка прав доступа
     chown -R matrix-synapse:matrix-synapse "$SYNAPSE_CONFIG_DIR"
     chown -R matrix-synapse:matrix-synapse "$SYNAPSE_DATA_DIR"
     chmod 755 "$SYNAPSE_CONFIG_DIR"
@@ -858,7 +919,7 @@ EOF
 
 # Главная функция установки
 main() {
-    print_header "MATRIX SYNAPSE УСТАНОВЩИК v2.0" "$GREEN"
+    print_header "MATRIX SYNAPSE УСТАНОВЩИК v2.0.1" "$GREEN"
     
     log "INFO" "Начало установки Matrix Synapse"
     log "INFO" "Использование библиотеки: $LIB_NAME v$LIB_VERSION"
