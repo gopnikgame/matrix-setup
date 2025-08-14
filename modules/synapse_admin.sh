@@ -18,7 +18,7 @@ fi
 # Настройки модуля
 CONFIG_DIR="/opt/matrix-install"
 SYNAPSE_ADMIN_DIR="/var/www/synapse-admin"
-ADMIN_CONFIG_FILE="$SYNAPSE_ADMIN_DIR/config.json"
+ADMIN_CONFIG_FILE="$CONFIG_DIR/synapse-admin-config.json"
 DOCKER_COMPOSE_FILE="$CONFIG_DIR/synapse-admin-docker-compose.yml"
 
 # Проверка root прав
@@ -151,6 +151,12 @@ install_prebuilt() {
         fi
     fi
     
+    # Очищаем конфликтующие пути
+    if ! clean_conflicting_paths; then
+        log "ERROR" "Не удалось устранить конфликты путей"
+        return 1
+    fi
+    
     log "INFO" "Создание резервной копии..."
     if [ -d "$SYNAPSE_ADMIN_DIR" ]; then
         backup_file "$SYNAPSE_ADMIN_DIR" "synapse-admin"
@@ -177,11 +183,21 @@ install_prebuilt() {
     
     rm -f "$temp_file"
     
+    # Создаем конфигурационный файл если он не существует
+    if [ ! -f "$ADMIN_CONFIG_FILE" ]; then
+        log "INFO" "Создание базового конфигурационного файла..."
+        if ! create_config "auto"; then
+            log "ERROR" "Не удалось создать конфигурацию"
+            return 1
+        fi
+    fi
+    
     # Устанавливаем правильные права доступа
     chown -R www-data:www-data "$SYNAPSE_ADMIN_DIR" 2>/dev/null || true
     chmod -R 755 "$SYNAPSE_ADMIN_DIR"
     
     log "SUCCESS" "Synapse Admin v$LATEST_VERSION успешно установлен"
+    log "INFO" "Конфигурационный файл: $ADMIN_CONFIG_FILE"
     return 0
 }
 
@@ -223,6 +239,12 @@ install_docker() {
     # Проверяем Docker окружение
     if ! check_docker_environment; then
         log "ERROR" "Проблемы с Docker окружением"
+        return 1
+    fi
+    
+    # Очищаем конфликтующие пути
+    if ! clean_conflicting_paths; then
+        log "ERROR" "Не удалось устранить конфликты путей"
         return 1
     fi
     
@@ -515,6 +537,41 @@ validate_config() {
     return 0
 }
 
+# Очистка проблемных файлов и директорий
+clean_conflicting_paths() {
+    log "INFO" "Проверка и очистка конфликтующих путей..."
+    
+    # Проверяем, есть ли директория config.json в /var/www/synapse-admin/
+    local old_config_path="/var/www/synapse-admin/config.json"
+    
+    if [ -d "$old_config_path" ]; then
+        log "WARN" "Найдена директория $old_config_path, которая мешает созданию файла конфигурации"
+        
+        if ask_confirmation "Удалить проблемную директорию $old_config_path?"; then
+            log "INFO" "Удаление проблемной директории..."
+            rm -rf "$old_config_path"
+            log "SUCCESS" "Проблемная директория удалена"
+        else
+            log "ERROR" "Невозможно продолжить установку без удаления проблемной директории"
+            return 1
+        fi
+    fi
+    
+    # Проверяем, есть ли файл config.json как файл в неправильном месте
+    if [ -f "$old_config_path" ]; then
+        log "INFO" "Найден старый конфигурационный файл, перемещаем его..."
+        
+        # Создаем директорию для нового конфига если нужно
+        mkdir -p "$(dirname "$ADMIN_CONFIG_FILE")"
+        
+        # Перемещаем старый конфиг
+        mv "$old_config_path" "$ADMIN_CONFIG_FILE"
+        log "SUCCESS" "Конфигурация перемещена в правильное место: $ADMIN_CONFIG_FILE"
+    fi
+    
+    return 0
+}
+
 # Показ главного меню
 show_main_menu() {
     while true; do
@@ -530,10 +587,11 @@ show_main_menu() {
         safe_echo "${GREEN}6.${NC} Обновить до последней версии"
         safe_echo "${GREEN}7.${NC} Удалить Synapse Admin"
         safe_echo "${GREEN}8.${NC} Просмотр логов Docker"
-        safe_echo "${GREEN}9.${NC} Вернуться в главное меню"
+        safe_echo "${GREEN}9.${NC} Мигрировать конфигурацию"
+        safe_echo "${GREEN}10.${NC} Вернуться в главное меню"
         echo
         
-        read -p "$(safe_echo "${YELLOW}Выберите опцию [1-9]: ${NC}")" choice
+        read -p "$(safe_echo "${YELLOW}Выберите опцию [1-10]: ${NC}")" choice
         
         case $choice in
             1)
@@ -575,6 +633,10 @@ show_main_menu() {
                 read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
                 ;;
             9)
+                migrate_config
+                read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+                ;;
+            10)
                 log "INFO" "Возврат в главное меню"
                 return 0
                 ;;
@@ -619,8 +681,21 @@ check_status() {
     if [ -f "$ADMIN_CONFIG_FILE" ]; then
         safe_echo "├─ Конфиг файл: ${GREEN}найден${NC}"
         safe_echo "└─ Путь: $ADMIN_CONFIG_FILE"
+        
+        # Показываем размер и права доступа
+        local config_size=$(du -h "$ADMIN_CONFIG_FILE" 2>/dev/null | cut -f1)
+        local config_perms=$(ls -la "$ADMIN_CONFIG_FILE" 2>/dev/null | cut -d' ' -f1)
+        safe_echo "   ├─ Размер: ${config_size:-неизвестен}"
+        safe_echo "   └─ Права: ${config_perms:-неизвестны}"
     else
         safe_echo "└─ Конфиг файл: ${YELLOW}не найден${NC}"
+        
+        # Проверяем старое расположение
+        local old_config_path="/var/www/synapse-admin/config.json"
+        if [ -f "$old_config_path" ] || [ -d "$old_config_path" ]; then
+            safe_echo "   └─ ${YELLOW}Найден старый конфиг: $old_config_path${NC}"
+            safe_echo "      ${YELLOW}Рекомендуется переустановка для миграции${NC}"
+        fi
     fi
     
     echo
@@ -805,6 +880,13 @@ uninstall() {
         rm -f "$ADMIN_CONFIG_FILE"
     fi
     
+    # Удаляем старый конфигурационный файл если он есть
+    local old_config_path="/var/www/synapse-admin/config.json"
+    if [ -f "$old_config_path" ] || [ -d "$old_config_path" ]; then
+        log "INFO" "Удаление старого конфигурационного файла..."
+        rm -rf "$old_config_path"
+    fi
+    
     # Удаляем сохраненный домен
     rm -f "$CONFIG_DIR/admin_domain"
     
@@ -863,19 +945,98 @@ show_docker_logs() {
     fi
 }
 
-# Главная функция модуля
-main() {
-    # Загружаем конфигурацию Matrix
-    load_matrix_config
+# Миграция конфигурации
+migrate_config() {
+    print_header "МИГРАЦИЯ КОНФИГУРАЦИИ SYNAPSE ADMIN" "$CYAN"
     
-    # Создаем необходимые директории
-    mkdir -p "$CONFIG_DIR"
+    local old_config_path="/var/www/synapse-admin/config.json"
     
-    # Запускаем главное меню
-    show_main_menu
+    echo
+    safe_echo "${BOLD}${CYAN}Проверка существующих конфигураций:${NC}"
+    
+    # Проверяем новую конфигурацию
+    if [ -f "$ADMIN_CONFIG_FILE" ]; then
+        safe_echo "├─ Новая конфигурация: ${GREEN}найдена${NC} ($ADMIN_CONFIG_FILE)"
+    else
+        safe_echo "├─ Новая конфигурация: ${YELLOW}не найдена${NC}"
+    fi
+    
+    # Проверяем старую конфигурацию
+    if [ -f "$old_config_path" ]; then
+        safe_echo "├─ Старая конфигурация: ${GREEN}найдена${NC} ($old_config_path)"
+    elif [ -d "$old_config_path" ]; then
+        safe_echo "├─ Старая конфигурация: ${RED}найдена директория вместо файла${NC} ($old_config_path)"
+    else
+        safe_echo "├─ Старая конфигурация: ${YELLOW}не найдена${NC}"
+    fi
+    
+    echo
+    
+    # Если есть проблемная директория
+    if [ -d "$old_config_path" ]; then
+        log "WARN" "Найдена директория $old_config_path, которая блокирует создание конфигурации"
+        
+        if ask_confirmation "Удалить проблемную директорию?"; then
+            rm -rf "$old_config_path"
+            log "SUCCESS" "Проблемная директория удалена"
+        else
+            log "INFO" "Миграция отменена"
+            return 0
+        fi
+    fi
+    
+    # Если есть старый файл конфигурации
+    if [ -f "$old_config_path" ]; then
+        log "INFO" "Найден старый конфигурационный файл"
+        
+        # Создаем директорию для нового конфига
+        mkdir -p "$(dirname "$ADMIN_CONFIG_FILE")"
+        
+        # Показываем содержимое старого конфига
+        echo
+        safe_echo "${BOLD}${CYAN}Содержимое старой конфигурации:${NC}"
+        echo "────────────────────────────────────────"
+        cat "$old_config_path" 2>/dev/null || echo "Не удалось прочитать файл"
+        echo "────────────────────────────────────────"
+        echo
+        
+        if ask_confirmation "Перенести эту конфигурацию в новое место?"; then
+            # Проверяем, есть ли уже новая конфигурация
+            if [ -f "$ADMIN_CONFIG_FILE" ]; then
+                if ! ask_confirmation "Новая конфигурация уже существует. Перезаписать?"; then
+                    log "INFO" "Миграция отменена"
+                    return 0
+                fi
+                
+                # Создаем резервную копию
+                backup_file "$ADMIN_CONFIG_FILE" "synapse-admin-config"
+            fi
+            
+            # Перемещаем конфигурацию
+            mv "$old_config_path" "$ADMIN_CONFIG_FILE"
+            log "SUCCESS" "Конфигурация перемещена в: $ADMIN_CONFIG_FILE"
+            
+            # Проверяем корректность
+            if validate_config; then
+                log "SUCCESS" "Миграция завершена успешно"
+            else
+                log "WARN" "Конфигурация перемещена, но может содержать ошибки"
+            fi
+        else
+            log "INFO" "Миграция отменена"
+        fi
+    else
+        # Создаем новую конфигурацию если ничего нет
+        if [ ! -f "$ADMIN_CONFIG_FILE" ]; then
+            log "INFO" "Старая конфигурация не найдена, создаем новую"
+            
+            if ask_confirmation "Создать новую конфигурацию?"; then
+                create_config
+            else
+                log "INFO" "Создание конфигурации отменено"
+            fi
+        else
+            log "INFO" "Конфигурация уже находится в правильном месте"
+        fi
+    fi
 }
-
-# Если скрипт запущен напрямую
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main "$@"
-fi
