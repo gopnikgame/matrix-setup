@@ -588,10 +588,12 @@ show_main_menu() {
         safe_echo "${GREEN}7.${NC} Удалить Synapse Admin"
         safe_echo "${GREEN}8.${NC} Просмотр логов Docker"
         safe_echo "${GREEN}9.${NC} Мигрировать конфигурацию"
-        safe_echo "${GREEN}10.${NC} Вернуться в главное меню"
+        safe_echo "${GREEN}10.${NC} 🔧 Диагностика CORS проблем"
+        safe_echo "${GREEN}11.${NC} 🛠️  Исправить CORS настройки"
+        safe_echo "${GREEN}12.${NC} Вернуться в главное меню"
         echo
         
-        read -p "$(safe_echo "${YELLOW}Выберите опцию [1-10]: ${NC}")" choice
+        read -p "$(safe_echo "${YELLOW}Выберите опцию [1-12]: ${NC}")" choice
         
         case $choice in
             1)
@@ -637,6 +639,14 @@ show_main_menu() {
                 read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
                 ;;
             10)
+                diagnose_cors_issue
+                read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+                ;;
+            11)
+                fix_cors_configuration
+                read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+                ;;
+            12)
                 log "INFO" "Возврат в главное меню"
                 return 0
                 ;;
@@ -702,7 +712,7 @@ check_status() {
     safe_echo "${BOLD}${CYAN}Docker контейнер:${NC}"
     
     if command -v docker >/dev/null 2>&1; then
-        local container_status=$(docker ps --filter "name=synapse-admin" --format "{{.Status}}" 2>/dev/null)
+        local container_status=$(docker ps -a --filter "name=synapse-admin" --format "{{.Status}}" 2>/dev/null)
         
         if [ -n "$container_status" ]; then
             safe_echo "├─ Статус: ${GREEN}$container_status${NC}"
@@ -937,7 +947,7 @@ show_docker_logs() {
         echo "────────────────────────────────────────"
     fi
     
-    if ask_confirmation "Следить за логами в реальном времени?"; then
+    if ask_confirmation "Следить за логами в реальном времени?"); then
         echo
         safe_echo "${BOLD}${CYAN}Логи в реальном времени (нажмите Ctrl+C для выхода):${NC}"
         echo "────────────────────────────────────────"
@@ -1039,6 +1049,388 @@ migrate_config() {
             log "INFO" "Конфигурация уже находится в правильном месте"
         fi
     fi
+}
+
+# Диагностика CORS проблем
+diagnose_cors_issue() {
+    print_header "ДИАГНОСТИКА CORS ПРОБЛЕМ" "$YELLOW"
+    
+    log "INFO" "Проверка настроек CORS для Synapse Admin..."
+    
+    # Проверяем конфигурацию Synapse Admin
+    if [ -f "$ADMIN_CONFIG_FILE" ]; then
+        log "INFO" "Анализ конфигурации Synapse Admin..."
+        
+        # Проверяем настройку restrictBaseUrl
+        if command -v jq >/dev/null 2>&1; then
+            local restrict_base_url=$(jq -r '.restrictBaseUrl // empty' "$ADMIN_CONFIG_FILE" 2>/dev/null)
+            if [ -n "$restrict_base_url" ] && [ "$restrict_base_url" != "null" ]; then
+                safe_echo "${BLUE}🔍 Настроен restrictBaseUrl: ${YELLOW}$restrict_base_url${NC}"
+            else
+                safe_echo "${YELLOW}⚠️  restrictBaseUrl не настроен - Admin может подключаться к любому серверу${NC}"
+            fi
+        fi
+    else
+        safe_echo "${RED}❌ Конфигурационный файл Synapse Admin не найден${NC}"
+    fi
+    
+    echo
+    safe_echo "${BOLD}${CYAN}Типичные причины CORS ошибок:${NC}"
+    safe_echo "1. ${YELLOW}Synapse Admin и Matrix Synapse на разных доменах${NC}"
+    safe_echo "2. ${YELLOW}Отсутствуют CORS заголовки в конфигурации Synapse${NC}"
+    safe_echo "3. ${YELLOW}Неправильная настройка обратного прокси${NC}"
+    safe_echo "4. ${YELLOW}Проблемы с SSL сертификатами${NC}"
+    
+    echo
+    safe_echo "${BOLD}${CYAN}Рекомендуемые решения:${NC}"
+    safe_echo "1. ${GREEN}Разместить Synapse Admin и Matrix на том же домене${NC}"
+    safe_echo "2. ${GREEN}Настроить CORS заголовки в Synapse${NC}"
+    safe_echo "3. ${GREEN}Использовать обратный прокси для объединения доменов${NC}"
+    
+    echo
+    if ask_confirmation "Хотите автоматически проверить доступность API эндпоинтов?"; then
+        test_api_endpoints
+    fi
+}
+
+# Тестирование API эндпоинтов
+test_api_endpoints() {
+    print_header "ТЕСТИРОВАНИЕ API ЭНДПОИНТОВ" "$BLUE"
+    
+    log "INFO" "Проверка доступности Matrix API..."
+    
+    # Определяем возможные URL для API
+    local api_urls=()
+    
+    # Добавляем локальные URL
+    api_urls+=("http://localhost:8008/_synapse/admin/v1/server_version")
+    api_urls+=("http://127.0.0.1:8008/_synapse/admin/v1/server_version")
+    
+    # Добавляем URL из конфигурации если есть
+    if [ -f "$CONFIG_DIR/domain" ]; then
+        local matrix_domain=$(cat "$CONFIG_DIR/domain")
+        api_urls+=("https://$matrix_domain/_synapse/admin/v1/server_version")
+        api_urls+=("http://$matrix_domain/_synapse/admin/v1/server_version")
+    fi
+    
+    echo
+    safe_echo "${BOLD}${CYAN}Тестирование эндпоинтов:${NC}"
+    
+    local working_endpoints=0
+    local total_endpoints=${#api_urls[@]}
+    
+    for api_url in "${api_urls[@]}"; do
+        log "DEBUG" "Тестирование: $api_url"
+        
+        local response_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 "$api_url" 2>/dev/null || echo "000")
+        local response_time=$(curl -s -o /dev/null -w "%{time_total}" --connect-timeout 10 "$api_url" 2>/dev/null || echo "timeout")
+        
+        if [[ "$response_code" == "200" ]]; then
+            safe_echo "  ${GREEN}✅ $api_url${NC}"
+            safe_echo "     ${DIM}HTTP $response_code, время ответа: ${response_time}s${NC}"
+            ((working_endpoints++))
+            
+            # Получаем версию сервера
+            local server_info=$(curl -s --connect-timeout 10 "$api_url" 2>/dev/null)
+            if [ -n "$server_info" ]; then
+                local server_version=$(echo "$server_info" | grep -o '"server_version":"[^"]*' | cut -d'"' -f4)
+                if [ -n "$server_version" ]; then
+                    safe_echo "     ${DIM}Версия Synapse: $server_version${NC}"
+                fi
+            fi
+            
+        elif [[ "$response_code" == "401" ]] || [[ "$response_code" == "403" ]]; then
+            safe_echo "  ${YELLOW}⚠️  $api_url${NC}"
+            safe_echo "     ${DIM}HTTP $response_code (требуется аутентификация - это нормально)${NC}"
+            ((working_endpoints++))
+            
+        else
+            safe_echo "  ${RED}❌ $api_url${NC}"
+            safe_echo "     ${DIM}HTTP ${response_code:-timeout}${NC}"
+        fi
+    done
+    
+    echo
+    safe_echo "${BOLD}${CYAN}Результат тестирования:${NC}"
+    
+    if [ $working_endpoints -gt 0 ]; then
+        safe_echo "  ${GREEN}✅ Найдено рабочих эндпоинтов: $working_endpoints из $total_endpoints${NC}"
+        
+        if [ $working_endpoints -lt $total_endpoints ]; then
+            safe_echo "  ${YELLOW}💡 Некоторые эндпоинты недоступны - это может быть нормально${NC}"
+        fi
+        
+        echo
+        safe_echo "${BOLD}${CYAN}Рекомендации для решения CORS:${NC}"
+        safe_echo "1. ${BLUE}Настройте Synapse Admin на том же домене, что и Matrix${NC}"
+        safe_echo "2. ${BLUE}Используйте обратный прокси (nginx/caddy) для объединения сервисов${NC}"
+        safe_echo "3. ${BLUE}Добавьте CORS заголовки в конфигурацию Synapse${NC}"
+        
+    else
+        safe_echo "  ${RED}❌ Ни один эндпоинт не доступен${NC}"
+        safe_echo "  ${YELLOW}💡 Проверьте, что Matrix Synapse запущен и настроен правильно${NC}"
+    fi
+}
+
+# Исправление CORS настроек
+fix_cors_configuration() {
+    print_header "ИСПРАВЛЕНИЕ CORS НАСТРОЕК" "$GREEN"
+    
+    log "WARN" "Настройка CORS может повлиять на безопасность"
+    
+    echo
+    safe_echo "${BOLD}${CYAN}Доступные варианты исправления CORS:${NC}"
+    safe_echo "${GREEN}1.${NC} Настроить обратный прокси (рекомендуется)"
+    safe_echo "${GREEN}2.${NC} Добавить CORS заголовки в Synapse"
+    safe_echo "${GREEN}3.${NC} Переместить Synapse Admin на тот же домен"
+    safe_echo "${GREEN}4.${NC} Настроить restrictBaseUrl в Synapse Admin"
+    safe_echo "${GREEN}5.${NC} Отмена"
+    
+    echo
+    read -p "$(safe_echo "${YELLOW}Выберите вариант [1-5]: ${NC}")" cors_choice
+    
+    case $cors_choice in
+        1)
+            setup_reverse_proxy_cors
+            ;;
+        2)
+            add_cors_headers_to_synapse
+            ;;
+        3)
+            move_admin_to_same_domain
+            ;;
+        4)
+            configure_restrict_base_url
+            ;;
+        5)
+            log "INFO" "Операция отменена"
+            return 0
+            ;;
+        *)
+            log "ERROR" "Неверный выбор"
+            return 1
+            ;;
+    esac
+}
+
+# Настройка обратного прокси для CORS
+setup_reverse_proxy_cors() {
+    log "INFO" "Настройка обратного прокси для решения CORS..."
+    
+    echo
+    safe_echo "${BOLD}${CYAN}Обратный прокси решает CORS, объединяя сервисы на одном домене:${NC}"
+    safe_echo "• ${BLUE}Synapse Admin: https://yourdomain.com/admin${NC}"
+    safe_echo "• ${BLUE}Matrix API: https://yourdomain.com/_matrix${NC}"
+    safe_echo "• ${BLUE}Synapse Admin API: https://yourdomain.com/_synapse${NC}"
+    
+    echo
+    if ask_confirmation "Хотите запустить модуль настройки Caddy для этого?"; then
+        log "INFO" "Запуск модуля caddy_config..."
+        # Здесь можно вызвать модуль caddy_config или дать инструкции
+        safe_echo "${YELLOW}💡 Запустите модуль настройки Caddy из главного меню:${NC}"
+        safe_echo "   ${CYAN}Дополнительные компоненты → Настройка Reverse Proxy (Caddy)${NC}"
+        
+        echo
+        safe_echo "${BOLD}${CYAN}Пример конфигурации Caddy:${NC}"
+        cat << 'EOF'
+yourdomain.com {
+    # Synapse Admin
+    route /admin/* {
+        uri strip_prefix /admin
+        reverse_proxy localhost:8080
+    }
+    
+    # Matrix API и Synapse Admin API
+    route /_matrix/* {
+        reverse_proxy localhost:8008
+    }
+    
+    route /_synapse/* {
+        reverse_proxy localhost:8008
+    }
+    
+    # Element Web (опционально)
+    route /* {
+        reverse_proxy localhost:8081
+    }
+}
+EOF
+    else
+        log "INFO" "Настройка прокси отменена"
+    fi
+}
+
+# Добавление CORS заголовков в Synapse
+add_cors_headers_to_synapse() {
+    log "INFO" "Добавление CORS заголовков в конфигурацию Synapse..."
+    
+    safe_echo "${YELLOW}⚠️  Внимание: Изменение CORS настроек может повлиять на безопасность${NC}"
+    
+    echo
+    safe_echo "${BOLD}${CYAN}Способы добавления CORS заголовков:${NC}"
+    safe_echo "1. ${BLUE}Добавить заголовки в homeserver.yaml${NC}"
+    safe_echo "2. ${BLUE}Настроить через обратный прокси (безопаснее)${NC}"
+    
+    echo
+    if ! ask_confirmation "Добавить CORS заголовки в homeserver.yaml?"; then
+        log "INFO" "Операция отменена"
+        return 0
+    fi
+    
+    # Создаем резервную копию
+    if [ -f "/etc/matrix-synapse/homeserver.yaml" ]; then
+        backup_file "/etc/matrix-synapse/homeserver.yaml" "homeserver-before-cors"
+        log "SUCCESS" "Создана резервная копия homeserver.yaml"
+    fi
+    
+    # Проверяем, есть ли уже настройки CORS
+    if grep -q "web_client_location" /etc/matrix-synapse/homeserver.yaml; then
+        log "WARN" "CORS настройки уже присутствуют в homeserver.yaml"
+        if ! ask_confirmation "Перезаписать существующие настройки?"; then
+            return 0
+        fi
+    fi
+    
+    # Запрашиваем домен Synapse Admin
+    local admin_domain=""
+    echo
+    read -p "$(safe_echo "${YELLOW}Введите домен Synapse Admin (например, https://webadmin.example.com): ${NC}")" admin_domain
+    
+    if [ -z "$admin_domain" ]; then
+        log "ERROR" "Домен не может быть пустым"
+        return 1
+    fi
+    
+    # Добавляем CORS настройки
+    log "INFO" "Добавление CORS настроек..."
+    
+    cat >> /etc/matrix-synapse/homeserver.yaml << EOF
+
+# CORS настройки для Synapse Admin
+web_client_location: $admin_domain
+
+# Дополнительные CORS заголовки
+http_options:
+  x_forwarded: true
+  
+# Разрешить кросс-доменные запросы от Synapse Admin
+serve_server_wellknown: true
+EOF
+
+    log "SUCCESS" "CORS настройки добавлены в homeserver.yaml"
+    
+    # Перезапускаем Synapse
+    if ask_confirmation "Перезапустить Matrix Synapse для применения изменений?"; then
+        log "INFO" "Перезапуск Matrix Synapse..."
+        if systemctl restart matrix-synapse; then
+            log "SUCCESS" "Matrix Synapse перезапущен"
+            
+            # Ждем запуска
+            sleep 5
+            
+            # Проверяем статус
+            if systemctl is-active --quiet matrix-synapse; then
+                log "SUCCESS" "Matrix Synapse работает корректно"
+            else
+                log "ERROR" "Проблемы с запуском Matrix Synapse"
+                log "INFO" "Проверьте логи: journalctl -u matrix-synapse -n 20"
+            fi
+        else
+            log "ERROR" "Ошибка перезапуска Matrix Synapse"
+        fi
+    fi
+}
+
+# Перемещение Admin на тот же домен
+move_admin_to_same_domain() {
+    log "INFO" "Настройка Synapse Admin на том же домене что и Matrix..."
+    
+    echo
+    safe_echo "${BOLD}${CYAN}Преимущества размещения на одном домене:${NC}"
+    safe_echo "• ${GREEN}Отсутствие CORS проблем${NC}"
+    safe_echo "• ${GREEN}Упрощенная настройка${NC}"
+    safe_echo "• ${GREEN}Лучшая безопасность${NC}"
+    
+    echo
+    safe_echo "${BOLD}${CYAN}Возможные варианты:${NC}"
+    safe_echo "1. ${BLUE}Поддомен: admin.yourdomain.com${NC}"
+    safe_echo "2. ${BLUE}Подпуть: yourdomain.com/admin${NC}"
+    safe_echo "3. ${BLUE}Порт: yourdomain.com:8080${NC}"
+    
+    echo
+    safe_echo "${YELLOW}💡 Рекомендуется использовать модуль настройки веб-сервера${NC}"
+    safe_echo "${CYAN}   Главное меню → Дополнительные компоненты → Настройка Reverse Proxy${NC}"
+}
+
+# Настройка restrictBaseUrl
+configure_restrict_base_url() {
+    log "INFO" "Настройка restrictBaseUrl в Synapse Admin..."
+    
+    # Получаем домен Matrix
+    local matrix_domain=""
+    if [ -f "$CONFIG_DIR/domain" ]; then
+        matrix_domain=$(cat "$CONFIG_DIR/domain")
+    fi
+    
+    if [ -z "$matrix_domain" ]; then
+        echo
+        read -p "$(safe_echo "${YELLOW}Введите домен Matrix сервера (например, matrix.example.com): ${NC}")" matrix_domain
+    fi
+    
+    if [ -z "$matrix_domain" ]; then
+        log "ERROR" "Домен Matrix не может быть пустым"
+        return 1
+    fi
+    
+    # Создаем резервную копию конфигурации
+    if [ -f "$ADMIN_CONFIG_FILE" ]; then
+        backup_file "$ADMIN_CONFIG_FILE" "synapse-admin-config"
+    fi
+    
+    # Создаем/обновляем конфигурацию
+    mkdir -p "$(dirname "$ADMIN_CONFIG_FILE")"
+    
+    local matrix_url="https://$matrix_domain"
+    
+    log "INFO" "Создание конфигурации с restrictBaseUrl: $matrix_url"
+    
+    cat > "$ADMIN_CONFIG_FILE" << EOF
+{
+  "restrictBaseUrl": "$matrix_url",
+  "defaultTheme": "auto",
+  "developmentMode": false,
+  "locale": "ru"
+}
+EOF
+
+    log "SUCCESS" "Конфигурация обновлена: $ADMIN_CONFIG_FILE"
+    
+    # Перезапускаем Docker контейнер если он запущен
+    if command -v docker >/dev/null 2>&1; then
+        if docker ps --filter "name=synapse-admin" --format "{{.Names}}" | grep -q "synapse-admin"; then
+            log "INFO" "Перезапуск Docker контейнера Synapse Admin..."
+            
+            if docker restart synapse-admin; then
+                log "SUCCESS" "Docker контейнер перезапущен"
+                sleep 3
+                
+                # Проверяем статус
+                local container_status=$(docker ps --filter "name=synapse-admin" --format "{{.Status}}" 2>/dev/null)
+                if [ -n "$container_status" ]; then
+                    log "SUCCESS" "Synapse Admin работает: $container_status"
+                else
+                    log "WARN" "Проблемы с контейнером, проверьте логи: docker logs synapse-admin"
+                fi
+            else
+                log "ERROR" "Ошибка перезапуска контейнера"
+            fi
+        fi
+    fi
+    
+    echo
+    safe_echo "${GREEN}✅ Настройка завершена!${NC}"
+    safe_echo "${BLUE}💡 Synapse Admin теперь будет подключаться только к $matrix_url${NC}"
+    safe_echo "${YELLOW}⚠️  Убедитесь, что этот URL доступен из браузера${NC}"
 }
 
 # Главная функция модуля

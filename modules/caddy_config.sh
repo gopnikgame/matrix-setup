@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # Caddy Configuration Module for Matrix Setup
-# Версия: 4.0.0 - Новый подход для хостинга и Proxmox
+# Версия: 4.1.0 - Доработанный подход на основе рабочей конфигурации
 
 # Настройки модуля
 LIB_NAME="Caddy Configuration Manager"
-LIB_VERSION="4.0.0"
+LIB_VERSION="4.1.0"
 MODULE_NAME="caddy_config"
 
 # Подключение общей библиотеки
@@ -55,23 +55,11 @@ get_domain_config() {
         echo "$ELEMENT_DOMAIN" > "$element_domain_file"
     fi
     
-    # Домен Synapse Admin
-    if [[ -f "$admin_domain_file" ]]; then
-        ADMIN_DOMAIN=$(cat "$admin_domain_file")
-    else
-        # Автоматическое определение домена Admin
-        case "$SERVER_TYPE" in
-            "proxmox"|"home_server"|"docker"|"openvz")
-                ADMIN_DOMAIN="admin.${MATRIX_DOMAIN#*.}"
-                ;;
-            *)
-                ADMIN_DOMAIN="admin.${MATRIX_DOMAIN}"
-                ;;
-        esac
-        echo "$ADMIN_DOMAIN" > "$admin_domain_file"
-    fi
+    # Для новой схемы - не используем отдельный домен для админки
+    # Админка будет доступна на /admin основного домена
+    ADMIN_DOMAIN="$MATRIX_DOMAIN"
     
-    log "INFO" "Домены: Matrix=$MATRIX_DOMAIN, Element=$ELEMENT_DOMAIN, Admin=$ADMIN_DOMAIN"
+    log "INFO" "Домены: Matrix=$MATRIX_DOMAIN, Element=$ELEMENT_DOMAIN, Admin=на /admin основного домена"
     export MATRIX_DOMAIN ELEMENT_DOMAIN ADMIN_DOMAIN
     return 0
 }
@@ -84,38 +72,46 @@ detect_ssl_certificates() {
     
     local cert_path=""
     local key_path=""
+    local root_domain="${MATRIX_DOMAIN#*.}"
     
-    # Поиск сертификатов Let's Encrypt
-    local letsencrypt_paths=(
-        "/etc/letsencrypt/live/${MATRIX_DOMAIN}"
-        "/etc/letsencrypt/live/${MATRIX_DOMAIN%.*.*}"
-        "/etc/letsencrypt/live/$(echo "$MATRIX_DOMAIN" | cut -d. -f2-)"
+    # Поиск wildcard сертификатов Cloudflare (приоритет)
+    local cloudflare_paths=(
+        "/etc/letsencrypt/live/${root_domain}"
+        "/etc/ssl/certs"
     )
     
-    for path in "${letsencrypt_paths[@]}"; do
+    for path in "${cloudflare_paths[@]}"; do
         if [[ -f "$path/fullchain.pem" ]] && [[ -f "$path/privkey.pem" ]]; then
             cert_path="$path/fullchain.pem"
             key_path="$path/privkey.pem"
-            log "INFO" "Найдены сертификаты Let's Encrypt: $path"
+            log "INFO" "Найдены wildcard сертификаты: $path"
             break
         fi
     done
     
-    # Если Let's Encrypt не найден, предлагаем установить
+    # Поиск обычных Let's Encrypt сертификатов
     if [[ -z "$cert_path" ]]; then
-        log "WARN" "SSL сертификаты Let's Encrypt не найдены"
-        log "INFO" "Рекомендуется установить certbot и получить SSL сертификаты"
+        local letsencrypt_paths=(
+            "/etc/letsencrypt/live/${MATRIX_DOMAIN}"
+            "/etc/letsencrypt/live/${root_domain}"
+        )
         
-        # Проверяем наличие пользовательских сертификатов
-        if [[ -f "/etc/ssl/certs/wildcard.pem" ]] && [[ -f "/etc/ssl/private/wildcard.key" ]]; then
-            cert_path="/etc/ssl/certs/wildcard.pem"
-            key_path="/etc/ssl/private/wildcard.key"
-            log "INFO" "Найдены пользовательские wildcard сертификаты"
-        else
-            log "ERROR" "SSL сертификаты необходимы для работы Matrix на хостинге"
-            show_ssl_help
-            return 1
-        fi
+        for path in "${letsencrypt_paths[@]}"; do
+            if [[ -f "$path/fullchain.pem" ]] && [[ -f "$path/privkey.pem" ]]; then
+                cert_path="$path/fullchain.pem"
+                key_path="$path/privkey.pem"
+                log "INFO" "Найдены сертификаты Let's Encrypt: $path"
+                break
+            fi
+        done
+    fi
+    
+    # Если сертификаты не найдены
+    if [[ -z "$cert_path" ]]; then
+        log "WARN" "SSL сертификаты не найдены"
+        log "INFO" "Рекомендуется установить wildcard сертификаты Cloudflare"
+        show_ssl_help
+        return 1
     fi
     
     export SSL_CERT_PATH="$cert_path"
@@ -129,7 +125,7 @@ show_ssl_help() {
     
     safe_echo "${BLUE}📋 Для работы Matrix на хостинге необходимы SSL сертификаты${NC}"
     echo
-    safe_echo "${BOLD}Вариант 1: Cloudflare (Бесплатный wildcard)${NC}"
+    safe_echo "${BOLD}Рекомендуемый вариант: Cloudflare wildcard (БЕСПЛАТНО)${NC}"
     safe_echo "${GREEN}1. Получите API токен в Cloudflare:${NC}"
     safe_echo "   • Откройте dash.cloudflare.com"
     safe_echo "   • Профиль → API Tokens → Create Token"
@@ -154,15 +150,6 @@ show_ssl_help() {
     safe_echo "     -d \"*.${MATRIX_DOMAIN#*.}\" \\\\"
     safe_echo "     --register-unsafely-without-email"
     echo
-    safe_echo "${BOLD}Вариант 2: Покупка wildcard сертификата${NC}"
-    safe_echo "${YELLOW}• Стоимость: ~4500 рублей/год${NC}"
-    safe_echo "${YELLOW}• Формат: .pem (если другой - конвертировать)${NC}"
-    safe_echo "${YELLOW}• Размещение:${NC}"
-    safe_echo "   /etc/ssl/certs/wildcard.pem"
-    safe_echo "   /etc/ssl/private/wildcard.key"
-    safe_echo "   sudo chmod 644 /etc/ssl/certs/wildcard.pem"
-    safe_echo "   sudo chmod 600 /etc/ssl/private/wildcard.key"
-    echo
     safe_echo "${RED}⚠️ ВАЖНО: Caddy работает только с .pem сертификатами!${NC}"
 }
 
@@ -174,7 +161,7 @@ detect_backend_addresses() {
             MATRIX_BACKEND="${LOCAL_IP:-192.168.88.165}:8008"
             FEDERATION_BACKEND="${LOCAL_IP:-192.168.88.165}:8448"
             ELEMENT_BACKEND="${LOCAL_IP:-192.168.88.165}:80"
-            ADMIN_BACKEND="${LOCAL_IP:-192.168.88.165}:8081"
+            ADMIN_BACKEND="${LOCAL_IP:-192.168.88.165}:8080"
             log "INFO" "Backend адреса для Proxmox/локального сервера: Matrix=$MATRIX_BACKEND"
             ;;
         *)
@@ -182,7 +169,7 @@ detect_backend_addresses() {
             MATRIX_BACKEND="127.0.0.1:8008"
             FEDERATION_BACKEND="127.0.0.1:8448"
             ELEMENT_BACKEND="127.0.0.1:80"
-            ADMIN_BACKEND="127.0.0.1:8081"
+            ADMIN_BACKEND="127.0.0.1:8080"
             log "INFO" "Backend адреса для хостинга: Matrix=$MATRIX_BACKEND"
             ;;
     esac
@@ -241,7 +228,7 @@ install_caddy() {
 create_hosting_config() {
     print_header "СОЗДАНИЕ КОНФИГУРАЦИИ CADDY ДЛЯ ХОСТИНГА" "$CYAN"
     
-    log "INFO" "Создание конфигурации Caddy для хостинга..."
+    log "INFO" "Создание конфигурации Caddy для хостинга (по образцу рабочей схемы)..."
     
     # Резервная копия существующей конфигурации
     if [[ -f "$CADDY_CONFIG_FILE" ]]; then
@@ -251,21 +238,23 @@ create_hosting_config() {
     # Создание директории для конфигурации
     mkdir -p "$CADDY_CONFIG_DIR"
     
-    # Создание Caddyfile для хостинга
+    local root_domain="${MATRIX_DOMAIN#*.}"
+    
+    # Создание Caddyfile для хостинга по образцу рабочей конфигурации
     cat > "$CADDY_CONFIG_FILE" <<EOF
 # Caddy Configuration for Matrix Server (Hosting)
-# Generated by Matrix Setup Tool v4.0
+# Generated by Matrix Setup Tool v4.1 - Based on working configuration
 # Server Type: $SERVER_TYPE
 # Generated: $(date '+%Y-%m-%d %H:%M:%S')
 
 # Global options
 {
-    email admin@${MATRIX_DOMAIN#*.}
+    email admin@${root_domain}
     default_sni $MATRIX_DOMAIN
 }
 
-# Main Matrix domain with .well-known endpoints
-$MATRIX_DOMAIN {
+# Основной домен с well-known endpoints (на root домене)
+$root_domain {
     tls $SSL_CERT_PATH $SSL_KEY_PATH
 
     # .well-known endpoints for Matrix federation discovery
@@ -284,29 +273,11 @@ $MATRIX_DOMAIN {
         }\` 200
     }
 
-    # Matrix client API and sync
-    handle /_matrix/* {
-        reverse_proxy $MATRIX_BACKEND {
-            header_up Host {upstream_hostport}
-            header_up X-Forwarded-Proto {scheme}
-            header_up X-Forwarded-For {remote_host}
-        }
-    }
-
-    # Security headers
-    header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-        X-Content-Type-Options "nosniff"
-        X-Frame-Options "DENY"
-        X-XSS-Protection "1; mode=block"
-        Referrer-Policy "strict-origin-when-cross-origin"
-    }
-
-    # Default response for main domain
-    respond "Matrix Server is running. Use a Matrix client to connect." 200
+    # Default response
+    respond "Matrix federation endpoints available" 200
 }
 
-# Matrix Federation (port 8448)
+# Matrix Federation (порт 8448)
 $MATRIX_DOMAIN:8448 {
     tls $SSL_CERT_PATH $SSL_KEY_PATH
     
@@ -314,15 +285,41 @@ $MATRIX_DOMAIN:8448 {
         transport http {
             tls_insecure_skip_verify
             keepalive 1h
-            keepalive_idle_conns 10
         }
-        header_up Host {upstream_hostport}
-        header_up X-Forwarded-Proto {scheme}
-        header_up X-Forwarded-For {remote_host}
     }
 }
 
-# Element Web Client
+# Matrix Homeserver - объединенная конфигурация (Matrix API + Synapse Admin)
+$MATRIX_DOMAIN {
+    tls $SSL_CERT_PATH $SSL_KEY_PATH
+
+    # Synapse Admin на /admin (с удалением префикса)
+    route /admin/* {
+        uri strip_prefix /admin
+        reverse_proxy $ADMIN_BACKEND
+    }
+
+    # Matrix API
+    route /_matrix/* {
+        reverse_proxy $MATRIX_BACKEND
+    }
+
+    # Synapse Admin API
+    route /_synapse/* {
+        reverse_proxy $MATRIX_BACKEND
+    }
+
+    # Security headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+    }
+
+    # Default response
+    respond "Matrix Server is running. Access admin at /admin or use a Matrix client." 200
+}
+
+# Element Web Client (отдельный домен)
 $ELEMENT_DOMAIN {
     tls $SSL_CERT_PATH $SSL_KEY_PATH
     
@@ -346,25 +343,6 @@ $ELEMENT_DOMAIN {
         X-XSS-Protection "1; mode=block"
     }
 }
-
-# Synapse Admin Interface
-$ADMIN_DOMAIN {
-    tls $SSL_CERT_PATH $SSL_KEY_PATH
-    
-    reverse_proxy $ADMIN_BACKEND {
-        header_up Host {upstream_hostport}
-        header_up X-Forwarded-Proto {scheme}
-        header_up X-Forwarded-For {remote_host}
-    }
-
-    # Security headers for admin interface
-    header {
-        X-Robots-Tag "noindex, nofollow, noarchive, nosnippet"
-        X-Frame-Options "DENY"
-        Content-Security-Policy "default-src 'self'"
-        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-    }
-}
 EOF
 
     # Проверка синтаксиса конфигурации
@@ -385,22 +363,24 @@ EOF
 generate_proxmox_config() {
     print_header "ГЕНЕРАЦИЯ КОНФИГУРАЦИИ ДЛЯ PROXMOX" "$CYAN"
     
-    log "INFO" "Генерация конфигурации Caddy для Proxmox..."
+    log "INFO" "Генерация конфигурации Caddy для Proxmox (по образцу рабочей схемы)..."
     
     # Создание директории для конфигураций
     mkdir -p "$CONFIG_DIR/proxmox"
+    
+    local root_domain="${MATRIX_DOMAIN#*.}"
     
     # Генерация Caddyfile для хоста Proxmox
     local proxmox_config="$CONFIG_DIR/proxmox/Caddyfile"
     cat > "$proxmox_config" <<EOF
 # Caddy Configuration for Matrix Server (Proxmox Host)
-# Generated by Matrix Setup Tool v4.0
+# Generated by Matrix Setup Tool v4.1 - Based on working configuration
 # Matrix VM IP: $MATRIX_BACKEND
 # Generated: $(date '+%Y-%m-%d %H:%M:%S')
 
-# Matrix Homeserver
-$MATRIX_DOMAIN {
-    tls /etc/letsencrypt/live/${MATRIX_DOMAIN#*.}/fullchain.pem /etc/letsencrypt/live/${MATRIX_DOMAIN#*.}/privkey.pem
+# Основной домен с well-known endpoints (на root домене)
+$root_domain {
+    tls /etc/letsencrypt/live/$root_domain/fullchain.pem /etc/letsencrypt/live/$root_domain/privkey.pem
 
     # .well-known endpoints for Matrix federation discovery
     handle /.well-known/matrix/server {
@@ -418,8 +398,41 @@ $MATRIX_DOMAIN {
         }\` 200
     }
 
-    # Matrix client API
-    reverse_proxy /_matrix/* $MATRIX_BACKEND
+    # Default response
+    respond "Matrix federation endpoints available" 200
+}
+
+# Matrix Federation (порт 8448)
+$MATRIX_DOMAIN:8448 {
+    tls /etc/letsencrypt/live/$root_domain/fullchain.pem /etc/letsencrypt/live/$root_domain/privkey.pem
+    
+    reverse_proxy $FEDERATION_BACKEND {
+        transport http {
+            tls_insecure_skip_verify
+            keepalive 1h
+        }
+    }
+}
+
+# Matrix Homeserver - объединенная конфигурация (Matrix API + Synapse Admin)
+$MATRIX_DOMAIN {
+    tls /etc/letsencrypt/live/$root_domain/fullchain.pem /etc/letsencrypt/live/$root_domain/privkey.pem
+
+    # Synapse Admin на /admin (с удалением префикса)
+    route /admin/* {
+        uri strip_prefix /admin
+        reverse_proxy $ADMIN_BACKEND
+    }
+
+    # Matrix API
+    route /_matrix/* {
+        reverse_proxy $MATRIX_BACKEND
+    }
+
+    # Synapse Admin API
+    route /_synapse/* {
+        reverse_proxy $MATRIX_BACKEND
+    }
 
     # Security headers
     header {
@@ -428,37 +441,22 @@ $MATRIX_DOMAIN {
     }
 
     # Default response
-    respond "Matrix Server is running on Proxmox VM" 200
+    respond "Matrix Server on Proxmox VM. Access admin at /admin or use a Matrix client." 200
 }
 
-# Matrix Federation
-$MATRIX_DOMAIN:8448 {
-    tls /etc/letsencrypt/live/${MATRIX_DOMAIN#*.}/fullchain.pem /etc/letsencrypt/live/${MATRIX_DOMAIN#*.}/privkey.pem
-    
-    reverse_proxy $FEDERATION_BACKEND
-}
-
-# Element Web Client
+# Element Web Client (отдельный домен, если установлен)
 $ELEMENT_DOMAIN {
-    tls /etc/letsencrypt/live/${MATRIX_DOMAIN#*.}/fullchain.pem /etc/letsencrypt/live/${MATRIX_DOMAIN#*.}/privkey.pem
+    tls /etc/letsencrypt/live/$root_domain/fullchain.pem /etc/letsencrypt/live/$root_domain/privkey.pem
     
-    reverse_proxy $ELEMENT_BACKEND
+    reverse_proxy $ELEMENT_BACKEND {
+        header_up Host {upstream_hostport}
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-For {remote_host}
+    }
     
     header {
         X-Frame-Options "SAMEORIGIN"
         X-Content-Type-Options "nosniff"
-    }
-}
-
-# Synapse Admin Interface
-$ADMIN_DOMAIN {
-    tls /etc/letsencrypt/live/${MATRIX_DOMAIN#*.}/fullchain.pem /etc/letsencrypt/live/${MATRIX_DOMAIN#*.}/privkey.pem
-    
-    reverse_proxy $ADMIN_BACKEND
-
-    header {
-        X-Robots-Tag "noindex, nofollow"
-        X-Frame-Options "DENY"
     }
 }
 EOF
@@ -470,7 +468,8 @@ EOF
 
 Дата генерации: $(date '+%Y-%m-%d %H:%M:%S')
 Matrix VM IP: $MATRIX_BACKEND
-Root домен: ${MATRIX_DOMAIN#*.}
+Root домен: $root_domain
+Matrix домен: $MATRIX_DOMAIN
 
 ## 1. УСТАНОВИТЕ CADDY НА ХОСТЕ PROXMOX
 
@@ -492,29 +491,25 @@ sudo cp $proxmox_config /etc/caddy/Caddyfile
 
 ## 3. НАСТРОЙТЕ DNS ЗАПИСИ
 
-Для корневого домена ${MATRIX_DOMAIN#*.} создайте SRV запись для федерации:
+Для корневого домена $root_domain создайте SRV запись для федерации:
 
 Тип записи:    SRV
 Услуга:       _matrix._tcp
-Домен:        $MATRIX_DOMAIN. (с точкой в конце!)
+Домен:        $root_domain. (с точкой в конце!)
 Приоритет:    10
 Вес:          5
 Порт:         8448
 TTL:          3600
 
 Пример для dig проверки:
-dig SRV _matrix._tcp.${MATRIX_DOMAIN#*.} +short
+dig SRV _matrix._tcp.$root_domain +short
 
 Ожидаемый результат:
 10 5 8448 $MATRIX_DOMAIN.
 
-## 4. ПОЛУЧИТЕ SSL СЕРТИФИКАТЫ
+## 4. ПОЛУЧИТЕ SSL СЕРТИФИКАТЫ (РЕКОМЕНДУЕТСЯ WILDCARD CLOUDFLARE)
 
-Вариант A: Let's Encrypt для публичного домена
-sudo apt install certbot
-sudo certbot certonly --standalone -d ${MATRIX_DOMAIN#*.} -d *.${MATRIX_DOMAIN#*.}
-
-Вариант B: Cloudflare (бесплатный wildcard)
+Вариант A: Cloudflare (бесплатный wildcard) - РЕКОМЕНДУЕТСЯ
 sudo apt install python3-certbot-dns-cloudflare
 sudo mkdir -p /etc/cloudflare
 sudo nano /etc/cloudflare/cloudflare.ini
@@ -527,9 +522,13 @@ sudo chmod 600 /etc/cloudflare/cloudflare.ini
 sudo certbot certonly \\\\
   --dns-cloudflare \\\\
   --dns-cloudflare-credentials /etc/cloudflare/cloudflare.ini \\\\
-  -d "${MATRIX_DOMAIN#*.}" \\\\
-  -d "*.${MATRIX_DOMAIN#*.}" \\\\
+  -d "$root_domain" \\\\
+  -d "*.$root_domain" \\\\
   --register-unsafely-without-email
+
+Вариант B: Let's Encrypt для публичного домена
+sudo apt install certbot
+sudo certbot certonly --standalone -d $root_domain -d $MATRIX_DOMAIN -d $ELEMENT_DOMAIN
 
 ## 5. ЗАПУСТИТЕ CADDY
 
@@ -540,7 +539,8 @@ sudo systemctl status caddy
 ## 6. ПРОВЕРЬТЕ РАБОТУ
 
 curl -I https://$MATRIX_DOMAIN
-curl https://$MATRIX_DOMAIN/.well-known/matrix/server
+curl https://$root_domain/.well-known/matrix/server
+curl https://$MATRIX_DOMAIN/admin
 
 ## 7. НАСТРОЙКА ФАЙРВОЛА НА ХОСТЕ
 
@@ -553,15 +553,25 @@ sudo ufw allow 8448/tcp
 1. IP адрес VM: $MATRIX_BACKEND
 2. Убедитесь что Matrix VM доступна с хоста по этому IP
 3. Проверьте что на VM запущен Matrix Synapse на порту 8008
-4. Настройте переадресацию портов в сети Proxmox если необходимо
+4. Synapse Admin доступен на порту 8080 VM
+5. Админка будет доступна по адресу: https://$MATRIX_DOMAIN/admin
+
+## ДОСТУП К СЕРВИСАМ:
+
+- Matrix API: https://$MATRIX_DOMAIN/_matrix/...
+- Synapse Admin: https://$MATRIX_DOMAIN/admin
+- Element Web: https://$ELEMENT_DOMAIN (если установлен)
+- Federation: https://$MATRIX_DOMAIN:8448
 
 ## ДИАГНОСТИКА ПРОБЛЕМ:
 
 - Логи Caddy: sudo journalctl -u caddy -f
 - Проверка портов: sudo ss -tlnp | grep -E ':(80|443|8448)'
 - Проверка доступности VM: curl http://$MATRIX_BACKEND/_matrix/client/versions
+- Проверка админки: curl http://$ADMIN_BACKEND
 - Проверка DNS: dig $MATRIX_DOMAIN
-- Проверка федерации: curl https://$MATRIX_DOMAIN/.well-known/matrix/server
+- Проверка федерации: curl https://$root_domain/.well-known/matrix/server
+- Проверка SRV: dig SRV _matrix._tcp.$root_domain +short
 EOF
 
     log "SUCCESS" "Конфигурация для Proxmox сгенерирована:"
@@ -589,18 +599,24 @@ show_proxmox_config() {
     safe_echo "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
     echo
     
+    local root_domain="${MATRIX_DOMAIN#*.}"
+    
     safe_echo "${YELLOW}📝 ВАЖНЫЕ ИНСТРУКЦИИ:${NC}"
     safe_echo "1. ${BOLD}DNS SRV запись:${NC}"
-    safe_echo "   Тип: SRV | Услуга: _matrix._tcp | Домен: $MATRIX_DOMAIN."
+    safe_echo "   Тип: SRV | Услуга: _matrix._tcp | Домен: $root_domain."
     safe_echo "   Приоритет: 10 | Вес: 5 | Порт: 8448 | TTL: 3600"
-    safe_echo "   Пример: _matrix._tcp.${MATRIX_DOMAIN#*.} "
-    safe_echo "   Ожидаемый результат: 10 5 8448 $MATRIX_DOMAIN."
     echo
     safe_echo "2. ${BOLD}Проверка SRV записи:${NC}"
-    safe_echo "   dig SRV _matrix._tcp.${MATRIX_DOMAIN#*.} +short"
+    safe_echo "   dig SRV _matrix._tcp.$root_domain +short"
     safe_echo "   Ожидаемый результат: 10 5 8448 $MATRIX_DOMAIN."
     echo
-    safe_echo "3. ${BOLD}IP адрес Matrix VM:${NC} $MATRIX_BACKEND"
+    safe_echo "3. ${BOLD}Доступ к сервисам:${NC}"
+    safe_echo "   • Matrix API: https://$MATRIX_DOMAIN/_matrix/..."
+    safe_echo "   • Synapse Admin: https://$MATRIX_DOMAIN/admin"
+    safe_echo "   • Element Web: https://$ELEMENT_DOMAIN"
+    safe_echo "   • Federation: https://$MATRIX_DOMAIN:8448"
+    echo
+    safe_echo "4. ${BOLD}IP адрес Matrix VM:${NC} $MATRIX_BACKEND"
     echo
     
     # Показываем инструкции
@@ -677,10 +693,12 @@ test_caddy_configuration() {
     done
     
     # Проверка доступности endpoints
+    local root_domain="${MATRIX_DOMAIN#*.}"
     local endpoints=(
         "http://localhost/.well-known/matrix/server"
         "http://localhost/.well-known/matrix/client"
         "http://localhost/_matrix/client/versions"
+        "http://localhost/admin"
     )
     
     log "INFO" "Ожидание готовности Caddy..."
@@ -799,7 +817,7 @@ show_caddy_status() {
     echo "Настроенные домены:"
     echo "  Matrix сервер: ${MATRIX_DOMAIN:-не определен}"
     echo "  Element Web: ${ELEMENT_DOMAIN:-не определен}"
-    echo "  Synapse Admin: ${ADMIN_DOMAIN:-не определен}"
+    echo "  Synapse Admin: на /admin основного домена"
     
     # Backend адреса
     echo
@@ -845,22 +863,24 @@ show_caddy_status() {
 show_srv_instructions() {
     print_header "НАСТРОЙКА SRV ЗАПИСИ ДЛЯ ФЕДЕРАЦИИ" "$YELLOW"
     
+    local root_domain="${MATRIX_DOMAIN#*.}"
+    
     safe_echo "${BLUE}📋 Для корректной работы федерации Matrix необходимо создать SRV запись${NC}"
     echo
     safe_echo "${BOLD}Параметры SRV записи:${NC}"
     safe_echo "   ${GREEN}Тип записи:${NC}    SRV"
     safe_echo "   ${GREEN}Услуга:${NC}        _matrix._tcp"
-    safe_echo "   ${GREEN}Домен:${NC}         $MATRIX_DOMAIN. ${RED}(обязательно с точкой в конце!)${NC}"
+    safe_echo "   ${GREEN}Домен:${NC}         $root_domain. ${RED}(обязательно с точкой в конце!)${NC}"
     safe_echo "   ${GREEN}Приоритет:${NC}     10"
     safe_echo "   ${GREEN}Вес:${NC}           5"
     safe_echo "   ${GREEN}Порт:${NC}          8448"
     safe_echo "   ${GREEN}TTL:${NC}           3600 (или значение по умолчанию)"
     echo
     safe_echo "${BOLD}Пример записи:${NC}"
-    safe_echo "${CYAN}_matrix._tcp.${MATRIX_DOMAIN#*.}. 3600 IN SRV 10 5 8448 $MATRIX_DOMAIN.${NC}"
+    safe_echo "${CYAN}_matrix._tcp.$root_domain. 3600 IN SRV 10 5 8448 $MATRIX_DOMAIN.${NC}"
     echo
     safe_echo "${BOLD}Проверка работы:${NC}"
-    safe_echo "${YELLOW}dig SRV _matrix._tcp.${MATRIX_DOMAIN#*.} +short${NC}"
+    safe_echo "${YELLOW}dig SRV _matrix._tcp.$root_domain +short${NC}"
     echo
     safe_echo "${BOLD}Ожидаемый результат:${NC}"
     safe_echo "${GREEN}10 5 8448 $MATRIX_DOMAIN.${NC}"
@@ -870,7 +890,7 @@ show_srv_instructions() {
 
 # Главная функция настройки Caddy
 main() {
-    print_header "НАСТРОЙКА CADDY ДЛЯ MATRIX" "$BLUE"
+    print_header "НАСТРОЙКА CADDY ДЛЯ MATRIX (v4.1)" "$BLUE"
     
     # Проверка прав root
     check_root || return 1
@@ -897,9 +917,12 @@ main() {
             test_caddy_configuration
             
             print_header "CADDY НАСТРОЕН ДЛЯ ХОСТИНГА!" "$GREEN"
-            safe_echo "${GREEN}✅ Caddy установлен и настроен${NC}"
+            safe_echo "${GREEN}✅ Caddy установлен и настроен по новой схеме${NC}"
             safe_echo "${BLUE}📋 Конфигурация: $CADDY_CONFIG_FILE${NC}"
-            safe_echo "${BLUE}📋 SSL: ${SSL_CERT_PATH}${NC}"
+            safe_echo "${BLUE}🔐 SSL: ${SSL_CERT_PATH}${NC}"
+            safe_echo "${BLUE}🌐 Matrix API: https://$MATRIX_DOMAIN/_matrix/...${NC}"
+            safe_echo "${BLUE}⚙️  Synapse Admin: https://$MATRIX_DOMAIN/admin${NC}"
+            safe_echo "${BLUE}🔗 Element Web: https://$ELEMENT_DOMAIN${NC}"
             ;;
             
         "proxmox"|"home_server"|"docker"|"openvz")
@@ -909,9 +932,11 @@ main() {
             show_srv_instructions
             
             print_header "КОНФИГУРАЦИЯ ДЛЯ PROXMOX ГОТОВА!" "$GREEN"
-            safe_echo "${GREEN}✅ Конфигурация сгенерирована${NC}"
+            safe_echo "${GREEN}✅ Конфигурация сгенерирована по новой схеме${NC}"
             safe_echo "${BLUE}📋 Скопируйте конфигурацию на хост Proxmox${NC}"
             safe_echo "${BLUE}📋 Создайте SRV запись в DNS${NC}"
+            safe_echo "${BLUE}🌐 Matrix API: https://$MATRIX_DOMAIN/_matrix/...${NC}"
+            safe_echo "${BLUE}⚙️  Synapse Admin: https://$MATRIX_DOMAIN/admin${NC}"
             ;;
             
         *)
@@ -924,20 +949,24 @@ main() {
     set_config_value "$CONFIG_DIR/caddy.conf" "CADDY_CONFIGURED" "true"
     set_config_value "$CONFIG_DIR/caddy.conf" "CADDY_CONFIG_DATE" "$(date '+%Y-%m-%d %H:%M:%S')"
     set_config_value "$CONFIG_DIR/caddy.conf" "SERVER_TYPE" "$SERVER_TYPE"
+    set_config_value "$CONFIG_DIR/caddy.conf" "CONFIG_VERSION" "4.1"
     
     echo
     safe_echo "${YELLOW}📝 Следующие шаги:${NC}"
     if [[ "$SERVER_TYPE" == "hosting" ]]; then
         safe_echo "   1. Убедитесь, что Matrix Synapse запущен на порту 8008"
-        safe_echo "   2. Настройте DNS записи для всех доменов"
-        safe_echo "   3. Проверьте доступность: https://$MATRIX_DOMAIN"
-        safe_echo "   4. Создайте SRV запись для федерации (см. выше)"
+        safe_echo "   2. Убедитесь, что Synapse Admin запущен на порту 8080"
+        safe_echo "   3. Настройте DNS записи для всех доменов"
+        safe_echo "   4. Проверьте доступность: https://$MATRIX_DOMAIN"
+        safe_echo "   5. Протестируйте админку: https://$MATRIX_DOMAIN/admin"
+        safe_echo "   6. Создайте SRV запись для федерации"
     else
         safe_echo "   1. Установите Caddy на хост Proxmox"
         safe_echo "   2. Скопируйте сгенерированную конфигурацию"
-        safe_echo "   3. Получите SSL сертификаты для домена"
+        safe_echo "   3. Получите SSL сертификаты (рекомендуется wildcard Cloudflare)"
         safe_echo "   4. Создайте SRV запись в DNS"
         safe_echo "   5. Запустите Caddy на хосте"
+        safe_echo "   6. Проверьте доступность Matrix API и админки"
     fi
     
     return 0
