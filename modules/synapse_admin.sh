@@ -133,7 +133,7 @@ check_installed_version() {
     fi
 }
 
-# Установка Synapse Admin из готовой сборки
+# Установку Synapse Admin из готовой сборки
 install_prebuilt() {
     print_header "УСТАНОВКА SYNAPSE ADMIN (ГОТОВАЯ СБОРКА)" "$GREEN"
     
@@ -189,6 +189,17 @@ install_prebuilt() {
 install_docker() {
     print_header "УСТАНОВКА SYNAPSE ADMIN (DOCKER)" "$BLUE"
     
+    # Проверяем и останавливаем существующие контейнеры
+    if docker ps -q --filter "name=synapse-admin" >/dev/null 2>&1; then
+        log "INFO" "Остановка существующего контейнера..."
+        docker stop synapse-admin >/dev/null 2>&1 || true
+    fi
+    
+    if docker ps -aq --filter "name=synapse-admin" >/dev/null 2>&1; then
+        log "INFO" "Удаление старого контейнера..."
+        docker rm synapse-admin >/dev/null 2>&1 || true
+    fi
+    
     # Проверяем наличие Docker
     if ! command -v docker >/dev/null 2>&1; then
         log "ERROR" "Docker не установлен"
@@ -209,14 +220,37 @@ install_docker() {
         fi
     fi
     
+    # Проверяем Docker окружение
+    if ! check_docker_environment; then
+        log "ERROR" "Проблемы с Docker окружением"
+        return 1
+    fi
+    
+    # Создаем конфигурационный файл если он не существует
+    if [ ! -f "$ADMIN_CONFIG_FILE" ]; then
+        log "INFO" "Создание базового конфигурационного файла..."
+        if ! create_config "auto"; then
+            log "ERROR" "Не удалось создать конфигурацию"
+            return 1
+        fi
+    else
+        log "INFO" "Используется существующий конфигурационный файл"
+    fi
+    
+    # Проверяем корректность конфигурации
+    if ! validate_config; then
+        log "ERROR" "Некорректная конфигурация"
+        return 1
+    fi
+    
     # Определяем порты в зависимости от типа сервера
     local docker_ports
     if [[ "$SERVER_TYPE" == "proxmox" ]] || [[ "$SERVER_TYPE" == "home_server" ]]; then
-        # Для локальных VPS привязываемся к 0.0.0.0 для доступа с хоста
+        # Для локальных VPS привязываем к 0.0.0.0 для доступа с хоста
         docker_ports="0.0.0.0:8080:80"
         log "INFO" "Настройка для локальной VPS - Synapse Admin будет доступен на всех интерфейсах"
     else
-        # Для хостинга привязываемся только к localhost
+        # Для хостинга привязываем только к localhost
         docker_ports="127.0.0.1:8080:80"
         log "INFO" "Настройка для хостинга - Synapse Admin будет доступен только локально"
     fi
@@ -254,17 +288,54 @@ EOF
     
     cd "$(dirname "$DOCKER_COMPOSE_FILE")" || return 1
     
+    # Пробуем запустить контейнер
+    log "DEBUG" "Выполнение: docker-compose -f $DOCKER_COMPOSE_FILE up -d"
+    
     if docker-compose -f "$DOCKER_COMPOSE_FILE" up -d; then
-        log "SUCCESS" "Synapse Admin запущен через Docker"
+        # Ждем немного чтобы контейнер запустился
+        sleep 5
         
-        if [[ "$SERVER_TYPE" == "proxmox" ]] || [[ "$SERVER_TYPE" == "home_server" ]]; then
-            log "INFO" "Доступен по адресу: http://${LOCAL_IP:-localhost}:8080"
-            log "INFO" "Для доступа с хоста Proxmox используйте: http://${LOCAL_IP}:8080"
+        # Проверяем статус контейнера
+        local container_status=$(docker ps --filter "name=synapse-admin" --format "{{.Status}}" 2>/dev/null)
+        
+        if [ -n "$container_status" ]; then
+            log "SUCCESS" "Synapse Admin запущен через Docker"
+            log "INFO" "Статус контейнера: $container_status"
+            
+            if [[ "$SERVER_TYPE" == "proxmox" ]] || [[ "$SERVER_TYPE" == "home_server" ]]; then
+                log "INFO" "Доступен по адресу: http://${LOCAL_IP:-localhost}:8080"
+                log "INFO" "Для доступа с хоста Proxmox используйте: http://${LOCAL_IP}:8080"
+            else
+                log "INFO" "Доступен по адресу: http://localhost:8080"
+            fi
+            
+            # Тестируем доступность
+            log "INFO" "Тестирование доступности..."
+            sleep 3
+            
+            local test_url="http://localhost:8080"
+            local response_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 10 "$test_url" 2>/dev/null || echo "000")
+            
+            if [[ "$response_code" == "200" ]] || [[ "$response_code" == "404" ]] || [[ "$response_code" == "302" ]]; then
+                log "SUCCESS" "Synapse Admin отвечает на запросы (HTTP $response_code)"
+            else
+                log "WARN" "Synapse Admin не отвечает (HTTP $response_code)"
+                log "INFO" "Проверьте логи: docker logs synapse-admin"
+            fi
         else
-            log "INFO" "Доступен по адресу: http://localhost:8080"
+            log "ERROR" "Контейнер не запустился"
+            log "INFO" "Проверьте логи: docker logs synapse-admin"
+            return 1
         fi
     else
         log "ERROR" "Ошибка запуска Docker контейнера"
+        log "INFO" "Проверьте логи: docker-compose -f $DOCKER_COMPOSE_FILE logs"
+        
+        # Показываем логи для диагностики
+        echo
+        log "INFO" "Логи Docker Compose:"
+        docker-compose -f "$DOCKER_COMPOSE_FILE" logs --tail=20
+        
         return 1
     fi
     
@@ -317,6 +388,24 @@ install_docker_compose() {
 # Создание конфигурационного файла
 create_config() {
     print_header "СОЗДАНИЕ КОНФИГУРАЦИИ SYNAPSE ADMIN" "$CYAN"
+    
+    # Если функция вызвана с параметром "auto", создаем базовую конфигурацию
+    if [[ "$1" == "auto" ]]; then
+        log "INFO" "Создание базовой конфигурации по умолчанию..."
+        
+        mkdir -p "$(dirname "$ADMIN_CONFIG_FILE")"
+        
+        cat > "$ADMIN_CONFIG_FILE" <<EOF
+{
+  "defaultTheme": "auto",
+  "developmentMode": false,
+  "locale": "ru"
+}
+EOF
+        
+        log "SUCCESS" "Базовый конфигурационный файл создан: $ADMIN_CONFIG_FILE"
+        return 0
+    fi
     
     echo
     safe_echo "${BOLD}${CYAN}Настройка ограничений homeserver:${NC}"
@@ -394,6 +483,38 @@ EOF
     return 0
 }
 
+# Проверка конфигурационного файла
+validate_config() {
+    if [ ! -f "$ADMIN_CONFIG_FILE" ]; then
+        log "ERROR" "Конфигурационный файл не найден: $ADMIN_CONFIG_FILE"
+        return 1
+    fi
+    
+    # Проверяем синтаксис JSON
+    if command -v python3 >/dev/null 2>&1; then
+        if ! python3 -m json.tool "$ADMIN_CONFIG_FILE" >/dev/null 2>&1; then
+            log "ERROR" "Неверный синтаксис JSON в конфигурационном файле"
+            return 1
+        fi
+    elif command -v jq >/dev/null 2>&1; then
+        if ! jq . "$ADMIN_CONFIG_FILE" >/dev/null 2>&1; then
+            log "ERROR" "Неверный синтаксис JSON в конфигурационном файле"
+            return 1
+        fi
+    else
+        log "WARN" "Не удалось проверить синтаксис JSON (нет python3 или jq)"
+    fi
+    
+    # Проверяем права доступа
+    if [ ! -r "$ADMIN_CONFIG_FILE" ]; then
+        log "ERROR" "Нет прав на чтение конфигурационного файла"
+        return 1
+    fi
+    
+    log "SUCCESS" "Конфигурационный файл корректен"
+    return 0
+}
+
 # Показ главного меню
 show_main_menu() {
     while true; do
@@ -408,10 +529,11 @@ show_main_menu() {
         safe_echo "${GREEN}5.${NC} Тестировать доступность"
         safe_echo "${GREEN}6.${NC} Обновить до последней версии"
         safe_echo "${GREEN}7.${NC} Удалить Synapse Admin"
-        safe_echo "${GREEN}8.${NC} Вернуться в главное меню"
+        safe_echo "${GREEN}8.${NC} Просмотр логов Docker"
+        safe_echo "${GREEN}9.${NC} Вернуться в главное меню"
         echo
         
-        read -p "$(safe_echo "${YELLOW}Выберите опцию [1-8]: ${NC}")" choice
+        read -p "$(safe_echo "${YELLOW}Выберите опцию [1-9]: ${NC}")" choice
         
         case $choice in
             1)
@@ -449,6 +571,10 @@ show_main_menu() {
                 read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
                 ;;
             8)
+                show_docker_logs
+                read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+                ;;
+            9)
                 log "INFO" "Возврат в главное меню"
                 return 0
                 ;;
@@ -585,6 +711,48 @@ test_accessibility() {
     return 0
 }
 
+# Проверка Docker окружения
+check_docker_environment() {
+    log "INFO" "Проверка Docker окружения..."
+    
+    # Проверяем статус Docker daemon
+    if ! docker info >/dev/null 2>&1; then
+        log "ERROR" "Docker daemon не запущен"
+        log "INFO" "Попытка запуска Docker..."
+        systemctl start docker
+        sleep 3
+        
+        if ! docker info >/dev/null 2>&1; then
+            log "ERROR" "Не удалось запустить Docker daemon"
+            return 1
+        fi
+    fi
+    
+    # Проверяем свободное место
+    local free_space=$(df /var/lib/docker 2>/dev/null | tail -1 | awk '{print $4}' || echo "0")
+    if [ "$free_space" -lt 1048576 ]; then  # Меньше 1GB
+        log "WARN" "Мало свободного места для Docker: $(( free_space / 1024 ))MB"
+    fi
+    
+    # Проверяем доступность порта
+    if netstat -tlnp 2>/dev/null | grep -q ":8080 "; then
+        log "WARN" "Порт 8080 уже используется"
+        local process=$(netstat -tlnp 2>/dev/null | grep ":8080 " | awk '{print $7}')
+        log "INFO" "Процесс использующий порт: ${process:-неизвестен}"
+        
+        if ask_confirmation "Попробовать остановить процесс?"; then
+            local pid=$(echo "$process" | cut -d'/' -f1)
+            if [ -n "$pid" ] && [ "$pid" != "-" ]; then
+                kill "$pid" 2>/dev/null || true
+                sleep 2
+            fi
+        fi
+    fi
+    
+    log "SUCCESS" "Docker окружение готово"
+    return 0
+}
+
 # Удаление Synapse Admin
 uninstall() {
     print_header "УДАЛЕНИЕ SYNAPSE ADMIN" "$RED"
@@ -596,11 +764,30 @@ uninstall() {
         return 0
     fi
     
-    # Останавливаем Docker контейнер
-    if [ -f "$DOCKER_COMPOSE_FILE" ]; then
-        log "INFO" "Остановка Docker контейнера..."
-        docker-compose -f "$DOCKER_COMPOSE_FILE" down 2>/dev/null || true
-        rm -f "$DOCKER_COMPOSE_FILE"
+    # Останавливаем и удаляем Docker контейнер
+    if command -v docker >/dev/null 2>&1; then
+        if docker ps -q --filter "name=synapse-admin" >/dev/null 2>&1; then
+            log "INFO" "Остановка Docker контейнера..."
+            docker stop synapse-admin >/dev/null 2>&1 || true
+        fi
+        
+        if docker ps -aq --filter "name=synapse-admin" >/dev/null 2>&1; then
+            log "INFO" "Удаление Docker контейнера..."
+            docker rm synapse-admin >/dev/null 2>&1 || true
+        fi
+        
+        # Удаляем Docker Compose файл
+        if [ -f "$DOCKER_COMPOSE_FILE" ]; then
+            log "INFO" "Остановка через Docker Compose..."
+            docker-compose -f "$DOCKER_COMPOSE_FILE" down >/dev/null 2>&1 || true
+            rm -f "$DOCKER_COMPOSE_FILE"
+        fi
+        
+        # Удаляем сеть если она пустая
+        if docker network ls --filter "name=synapse-admin-network" --format "{{.Name}}" | grep -q "synapse-admin-network"; then
+            log "INFO" "Удаление Docker сети..."
+            docker network rm synapse-admin-network >/dev/null 2>&1 || true
+        fi
     fi
     
     # Удаляем файлы
@@ -612,10 +799,68 @@ uninstall() {
         rm -rf "$SYNAPSE_ADMIN_DIR"
     fi
     
+    # Удаляем конфигурационный файл
+    if [ -f "$ADMIN_CONFIG_FILE" ]; then
+        log "INFO" "Удаление конфигурационного файла..."
+        rm -f "$ADMIN_CONFIG_FILE"
+    fi
+    
     # Удаляем сохраненный домен
     rm -f "$CONFIG_DIR/admin_domain"
     
     log "SUCCESS" "Synapse Admin удален"
+}
+
+# Просмотр логов Docker контейнера
+show_docker_logs() {
+    print_header "ЛОГИ SYNAPSE ADMIN DOCKER" "$BLUE"
+    
+    if ! command -v docker >/dev/null 2>&1; then
+        log "ERROR" "Docker не установлен"
+        return 1
+    fi
+    
+    local container_name="synapse-admin"
+    
+    # Проверяем существование контейнера
+    if ! docker ps -a --filter "name=$container_name" --format "{{.Names}}" | grep -q "^$container_name$"; then
+        log "ERROR" "Контейнер '$container_name' не найден"
+        return 1
+    fi
+    
+    # Показываем информацию о контейнере
+    echo
+    safe_echo "${BOLD}${CYAN}Информация о контейнере:${NC}"
+    
+    local container_status=$(docker ps -a --filter "name=$container_name" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}")
+    echo "$container_status"
+    
+    echo
+    safe_echo "${BOLD}${CYAN}Последние 50 строк логов:${NC}"
+    echo "────────────────────────────────────────"
+    
+    docker logs --tail=50 --timestamps "$container_name" 2>&1 || {
+        log "ERROR" "Не удалось получить логи контейнера"
+        return 1
+    }
+    
+    echo "────────────────────────────────────────"
+    echo
+    
+    if ask_confirmation "Показать полные логи?"; then
+        echo
+        safe_echo "${BOLD}${CYAN}Полные логи контейнера:${NC}"
+        echo "────────────────────────────────────────"
+        docker logs --timestamps "$container_name" 2>&1
+        echo "────────────────────────────────────────"
+    fi
+    
+    if ask_confirmation "Следить за логами в реальном времени?"; then
+        echo
+        safe_echo "${BOLD}${CYAN}Логи в реальном времени (нажмите Ctrl+C для выхода):${NC}"
+        echo "────────────────────────────────────────"
+        docker logs -f --timestamps "$container_name" 2>&1
+    fi
 }
 
 # Главная функция модуля
