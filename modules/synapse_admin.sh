@@ -564,7 +564,7 @@ clean_conflicting_paths() {
         # Создаем директорию для нового конфига если нужно
         mkdir -p "$(dirname "$ADMIN_CONFIG_FILE")"
         
-        # Перемещаем старый конфиг
+        # Перемещаем старый конфига
         mv "$old_config_path" "$ADMIN_CONFIG_FILE"
         log "SUCCESS" "Конфигурация перемещена в правильное место: $ADMIN_CONFIG_FILE"
     fi
@@ -1040,3 +1040,18 @@ migrate_config() {
         fi
     fi
 }
+
+# Главная функция модуля
+main() {
+    # Загружаем конфигурацию Matrix
+    load_matrix_config
+    
+    # Создаем необходимые директории
+    mkdir -p "$CONFIG_DIR"
+    
+    # Запускаем главное меню
+    show_main_menu
+}
+
+# Запуск функции main при любом способе выполнения скрипта
+main "$@"
