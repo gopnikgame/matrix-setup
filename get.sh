@@ -242,6 +242,7 @@ verify_installation() {
         "$INSTALL_DIR/modules/synapse_admin.sh"
         "$INSTALL_DIR/modules/federation_control.sh"
         "$INSTALL_DIR/modules/registration_control.sh"
+        "$INSTALL_DIR/modules/registration_mas.sh"
         "$INSTALL_DIR/modules/ufw_config.sh"
     )
     
@@ -315,6 +316,14 @@ show_installation_info() {
     safe_echo "   4. Следуйте инструкциям мастера установки"
     echo
     
+    safe_echo "${BOLD}🔑 Новые возможности v3.0:${NC}"
+    safe_echo "   ${GREEN}✨ Matrix Authentication Service (MAS)${NC} - современная OAuth2/OIDC аутентификация"
+    safe_echo "   ${GREEN}✨ Element X поддержка${NC} - полная совместимость с новым мобильным клиентом"
+    safe_echo "   ${GREEN}✨ Автоматическое определение типа сервера${NC} - адаптация под Proxmox/VPS"
+    safe_echo "   ${GREEN}✨ Умное управление портами${NC} - избегание конфликтов"
+    safe_echo "   ${GREEN}✨ Встроенная диагностика${NC} - автоматическое устранение проблем"
+    echo
+    
     safe_echo "${BOLD}🆘 Поддержка:${NC}"
     safe_echo "   GitHub: https://github.com/gopnikgame/matrix-setup"
     safe_echo "   Issues: https://github.com/gopnikgame/matrix-setup/issues"
@@ -341,6 +350,28 @@ show_installation_info() {
         echo
         safe_echo "${YELLOW}💡 Рекомендуется устранить предупреждения перед установкой Matrix${NC}"
     fi
+    
+    # Информация о компонентах
+    echo
+    safe_echo "${BOLD}${CYAN}📦 Доступные компоненты:${NC}"
+    safe_echo "${BOLD}Основные:${NC}"
+    safe_echo "   • Matrix Synapse - основной сервер Matrix"
+    safe_echo "   • PostgreSQL - база данных"
+    safe_echo "   • Element Web - современный веб-клиент"
+    echo
+    safe_echo "${BOLD}Дополнительные:${NC}"
+    safe_echo "   • ${CYAN}Matrix Authentication Service (MAS)${NC} - OAuth2/OIDC аутентификация"
+    safe_echo "   • Coturn TURN Server - VoIP звонки через NAT/firewall"
+    safe_echo "   • Synapse Admin - веб-интерфейс администрирования"
+    safe_echo "   • Reverse Proxy (Caddy) - SSL и проксирование"
+    safe_echo "   • Registration Control - управление регистрацией"
+    safe_echo "   • Federation Control - управление федерацией"
+    safe_echo "   • UFW Firewall - настройка безопасности"
+    echo
+    safe_echo "${BOLD}${BLUE}🎯 Рекомендуется сначала установить:${NC}"
+    safe_echo "   1. Matrix Synapse (основная установка)"
+    safe_echo "   2. Element Web (веб-клиент)"
+    safe_echo "   3. ${CYAN}Matrix Authentication Service (MAS)${NC} - для Element X поддержки"
     
     echo
     safe_echo "${GREEN}Готово! Удачной установки! 🎉${NC}"

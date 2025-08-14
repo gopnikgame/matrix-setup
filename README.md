@@ -11,6 +11,7 @@
 - **Element Web** - современный веб-клиент
 
 #### Дополнительные компоненты:
+- **Matrix Authentication Service (MAS)** - современная OAuth2/OIDC аутентификация
 - **Coturn TURN Server** - для надежных VoIP звонков через NAT/firewall
 - **Synapse Admin** - веб-интерфейс администрирования
 - **Reverse Proxy** - поддержка Caddy
@@ -50,7 +51,11 @@ matrix-setup/
 │   ├── synapse_admin.sh        # Установка Synapse Admin
 │   ├── federation_control.sh   # Управление федерацией
 │   ├── registration_control.sh # Управление регистрацией
+│   ├── registration_mas.sh     # Matrix Authentication Service (MAS)
 │   └── ufw_config.sh           # Настройка файрвола
+├── docs/
+│   ├── mas-deployment-guide.md # Руководство по развертыванию MAS
+│   └── ...                     # Другие руководства
 ├── manager-matrix.sh           # Главный скрипт управления
 ├── get.sh                      # Скрипт быстрой установки
 └── README.md                   # Документация

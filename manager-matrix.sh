@@ -1127,7 +1127,7 @@ initialize() {
     mkdir -p "$LOG_DIR"
     
     # Проверка наличия модулей
-    local required_modules=("core_install" "element_web" "coturn_setup" "caddy_config" "synapse_admin" "federation_control" "registration_control" "ufw_config")
+    local required_modules=("core_install" "element_web" "coturn_setup" "caddy_config" "synapse_admin" "federation_control" "registration_control" "registration_mas" "ufw_config")
     local missing_modules=()
     
     for module in "${required_modules[@]}"; do
@@ -1161,10 +1161,11 @@ manage_additional_components() {
         safe_echo "${GREEN}4.${NC} 🌍 Управление федерацией"
         safe_echo "${GREEN}5.${NC} 🔒 Настройка файрвола (UFW)"
         safe_echo "${GREEN}6.${NC} 🔧 Настройка Reverse Proxy (Caddy)"
-        safe_echo "${GREEN}7.${NC} Назад в главное меню"
+        safe_echo "${GREEN}7.${NC} 🔑 Matrix Authentication Service (MAS)"
+        safe_echo "${GREEN}8.${NC} Назад в главное меню"
         
         echo
-        read -p "$(safe_echo "${YELLOW}Выберите действие (1-7): ${NC}")" choice
+        read -p "$(safe_echo "${YELLOW}Выберите действие (1-8): ${NC}")" choice
         
         case $choice in
             1) run_module "coturn_setup" ;;
@@ -1173,14 +1174,15 @@ manage_additional_components() {
             4) run_module "federation_control" ;;
             5) run_module "ufw_config" ;;
             6) run_module "caddy_config" ;;
-            7) return 0 ;;
+            7) run_module "registration_mas" ;;
+            8) return 0 ;;
             *)
                 log "ERROR" "Неверный выбор"
                 sleep 1
                 ;;
         esac
         
-        if [ $choice -ne 7 ]; then
+        if [ $choice -ne 8 ]; then
             read -p "Нажмите Enter для продолжения..."
         fi
     done
