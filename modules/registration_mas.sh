@@ -138,7 +138,7 @@ setup_mas_database() {
         return 1
     fi
     
-    # Получаем пароль пользователя synapse_user
+    # Получаем пароль пользователя synapse_user (НЕ matrix-synapse!)
     local db_password=""
     if [ -f "$CONFIG_DIR/database.conf" ]; then
         db_password=$(grep "DB_PASSWORD=" "$CONFIG_DIR/database.conf" | cut -d'=' -f2 | tr -d '"')
@@ -146,8 +146,21 @@ setup_mas_database() {
     
     if [ -z "$db_password" ]; then
         log "ERROR" "Не найден пароль базы данных в $CONFIG_DIR/database.conf"
+        log "INFO" "Убедитесь, что основная установка Matrix завершена успешно"
         return 1
     fi
+    
+    # Проверяем, существует ли пользователь synapse_user
+    local user_exists=$(sudo -u postgres psql -t -c "SELECT 1 FROM pg_roles WHERE rolname='synapse_user'" | grep -c 1)
+    
+    if [ "$user_exists" -eq 0 ]; then
+        log "ERROR" "Пользователь базы данных 'synapse_user' не существует"
+        log "INFO" "Необходимо сначала запустить основную установку Matrix (core_install.sh)"
+        log "INFO" "Этот пользователь создается автоматически в процессе основной установки"
+        return 1
+    fi
+    
+    log "SUCCESS" "Пользователь базы данных 'synapse_user' найден"
     
     # Проверяем, существует ли база данных MAS
     local db_exists=$(sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -w "$MAS_DB_NAME" | wc -l)
@@ -155,6 +168,7 @@ setup_mas_database() {
     if [ "$db_exists" -eq 0 ]; then
         log "INFO" "Создание базы данных $MAS_DB_NAME..."
         
+        # Создаем базу данных с владельцем synapse_user (НЕ matrix-synapse!)
         if ! sudo -u postgres createdb --encoding=UTF8 --locale=C --template=template0 --owner=synapse_user "$MAS_DB_NAME"; then
             log "ERROR" "Не удалось создать базу данных $MAS_DB_NAME"
             return 1
@@ -165,14 +179,15 @@ setup_mas_database() {
         log "INFO" "База данных $MAS_DB_NAME уже существует"
     fi
     
-    # Сохраняем информацию о базе данных
+    # Сохраняем информацию о базе данных MAS (используем synapse_user!)
     {
         echo "MAS_DB_NAME=\"$MAS_DB_NAME\""
-        echo "MAS_DB_USER=\"synapse_user\""
+        echo "MAS_DB_USER=\"synapse_user\""  # ИСПРАВЛЕНО: используем synapse_user
         echo "MAS_DB_PASSWORD=\"$db_password\""
-        echo "MAS_DB_URI=\"postgresql://synapse_user:$db_password@localhost/$MAS_DB_NAME\""
+        echo "MAS_DB_URI=\"postgresql://synapse_user:$db_password@localhost/$MAS_DB_NAME\""  # ИСПРАВЛЕНО
     } > "$CONFIG_DIR/mas_database.conf"
     
+    log "SUCCESS" "Конфигурация базы данных MAS сохранена"
     return 0
 }
 
@@ -257,6 +272,42 @@ download_and_install_mas() {
     return 0
 }
 
+# Создание пользователя для MAS если не существует
+create_mas_user() {
+    log "INFO" "Проверка системного пользователя для MAS..."
+    
+    # Проверяем, существует ли пользователь matrix-synapse
+    if id "$MAS_USER" &>/dev/null; then
+        log "INFO" "Системный пользователь $MAS_USER уже существует"
+        return 0
+    fi
+    
+    log "INFO" "Создание системного пользователя $MAS_USER..."
+    
+    # Создаем группу matrix-synapse если не существует
+    if ! getent group "$MAS_GROUP" &>/dev/null; then
+        if ! groupadd --system "$MAS_GROUP"; then
+            log "ERROR" "Не удалось создать группу $MAS_GROUP"
+            return 1
+        fi
+        log "INFO" "Группа $MAS_GROUP создана"
+    fi
+    
+    # Создаем пользователя matrix-synapse
+    if ! useradd --system \
+                 --no-create-home \
+                 --shell /bin/false \
+                 --gid "$MAS_GROUP" \
+                 --comment "Matrix Authentication Service" \
+                 "$MAS_USER"; then
+        log "ERROR" "Не удалось создать пользователя $MAS_USER"
+        return 1
+    fi
+    
+    log "SUCCESS" "Системный пользователь $MAS_USER создан"
+    return 0
+}
+
 # Генерация конфигурации MAS
 generate_mas_config() {
     local mas_port="$1"
@@ -265,6 +316,11 @@ generate_mas_config() {
     local db_uri="$4"
     
     log "INFO" "Генерация конфигурации MAS..."
+    
+    # Создаем системного пользователя для MAS если нужно
+    if ! create_mas_user; then
+        return 1
+    fi
     
     # Создаем директории
     mkdir -p "$MAS_CONFIG_DIR"
@@ -498,11 +554,45 @@ EOF
 initialize_mas_database() {
     log "INFO" "Инициализация базы данных MAS..."
     
+    # Проверяем, что пользователь matrix-synapse существует в системе
+    if ! id "$MAS_USER" &>/dev/null; then
+        log "ERROR" "Системный пользователь $MAS_USER не существует"
+        log "ERROR" "Пользователь должен был быть создан на этапе генерации конфигурации"
+        return 1
+    fi
+    
     # Выполняем миграции базы данных
     if sudo -u "$MAS_USER" mas database migrate --config "$MAS_CONFIG_FILE"; then
         log "SUCCESS" "Миграции базы данных MAS выполнены"
     else
         log "ERROR" "Ошибка выполнения миграций базы данных MAS"
+        
+        # Дополнительная диагностика
+        log "INFO" "Диагностика проблемы с базой данных..."
+        
+        # Проверяем подключение к базе данных
+        local db_uri=$(grep "MAS_DB_URI=" "$CONFIG_DIR/mas_database.conf" | cut -d'=' -f2 | tr -d '"')
+        log "DEBUG" "URI базы данных: $db_uri"
+        
+        # Проверяем существование базы данных
+        if sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$MAS_DB_NAME"; then
+            log "INFO" "База данных $MAS_DB_NAME существует"
+        else
+            log "ERROR" "База данных $MAS_DB_NAME не найдена"
+        fi
+        
+        # Проверяем права доступа к конфигурации
+        log "DEBUG" "Права доступа к конфигурации MAS:"
+        ls -la "$MAS_CONFIG_FILE" 2>/dev/null || log "ERROR" "Конфигурационный файл недоступен"
+        
+        # Проверяем возможность подключения к базе
+        log "INFO" "Проверка подключения к базе данных MAS..."
+        if sudo -u postgres psql -d "$MAS_DB_NAME" -c "SELECT 1;" &>/dev/null; then
+            log "INFO" "Прямое подключение к базе $MAS_DB_NAME работает"
+        else
+            log "ERROR" "Не удается подключиться к базе $MAS_DB_NAME"
+        fi
+        
         return 1
     fi
     
@@ -747,7 +837,7 @@ check_mas_status() {
     fi
     
     if [ -f "$SYNAPSE_MAS_CONFIG" ]; then
-        safe_echo "${GREEN}✅ Интеграция Synapse-MAS: $SYNAPSE_MAS_CONFIG${NC}"
+        safe_echo "${GREEN}✅ Интеграция Synapse-МAS: $SYNAPSE_MAS_CONFIG${NC}"
         
         # Проверяем, включен ли MAS в конфигурации Synapse
         if grep -q "msc3861:" "$SYNAPSE_MAS_CONFIG"; then
@@ -945,6 +1035,8 @@ diagnose_mas() {
     # Проверяем установку MAS
     if command -v mas >/dev/null 2>&1; then
         safe_echo "${GREEN}✅ MAS CLI установлен${NC}"
+        local mas_version=$(mas --version 2>/dev/null | head -1)
+        safe_echo "${BLUE}   Версия: ${mas_version:-неизвестна}${NC}"
         
         # Запускаем встроенную диагностику MAS
         if [ -f "$MAS_CONFIG_FILE" ]; then
@@ -968,7 +1060,41 @@ diagnose_mas() {
     # Дополнительные проверки
     safe_echo "${BOLD}${BLUE}Дополнительные проверки:${NC}"
     
-    # Проверяем сеть
+    # Проверка 1: Системный пользователь
+    if id "$MAS_USER" &>/dev/null; then
+        safe_echo "${GREEN}✅ Системный пользователь $MAS_USER существует${NC}"
+    else
+        safe_echo "${RED}❌ Системный пользователь $MAS_USER не найден${NC}"
+    fi
+    
+    # Проверка 2: База данных
+    if [ -f "$CONFIG_DIR/mas_database.conf" ]; then
+        source "$CONFIG_DIR/mas_database.conf"
+        
+        if sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$MAS_DB_NAME"; then
+            safe_echo "${GREEN}✅ База данных $MAS_DB_NAME существует${NC}"
+            
+            # Проверяем подключение
+            if sudo -u postgres psql -d "$MAS_DB_NAME" -c "SELECT 1;" &>/dev/null; then
+                safe_echo "${GREEN}✅ Подключение к базе данных работает${NC}"
+            else
+                safe_echo "${RED}❌ Ошибка подключения к базе данных${NC}"
+            fi
+        else
+            safe_echo "${RED}❌ База данных $MAS_DB_NAME не найдена${NC}"
+        fi
+    else
+        safe_echo "${RED}❌ Конфигурация базы данных MAS не найдена${NC}"
+    fi
+    
+    # Проверка 3: Службы
+    if systemctl is-active --quiet matrix-auth-service; then
+        safe_echo "${GREEN}✅ Служба matrix-auth-service запущена${NC}"
+    else
+        safe_echo "${RED}❌ Служба matrix-auth-service не запущена${NC}"
+    fi
+    
+    # Проверка 4: Сеть
     local mas_port=$(grep "MAS_PORT=" "$CONFIG_DIR/mas.conf" 2>/dev/null | cut -d'=' -f2 | tr -d '"')
     if [ -n "$mas_port" ]; then
         if ss -tlnp | grep ":$mas_port" >/dev/null; then
@@ -984,9 +1110,88 @@ diagnose_mas() {
         fi
     fi
     
-    # Проверяем логи
+    # Проверка 5: Конфигурационные файлы
+    if [ -f "$MAS_CONFIG_FILE" ]; then
+        safe_echo "${GREEN}✅ Конфигурация MAS найдена${NC}"
+        
+        # Проверяем права доступа
+        local file_owner=$(stat -c '%U:%G' "$MAS_CONFIG_FILE" 2>/dev/null)
+        if [ "$file_owner" = "$MAS_USER:$MAS_GROUP" ]; then
+            safe_echo "${GREEN}✅ Права доступа к конфигурации корректны${NC}"
+        else
+            safe_echo "${YELLOW}⚠️  Права доступа: $file_owner (ожидается: $MAS_USER:$MAS_GROUP)${NC}"
+        fi
+    else
+        safe_echo "${RED}❌ Конфигурация MAS не найдена${NC}"
+    fi
+    
+    if [ -f "$SYNAPSE_MAS_CONFIG" ]; then
+        safe_echo "${GREEN}✅ Интеграция Synapse-MAS настроена${NC}"
+        
+        # Проверяем, включен ли MSC3861
+        if grep -q "msc3861:" "$SYNAPSE_MAS_CONFIG" && grep -A 1 "msc3861:" "$SYNAPSE_MAS_CONFIG" | grep -q "enabled: true"; then
+            safe_echo "${GREEN}✅ MSC3861 включен в Synapse${NC}"
+        else
+            safe_echo "${RED}❌ MSC3861 не включен в Synapse${NC}"
+        fi
+    else
+        safe_echo "${RED}❌ Интеграция Synapse-MAS не найдена${NC}"
+    fi
+    
+    # Показываем логи если есть проблемы
+    echo
     safe_echo "${BLUE}🔍 Последние записи из логов MAS:${NC}"
-    journalctl -u matrix-auth-service -n 10 --no-pager -q || safe_echo "${YELLOW}Логи недоступны${NC}"
+    if systemctl is-active --quiet matrix-auth-service; then
+        journalctl -u matrix-auth-service -n 10 --no-pager -q 2>/dev/null || safe_echo "${YELLOW}Логи недоступны${NC}"
+    else
+        safe_echo "${YELLOW}Служба не запущена - логи недоступны${NC}"
+    fi
+    
+    return 0
+}
+
+# Проверка наличия yq
+check_yq_dependency() {
+    if ! command -v yq &>/dev/null; then
+        log "WARN" "Утилита 'yq' не найдена. Она необходима для управления YAML конфигурацией MAS."
+        
+        if ask_confirmation "Установить yq автоматически?"; then
+            log "INFO" "Установка yq..."
+            
+            # Попробуем установить через snap (наиболее надежный способ)
+            if command -v snap &>/dev/null; then
+                if snap install yq; then
+                    log "SUCCESS" "yq установлен через snap"
+                    return 0
+                fi
+            fi
+            
+            # Альтернативный способ - через GitHub releases
+            log "INFO" "Установка yq через GitHub releases..."
+            local arch=$(uname -m)
+            local yq_binary=""
+            
+            case "$arch" in
+                x86_64) yq_binary="yq_linux_amd64" ;;
+                aarch64|arm64) yq_binary="yq_linux_arm64" ;;
+                *) log "ERROR" "Неподдерживаемая архитектура для yq: $arch"; return 1 ;;
+            esac
+            
+            local yq_url="https://github.com/mikefarah/yq/releases/latest/download/$yq_binary"
+            
+            if download_file "$yq_url" "/tmp/yq" && chmod +x /tmp/yq && mv /tmp/yq /usr/local/bin/yq; then
+                log "SUCCESS" "yq установлен через GitHub releases"
+                return 0
+            else
+                log "ERROR" "Не удалось установить yq"
+                return 1
+            fi
+        else
+            log "ERROR" "yq необходим для управления конфигурацией MAS"
+            log "INFO" "Установите вручную: snap install yq или apt install yq"
+            return 1
+        fi
+    fi
     
     return 0
 }
@@ -994,34 +1199,46 @@ diagnose_mas() {
 # Функция получения статуса открытой регистрации MAS
 get_mas_registration_status() {
     if [ ! -f "$MAS_CONFIG_FILE" ]; then
-        echo "disabled"
-        return
+        echo "unknown"
+        return 1
     fi
     
-    local status=$(grep "password_registration_enabled:" "$MAS_CONFIG_FILE" | awk '{print $2}')
+    if ! check_yq_dependency; then
+        echo "unknown"
+        return 1
+    fi
+    
+    local status=$(yq eval '.account.password_registration_enabled' "$MAS_CONFIG_FILE" 2>/dev/null)
+    
     if [ "$status" = "true" ]; then
         echo "enabled"
+    elif [ "$status" = "false" ]; then
+        echo "disabled" 
     else
-        echo "disabled"
+        echo "unknown"
     fi
 }
 
 # Функция получения статуса регистрации по токенам
 get_mas_token_registration_status() {
     if [ ! -f "$MAS_CONFIG_FILE" ]; then
-        echo "disabled"
-        return
+        echo "unknown"
+        return 1
     fi
     
-    if grep -q "registration_token_required:" "$MAS_CONFIG_FILE"; then
-        local status=$(grep "registration_token_required:" "$MAS_CONFIG_FILE" | awk '{print $2}')
-        if [ "$status" = "true" ]; then
-            echo "enabled"
-        else
-            echo "disabled"
-        fi
-    else
+    if ! check_yq_dependency; then
+        echo "unknown"
+        return 1
+    fi
+    
+    local status=$(yq eval '.account.registration_token_required' "$MAS_CONFIG_FILE" 2>/dev/null)
+    
+    if [ "$status" = "true" ]; then
+        echo "enabled"
+    elif [ "$status" = "false" ]; then
         echo "disabled"
+    else
+        echo "unknown"
     fi
 }
 
@@ -1035,17 +1252,34 @@ set_mas_config_value() {
         return 1
     fi
     
-    log "INFO" "Установка $key: $value"
+    if ! check_yq_dependency; then
+        return 1
+    fi
     
-    if ! sed -i "s/^\(\s*$key:\s*\).*/\1$value/" "$MAS_CONFIG_FILE"; then
+    log "INFO" "Изменение настройки $key на $value..."
+    
+    # Определяем полный путь к параметру
+    local full_path=""
+    case "$key" in
+        "password_registration_enabled"|"registration_token_required"|"email_change_allowed"|"displayname_change_allowed"|"password_change_allowed"|"password_recovery_enabled"|"account_deactivation_allowed")
+            full_path=".account.$key"
+            ;;
+        *)
+            log "ERROR" "Неизвестный параметр конфигурации: $key"
+            return 1
+            ;;
+    esac
+    
+    # Обновляем конфигурацию
+    if ! yq eval -i "$full_path = $value" "$MAS_CONFIG_FILE"; then
         log "ERROR" "Не удалось изменить $key в $MAS_CONFIG_FILE"
         return 1
     fi
     
+    # Перезапускаем MAS для применения изменений
     log "INFO" "Перезапуск MAS для применения изменений..."
     if systemctl restart matrix-auth-service; then
-        log "SUCCESS" "Параметр $key успешно изменен на '$value'"
-        sleep 3 # Даем время сервису перезапуститься
+        log "SUCCESS" "Настройка $key успешно изменена на $value"
     else
         log "ERROR" "Ошибка перезапуска matrix-auth-service"
         return 1
@@ -1056,30 +1290,108 @@ set_mas_config_value() {
 
 # Генерация токена регистрации
 generate_registration_token() {
-    print_header "ГЕНЕРАЦИЯ ТОКЕНА РЕГИСТРАЦИИ" "$CYAN"
+    print_header "ГЕНЕРАЦИЯ ТОКЕНА РЕГИСТРАЦИИ" "$GREEN"
     
-    read -p "$(safe_echo "${YELLOW}Введите лимит использований (оставьте пустым для безлимитного): ${NC}")" usage_limit
-    read -p "$(safe_echo "${YELLOW}Введите срок действия в секундах (оставьте пустым для бессрочного): ${NC}")" expires_in
-    
-    local cmd="sudo -u \"$MAS_USER\" mas manage issue-user-registration-token --config \"$MAS_CONFIG_FILE\""
-    
-    if [ -n "$usage_limit" ]; then
-        cmd+=" --usage-limit $usage_limit"
+    if ! command -v mas >/dev/null 2>&1; then
+        log "ERROR" "MAS CLI не установлен"
+        read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+        return 1
     fi
     
-    if [ -n "$expires_in" ]; then
-        cmd+=" --expires-in $expires_in"
+    if ! systemctl is-active --quiet matrix-auth-service; then
+        log "ERROR" "Сервис matrix-auth-service не запущен"
+        read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+        return 1
     fi
     
-    log "INFO" "Выполнение команды: $cmd"
+    # Запрашиваем параметры токена
+    safe_echo "${BOLD}${CYAN}Настройки токена регистрации:${NC}"
+    echo
+    
+    # Пользовательский токен (опционально)
+    read -p "$(safe_echo "${YELLOW}Введите кастомный токен (оставьте пустым для автогенерации): ${NC}")" custom_token
+    
+    # Лимит использования
+    read -p "$(safe_echo "${YELLOW}Лимит использований (оставьте пустым для неограниченного): ${NC}")" usage_limit
+    
+    # Время истечения (в секундах)
+    safe_echo "${BLUE}Время истечения токена:${NC}"
+    safe_echo "  1. 1 час (3600 сек)"
+    safe_echo "  2. 1 день (86400 сек)"
+    safe_echo "  3. 1 неделя (604800 сек)"
+    safe_echo "  4. 1 месяц (2592000 сек)"
+    safe_echo "  5. Без ограничений"
+    safe_echo "  6. Ввести вручную"
+    
+    read -p "$(safe_echo "${YELLOW}Выберите опцию [1-6]: ${NC}")" time_choice
+    
+    local expires_in=""
+    case "$time_choice" in
+        1) expires_in="3600" ;;
+        2) expires_in="86400" ;;
+        3) expires_in="604800" ;;
+        4) expires_in="2592000" ;;
+        5) expires_in="" ;;
+        6) 
+            read -p "$(safe_echo "${YELLOW}Введите время в секундах: ${NC}")" expires_in
+            if ! [[ "$expires_in" =~ ^[0-9]+$ ]]; then
+                log "ERROR" "Время должно быть числом"
+                read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+                return 1
+            fi
+            ;;
+        *) 
+            log "ERROR" "Неверный выбор"
+            read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+            return 1
+            ;;
+    esac
+    
+    # Формируем команду
+    local cmd_args="--config $MAS_CONFIG_FILE"
+    
+    if [ -n "$custom_token" ]; then
+        cmd_args="$cmd_args --token \"$custom_token\""
+    fi
+    
+    if [ -n "$usage_limit" ] && [[ "$usage_limit" =~ ^[0-9]+$ ]]; then
+        cmd_args="$cmd_args --usage-limit $usage_limit"
+    fi
+    
+    if [ -n "$expires_in" ] && [[ "$expires_in" =~ ^[0-9]+$ ]]; then
+        cmd_args="$cmd_args --expires-in $expires_in"
+    fi
+    
+    # Выполняем команду
+    log "INFO" "Генерация токена регистрации..."
     
     local output
-    if output=$(eval "$cmd"); then
-        log "SUCCESS" "Токен успешно создан"
-        safe_echo "${GREEN}${output}${NC}"
+    if output=$(sudo -u "$MAS_USER" mas manage issue-user-registration-token $cmd_args 2>&1); then
+        log "SUCCESS" "Токен регистрации создан"
+        echo
+        safe_echo "${BOLD}${GREEN}Новый токен регистрации:${NC}"
+        safe_echo "${CYAN}$output${NC}"
+        echo
+        safe_echo "${BOLD}${BLUE}Как использовать токен:${NC}"
+        safe_echo "• Пользователи должны ввести этот токен при регистрации"
+        safe_echo "• Токен можно передать пользователям через безопасный канал"
+        
+        if [ -n "$usage_limit" ]; then
+            safe_echo "• Токен можно использовать максимум $usage_limit раз"
+        else
+            safe_echo "• Токен можно использовать неограниченное количество раз"
+        fi
+        
+        if [ -n "$expires_in" ]; then
+            local expire_date=$(date -d "+$expires_in seconds" '+%Y-%m-%d %H:%M:%S')
+            safe_echo "• Токен истекает: $expire_date"
+        else
+            safe_echo "• Токен не имеет срока истечения"
+        fi
+        
     else
-        log "ERROR" "Не удалось создать токен"
-        safe_echo "${RED}${output}${NC}"
+        log "ERROR" "Ошибка создания токена регистрации"
+        log "DEBUG" "Вывод команды: $output"
     fi
     
     read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
@@ -1087,26 +1399,66 @@ generate_registration_token() {
 
 # Просмотр существующих токенов
 view_registration_tokens() {
-    print_header "СУЩЕСТВУЮЩИЕ ТОКЕНЫ РЕГИСТРАЦИИ" "$CYAN"
+    print_header "ПРОСМОТР ТОКЕНОВ РЕГИСТРАЦИИ" "$BLUE"
     
-    log "INFO" "Получение списка токенов из базы данных $MAS_DB_NAME..."
-    
-    local query="SELECT token, max_uses, uses, TO_CHAR(expires_at, 'YYYY-MM-DD HH24:MI:SS') as expires_at, TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at FROM user_registration_tokens;"
-    
-    local tokens
-    tokens=$(sudo -u postgres psql -d "$MAS_DB_NAME" -c "$query" 2>/dev/null)
-    
-    if [ $? -ne 0 ]; then
-        log "ERROR" "Не удалось получить доступ к базе данных или таблице токенов"
-        safe_echo "${RED}Не удалось получить список токенов. Проверьте логи.${NC}"
+    if ! command -v mas >/dev/null 2>&1; then
+        log "ERROR" "MAS CLI не установлен"
+        read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
         return 1
     fi
     
-    if [[ -z "$tokens" || $(echo "$tokens" | wc -l) -le 2 ]]; then
-        safe_echo "${YELLOW}Активных токенов регистрации不 найдено.${NC}"
-    else
-        safe_echo "${BOLD}${BLUE}Список токенов:${NC}"
-        echo "$tokens"
+    if ! systemctl is-active --quiet matrix-auth-service; then
+        log "ERROR" "Сервис matrix-auth-service не запущен"
+        read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+        return 1
+    fi
+    
+    # Примечание: MAS CLI не предоставляет прямую команду для просмотра токенов
+    # Поэтому мы можем только показать, как проверить токены через логи или БД
+    
+    safe_echo "${YELLOW}ℹ️  MAS CLI не предоставляет команду для просмотра существующих токенов.${NC}"
+    echo
+    safe_echo "${BOLD}${CYAN}Альтернативные способы проверки токенов:${NC}"
+    echo
+    safe_echo "${BLUE}1. Проверка через логи MAS:${NC}"
+    safe_echo "   ${CYAN}journalctl -u matrix-auth-service | grep -i 'registration.*token'${NC}"
+    echo
+    safe_echo "${BLUE}2. Проверка через базу данных:${NC}"
+    safe_echo "   ${CYAN}sudo -u postgres psql mas_db -c \"SELECT token, usage_limit, used_count, expires_at FROM user_registration_tokens;\"${NC}"
+    echo
+    safe_echo "${BLUE}3. Статистика использования:${NC}"
+    safe_echo "   Токены можно отслеживать в веб-интересе MAS (если доступен)"
+    echo
+    
+    if ask_confirmation "Показать токены из базы данных?"; then
+        log "INFO" "Запрос к базе данных MAS..."
+        
+        local db_result
+        if db_result=$(sudo -u postgres psql mas_db -c "
+            SELECT 
+                substring(token, 1, 8) || '...' as token_preview,
+                usage_limit,
+                used_count,
+                CASE 
+                    WHEN expires_at IS NULL THEN 'Never'
+                    ELSE expires_at::text 
+                END as expires_at,
+                created_at
+            FROM user_registration_tokens 
+            ORDER BY created_at DESC 
+            LIMIT 10;" 2>/dev/null); then
+            
+            echo
+            safe_echo "${BOLD}${GREEN}Последние 10 токенов регистрации:${NC}"
+            echo "$db_result"
+            
+        else
+            log "WARN" "Не удалось получить данные из базы или таблица токенов пуста"
+            safe_echo "${YELLOW}Возможные причины:${NC}"
+            safe_echo "• Токены еще не созданы"
+            safe_echo "• Таблица user_registration_tokens не существует"
+            safe_echo "• Нет прав доступа к базе данных"
+        fi
     fi
     
     read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
@@ -1118,13 +1470,6 @@ manage_sso_providers() {
 
     if [ ! -f "$MAS_CONFIG_FILE" ]; then
         log "ERROR" "Файл конфигурации MAS не найден: $MAS_CONFIG_FILE"
-        read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
-        return 1
-    fi
-
-    if ! command -v yq &> /dev/null; then
-        log "ERROR" "Утилита 'yq' не найдена. Она необходима для управления YAML конфигурацией."
-        log "INFO" "Пожалуйста, установите 'yq' (например, 'sudo apt install yq' или 'sudo snap install yq')"
         read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
         return 1
     fi
@@ -1503,14 +1848,6 @@ manage_banned_usernames() {
         fi
     }
 
-    # Проверяем наличие yq
-    if ! command -v yq &> /dev/null; then
-        log "ERROR" "Утилита 'yq' не найдена. Она необходима для управления YAML конфигурацией."
-        log "INFO" "Пожалуйста, установите 'yq' (например, 'sudo apt install yq' или 'sudo snap install yq')"
-        read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
-        return 1
-    fi
-
     while true; do
         print_header "УПРАВЛЕНИЕ ЗАБЛОКИРОВАННЫМИ ИМЕНАМИ" "$BLUE"
         
@@ -1582,6 +1919,7 @@ manage_banned_usernames() {
         esac
     done
 }
+
 
 # Меню управления регистрацией MAS
 manage_mas_registration() {
@@ -1697,7 +2035,7 @@ show_main_menu() {
         safe_echo "${GREEN}2.${NC} 📊 Проверить статус MAS"
         safe_echo "${GREEN}3.${NC} 🚪 Управление регистрацией MAS"
         safe_echo "${GREEN}4.${NC} 🔧 Диагностика MAS"
-        safe_echo "${GREEN}5.${NC} SSO Управление внешними провайдерами (SSO)"
+        safe_echo "${GREEN}5.${NC} 🌐 Управление внешними провайдерами (SSO)"
         safe_echo "${GREEN}6.${NC} 🗑️  Удалить MAS"
         safe_echo "${GREEN}7.${NC} ↩️  Вернуться в главное меню"
         echo
@@ -1718,7 +2056,7 @@ show_main_menu() {
                 ;;
             4)
                 diagnose_mas
-                read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+                read -p "$(safe_echo "${CYAN}Наджмите Enter для продолжения...${NC}")"
                 ;;
             5)
                 manage_sso_providers
