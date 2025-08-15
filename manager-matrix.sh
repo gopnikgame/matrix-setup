@@ -1224,34 +1224,76 @@ update_modules_and_library() {
             fi
         done
     else
-        local modules_json=$(curl -sL --fail "$repo_api_url")
-        if [ $? -eq 0 ] && [ -n "$modules_json" ]; then
-            # Проверяем, что ответ является JSON-массивом
-            if ! echo "$modules_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
-                log "WARN" "Ответ от API GitHub не является массивом. Пропускаем обновление новых модулей."
-                log "DEBUG" "Ответ API: $modules_json"
-            else
-                while IFS= read -r line; do
-                    remote_modules+=("$line")
-                done < <(echo "$modules_json" | jq -r '.[] | select(.type == "file" and .name | endswith(".sh")) | .name')
-            fi
-            
-            if [ ${#remote_modules[@]} -gt 0 ]; then
-                for module_name in "${remote_modules[@]}"; do
-                    files_to_check+=("modules/$module_name")
-                done
-            else
-                log "WARN" "Не удалось получить список модулей из репозитория. Обновляем только существующие."
-            fi
+        # Получаем ответ от API с таймаутом и улучшенной обработкой ошибок
+        local modules_json=""
+        local api_response_code=""
+        
+        # Проверяем доступность API GitHub
+        api_response_code=$(curl -sL --connect-timeout 10 --max-time 30 -w "%{http_code}" -o /dev/null "$repo_api_url" 2>/dev/null || echo "000")
+        
+        if [ "$api_response_code" != "200" ]; then
+            log "WARN" "API GitHub недоступен (код ответа: $api_response_code). Обновляем только существующие модули."
         else
-            log "WARN" "Не удалось связаться с API GitHub. Обновляем только существующие модули."
+            # Получаем JSON ответ
+            modules_json=$(curl -sL --connect-timeout 10 --max-time 30 --fail "$repo_api_url" 2>/dev/null)
+            local curl_exit_code=$?
+            
+            if [ $curl_exit_code -ne 0 ] || [ -z "$modules_json" ]; then
+                log "WARN" "Не удалось получить данные от API GitHub (код curl: $curl_exit_code). Обновляем только существующие модули."
+            else
+                # Проверяем, что ответ содержит валидный JSON
+                if ! echo "$modules_json" | jq empty >/dev/null 2>&1; then
+                    log "WARN" "Ответ от API GitHub содержит невалидный JSON. Обновляем только существующие модули."
+                    log "DEBUG" "Первые 200 символов ответа: $(echo "$modules_json" | head -c 200)..."
+                else
+                    # Проверяем, что ответ является JSON-массивом
+                    if ! echo "$modules_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                        log "WARN" "Ответ от API GitHub не является массивом. Обновляем только существующие модули."
+                        local response_type=$(echo "$modules_json" | jq -r 'type' 2>/dev/null || echo "unknown")
+                        log "DEBUG" "Тип ответа: $response_type"
+                        if echo "$modules_json" | jq -e 'has("message")' >/dev/null 2>&1; then
+                            local error_message=$(echo "$modules_json" | jq -r '.message' 2>/dev/null)
+                            log "DEBUG" "Сообщение об ошибке: $error_message"
+                        fi
+                    else
+                        # Безопасно извлекаем имена файлов .sh
+                        local jq_output=""
+                        jq_output=$(echo "$modules_json" | jq -r '.[] | select(.type == "file") | select(.name | type == "string") | select(.name | endswith(".sh")) | .name' 2>/dev/null)
+                        local jq_exit_code=$?
+                        
+                        if [ $jq_exit_code -eq 0 ] && [ -n "$jq_output" ]; then
+                            while IFS= read -r line; do
+                                if [ -n "$line" ]; then
+                                    remote_modules+=("$line")
+                                fi
+                            done <<< "$jq_output"
+                            
+                            log "DEBUG" "Найдено модулей в репозитории: ${#remote_modules[@]}"
+                        else
+                            log "WARN" "Ошибка обработки JSON ответа (код jq: $jq_exit_code). Обновляем только существующие модули."
+                        fi
+                    fi
+                fi
+            fi
         fi
-        # Добавляем существующие на случай, если API недоступен
+        
+        # Добавляем найденные удаленные модули в список для проверки
+        if [ ${#remote_modules[@]} -gt 0 ]; then
+            for module_name in "${remote_modules[@]}"; do
+                files_to_check+=("modules/$module_name")
+            done
+            log "DEBUG" "Добавлено удаленных модулей для проверки: ${#remote_modules[@]}"
+        else
+            log "WARN" "Не удалось получить список модулей из репозитория. Обновляем только существующие."
+        fi
+        
+        # Добавляем существующие локальные модули на случай, если API недоступен
         for module_path in "$MODULES_DIR"/*.sh; do
             if [ -f "$module_path" ]; then
+                local module_basename="modules/$(basename "$module_path")"
                 # Избегаем дублирования
-                if ! [[ " ${files_to_check[*]} " =~ " modules/$(basename "$module_path") " ]]; then
-                    files_to_check+=("modules/$(basename "$module_path")")
+                if ! printf '%s\n' "${files_to_check[@]}" | grep -q "^$module_basename$"; then
+                    files_to_check+=("$module_basename")
                 fi
             fi
         done
@@ -1262,14 +1304,16 @@ update_modules_and_library() {
         return 1
     fi
     
+    log "DEBUG" "Всего файлов для проверки: ${#files_to_check[@]}"
+    
     for file_rel_path in "${files_to_check[@]}"; do
         local local_file_path="${SCRIPT_DIR}/${file_rel_path}"
         local remote_file_url="${repo_raw_url}/${file_rel_path}"
         local temp_file
         temp_file=$(mktemp)
         
-        # Скачиваем удаленный файл
-        if ! curl -sL --fail "$remote_file_url" -o "$temp_file"; then
+        # Скачиваем удаленный файл с улучшенной обработкой ошибок
+        if ! curl -sL --connect-timeout 10 --max-time 30 --fail "$remote_file_url" -o "$temp_file" 2>/dev/null; then
             log "WARN" "Не удалось скачать файл: $remote_file_url"
             rm -f "$temp_file"
             continue
@@ -1930,7 +1974,7 @@ manage_registration_tokens() {
     safe_echo "${GREEN}1.${NC} 🎫 Создать новый токен регистрации"
     safe_echo "${GREEN}2.${NC} 📋 Показать все токены"
     safe_echo "${GREEN}3.${NC} 🗑️  Удалить токен"
-    safe_echo "${GREEN}4.${NC} ⚙️  Полное управление регистрацией (модуль)"
+    safe_echo "${GREEN}4.${NC} ⚙️  Полное управление регистрации (модуль)"
     safe_echo "${GREEN}5.${NC} ↩️  Назад"
     
     echo
