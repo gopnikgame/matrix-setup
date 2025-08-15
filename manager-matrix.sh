@@ -573,7 +573,7 @@ manage_services() {
         safe_echo "${BOLD}Доступные действия:${NC}"
         safe_echo "${GREEN}1.${NC} Запустить все службы"
         safe_echo "${GREEN}2.${NC} Остановить все службы"
-        safe_echo "${GREEN}3.${NC} Перезапустить все службы"
+        safe_echo "${GREEN}3.${NC} Перезагрузить все службы"
         safe_echo "${GREEN}4.${NC} Управление Matrix Synapse"
         safe_echo "${GREEN}5.${NC} Управление PostgreSQL"
         safe_echo "${GREEN}6.${NC} Управление веб-сервером"
@@ -793,7 +793,7 @@ manage_web_server() {
     safe_echo "${BOLD}Доступные действия:${NC}"
     safe_echo "${GREEN}1.${NC} Запустить"
     safe_echo "${GREEN}2.${NC} Остановить"
-    safe_echo "${GREEN}3.${NC} Перезапустить"
+    safe_echo "${GREEN}3.${NC} Перезагрузить"
     safe_echo "${GREEN}4.${NC} Перезагрузить конфигурацию"
     safe_echo "${GREEN}5.${NC} Показать логи"
     safe_echo "${GREEN}6.${NC} Проверить конфигурацию"
@@ -1200,6 +1200,7 @@ update_modules_and_library() {
     log "INFO" "Проверка обновлений для модулей, библиотеки и менеджера..."
     
     local repo_raw_url="https://raw.githubusercontent.com/gopnikgame/matrix-setup/main"
+    local repo_api_url="https://api.github.com/repos/gopnikgame/matrix-setup/contents/modules"
     local updated_files=0
     local checked_files=0
     
@@ -1212,12 +1213,51 @@ update_modules_and_library() {
     # Добавляем главный менеджер
     files_to_check+=("manager-matrix.sh")
     
-    # Добавляем все модули
-    for module_path in "$MODULES_DIR"/*.sh; do
-        if [ -f "$module_path" ]; then
-            files_to_check+=("modules/$(basename "$module_path")")
+    # Получаем список модулей из репозитория
+    log "INFO" "Получение списка модулей из репозитория GitHub..."
+    local remote_modules=()
+    
+    # Проверяем наличие curl и jq
+    if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        log "WARN" "curl или jq не установлены. Невозможно получить список новых модулей."
+        log "INFO" "Будут обновлены только существующие файлы."
+        # Добавляем все существующие модули
+        for module_path in "$MODULES_DIR"/*.sh; do
+            if [ -f "$module_path" ]; then
+                files_to_check+=("modules/$(basename "$module_path")")
+            fi
+        done
+    else
+        # Используем API GitHub для получения списка файлов в директории modules
+        local modules_json=$(curl -sL --fail "$repo_api_url")
+        if [ $? -eq 0 ] && [ -n "$modules_json" ]; then
+            # Используем jq для парсинга JSON и получения имен файлов
+            while IFS= read -r line; do
+                remote_modules+=("$line")
+            done < <(echo "$modules_json" | jq -r '.[] | select(.type == "file" and .name | endswith(".sh")) | .name')
+            
+            if [ ${#remote_modules[@]} -gt 0 ]; then
+                log "INFO" "Найдено ${#remote_modules[@]} модулей в репозитории."
+                for module_name in "${remote_modules[@]}"; do
+                    files_to_check+=("modules/$module_name")
+                done
+            else
+                log "WARN" "Не удалось получить список модулей из репозитория. Обновляем только существующие."
+                for module_path in "$MODULES_DIR"/*.sh; do
+                    if [ -f "$module_path" ]; then
+                        files_to_check+=("modules/$(basename "$module_path")")
+                    fi
+                done
+            fi
+        else
+            log "WARN" "Не удалось связаться с API GitHub. Обновляем только существующие модули."
+            for module_path in "$MODULES_DIR"/*.sh; do
+                if [ -f "$module_path" ]; then
+                    files_to_check+=("modules/$(basename "$module_path")")
+                fi
+            done
         fi
-    done
+    fi
     
     # Проверка зависимостей
     if ! command -v sha256sum >/dev/null 2>&1; then
@@ -1245,6 +1285,24 @@ update_modules_and_library() {
         if [ ! -s "$temp_file" ]; then
             log "WARN" "Загруженный файл пуст: $file_rel_path"
             rm -f "$temp_file"
+            continue
+        fi
+        
+        # Если локального файла нет, это новый файл
+        if [ ! -f "$local_file_path" ]; then
+            log "INFO" "Найден новый файл: $file_rel_path"
+            
+            # Создаем директорию если нужно
+            mkdir -p "$(dirname "$local_file_path")"
+            
+            if mv "$temp_file" "$local_file_path"; then
+                chmod +x "$local_file_path"
+                log "SUCCESS" "Файл $file_rel_path успешно загружен."
+                ((updated_files++))
+            else
+                log "ERROR" "Ошибка при сохранении нового файла: $local_file_path"
+                rm -f "$temp_file"
+            fi
             continue
         fi
         
@@ -1296,7 +1354,7 @@ update_modules_and_library() {
     done
     
     if [ $updated_files -gt 0 ]; then
-        log "SUCCESS" "Обновление завершено. Обновлено файлов: $updated_files из $checked_files."
+        log "SUCCESS" "Обновление завершено. Обновлено/загружено файлов: $updated_files из $checked_files."
         
         # Если обновились модули, перезагружаем их
         if [ $updated_files -gt 0 ] && [ "$file_rel_path" != "manager-matrix.sh" ]; then
