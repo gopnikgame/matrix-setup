@@ -1226,9 +1226,15 @@ update_modules_and_library() {
     else
         local modules_json=$(curl -sL --fail "$repo_api_url")
         if [ $? -eq 0 ] && [ -n "$modules_json" ]; then
-            while IFS= read -r line; do
-                remote_modules+=("$line")
-            done < <(echo "$modules_json" | jq -r '.[] | select(.type == "file" and .name | endswith(".sh")) | .name')
+            # Проверяем, что ответ является JSON-массивом
+            if ! echo "$modules_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                log "WARN" "Ответ от API GitHub не является массивом. Пропускаем обновление новых модулей."
+                log "DEBUG" "Ответ API: $modules_json"
+            else
+                while IFS= read -r line; do
+                    remote_modules+=("$line")
+                done < <(echo "$modules_json" | jq -r '.[] | select(.type == "file" and .name | endswith(".sh")) | .name')
+            fi
             
             if [ ${#remote_modules[@]} -gt 0 ]; then
                 for module_name in "${remote_modules[@]}"; do
