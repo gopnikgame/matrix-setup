@@ -353,10 +353,11 @@ passwords:
 account:
   email_change_allowed: true
   displayname_change_allowed: true
-  password_registration_enabled: true
+  password_registration_enabled: false
   password_change_allowed: true
   password_recovery_enabled: false
   account_deactivation_allowed: true
+  registration_token_required: false
 
 experimental:
   access_token_ttl: 300
@@ -990,6 +991,687 @@ diagnose_mas() {
     return 0
 }
 
+# Функция получения статуса открытой регистрации MAS
+get_mas_registration_status() {
+    if [ ! -f "$MAS_CONFIG_FILE" ]; then
+        echo "disabled"
+        return
+    fi
+    
+    local status=$(grep "password_registration_enabled:" "$MAS_CONFIG_FILE" | awk '{print $2}')
+    if [ "$status" = "true" ]; then
+        echo "enabled"
+    else
+        echo "disabled"
+    fi
+}
+
+# Функция получения статуса регистрации по токенам
+get_mas_token_registration_status() {
+    if [ ! -f "$MAS_CONFIG_FILE" ]; then
+        echo "disabled"
+        return
+    fi
+    
+    if grep -q "registration_token_required:" "$MAS_CONFIG_FILE"; then
+        local status=$(grep "registration_token_required:" "$MAS_CONFIG_FILE" | awk '{print $2}')
+        if [ "$status" = "true" ]; then
+            echo "enabled"
+        else
+            echo "disabled"
+        fi
+    else
+        echo "disabled"
+    fi
+}
+
+# Функция для изменения параметра в YAML файле
+set_mas_config_value() {
+    local key="$1"
+    local value="$2"
+    
+    if [ ! -f "$MAS_CONFIG_FILE" ]; then
+        log "ERROR" "Файл конфигурации MAS не найден: $MAS_CONFIG_FILE"
+        return 1
+    fi
+    
+    log "INFO" "Установка $key: $value"
+    
+    if ! sed -i "s/^\(\s*$key:\s*\).*/\1$value/" "$MAS_CONFIG_FILE"; then
+        log "ERROR" "Не удалось изменить $key в $MAS_CONFIG_FILE"
+        return 1
+    fi
+    
+    log "INFO" "Перезапуск MAS для применения изменений..."
+    if systemctl restart matrix-auth-service; then
+        log "SUCCESS" "Параметр $key успешно изменен на '$value'"
+        sleep 3 # Даем время сервису перезапуститься
+    else
+        log "ERROR" "Ошибка перезапуска matrix-auth-service"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Генерация токена регистрации
+generate_registration_token() {
+    print_header "ГЕНЕРАЦИЯ ТОКЕНА РЕГИСТРАЦИИ" "$CYAN"
+    
+    read -p "$(safe_echo "${YELLOW}Введите лимит использований (оставьте пустым для безлимитного): ${NC}")" usage_limit
+    read -p "$(safe_echo "${YELLOW}Введите срок действия в секундах (оставьте пустым для бессрочного): ${NC}")" expires_in
+    
+    local cmd="sudo -u \"$MAS_USER\" mas manage issue-user-registration-token --config \"$MAS_CONFIG_FILE\""
+    
+    if [ -n "$usage_limit" ]; then
+        cmd+=" --usage-limit $usage_limit"
+    fi
+    
+    if [ -n "$expires_in" ]; then
+        cmd+=" --expires-in $expires_in"
+    fi
+    
+    log "INFO" "Выполнение команды: $cmd"
+    
+    local output
+    if output=$(eval "$cmd"); then
+        log "SUCCESS" "Токен успешно создан"
+        safe_echo "${GREEN}${output}${NC}"
+    else
+        log "ERROR" "Не удалось создать токен"
+        safe_echo "${RED}${output}${NC}"
+    fi
+    
+    read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+}
+
+# Просмотр существующих токенов
+view_registration_tokens() {
+    print_header "СУЩЕСТВУЮЩИЕ ТОКЕНЫ РЕГИСТРАЦИИ" "$CYAN"
+    
+    log "INFO" "Получение списка токенов из базы данных $MAS_DB_NAME..."
+    
+    local query="SELECT token, max_uses, uses, TO_CHAR(expires_at, 'YYYY-MM-DD HH24:MI:SS') as expires_at, TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at FROM user_registration_tokens;"
+    
+    local tokens
+    tokens=$(sudo -u postgres psql -d "$MAS_DB_NAME" -c "$query" 2>/dev/null)
+    
+    if [ $? -ne 0 ]; then
+        log "ERROR" "Не удалось получить доступ к базе данных или таблице токенов"
+        safe_echo "${RED}Не удалось получить список токенов. Проверьте логи.${NC}"
+        return 1
+    fi
+    
+    if [[ -z "$tokens" || $(echo "$tokens" | wc -l) -le 2 ]]; then
+        safe_echo "${YELLOW}Активных токенов регистрации不 найдено.${NC}"
+    else
+        safe_echo "${BOLD}${BLUE}Список токенов:${NC}"
+        echo "$tokens"
+    fi
+    
+    read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+}
+
+# Меню управления SSO-провайдерами
+manage_sso_providers() {
+    print_header "УПРАВЛЕНИЕ ВНЕШНИМИ ПРОВАЙДЕРАМИ (SSO)" "$BLUE"
+
+    if [ ! -f "$MAS_CONFIG_FILE" ]; then
+        log "ERROR" "Файл конфигурации MAS не найден: $MAS_CONFIG_FILE"
+        read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+        return 1
+    fi
+
+    if ! command -v yq &> /dev/null; then
+        log "ERROR" "Утилита 'yq' не найдена. Она необходима для управления YAML конфигурацией."
+        log "INFO" "Пожалуйста, установите 'yq' (например, 'sudo apt install yq' или 'sudo snap install yq')"
+        read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+        return 1
+    fi
+
+    # Функция для синхронизации и перезапуска MAS
+    sync_and_restart_mas() {
+        log "INFO" "Синхронизация конфигурации MAS с базой данных..."
+        if ! sudo -u "$MAS_USER" mas config sync --config "$MAS_CONFIG_FILE" --prune; then
+            log "ERROR" "Ошибка синхронизации конфигурации MAS"
+            return 1
+        fi
+
+        log "INFO" "Перезапуск MAS для применения изменений..."
+        if systemctl restart matrix-auth-service; then
+            log "SUCCESS" "Настройки SSO успешно обновлены"
+            sleep 3
+        else
+            log "ERROR" "Ошибка перезапуска matrix-auth-service"
+            return 1
+        fi
+    }
+
+    # Функция для генерации ULID
+    generate_ulid() {
+        # Простой способ генерации псевдо-ULID, достаточный для уникальности в данном контексте
+        local timestamp=$(printf '%x' $(date +%s))
+        local random_part=$(openssl rand -hex 10)
+        echo "$(echo "$timestamp$random_part" | tr '[:lower:]' '[:upper:]')"
+    }
+
+    # Функция добавления провайдера
+    add_sso_provider() {
+        local provider_name="$1"
+        local human_name="$2"
+        local brand_name="$3"
+        local issuer="$4"
+        local scope="$5"
+        local extra_config="$6"
+
+        print_header "НАСТРОЙКА $human_name SSO" "$CYAN"
+        
+        case $provider_name in
+            "google")
+                safe_echo "1. Перейдите в Google API Console: ${UNDERLINE}https://console.developers.google.com/apis/credentials${NC}"
+                safe_echo "2. Нажмите 'CREATE CREDENTIALS' -> 'OAuth client ID'."
+                safe_echo "3. Выберите 'Web application'."
+                safe_echo "4. В 'Authorized redirect URIs' добавьте URI вашего MAS. Он будет показан после ввода данных."
+                safe_echo "   Пример: https://auth.your-domain.com/upstream/callback/YOUR_ULID"
+                safe_echo "5. Скопируйте 'Client ID' и 'Client Secret'."
+                ;;
+            "github")
+                safe_echo "1. Перейдите в 'Developer settings' вашего GitHub профиля: ${UNDERLINE}https://github.com/settings/developers${NC}"
+                safe_echo "2. Выберите 'OAuth Apps' -> 'New OAuth App'."
+                safe_echo "3. 'Homepage URL': URL вашего MAS (например, https://auth.your-domain.com)."
+                safe_echo "4. 'Authorization callback URL': URL для коллбэка. Будет показан после ввода данных."
+                safe_echo "   Пример: https://auth.your-domain.com/upstream/callback/YOUR_ULID"
+                safe_echo "5. Скопируйте 'Client ID' и сгенерируйте 'Client Secret'."
+                ;;
+            "gitlab")
+                safe_echo "1. Перейдите в 'Applications' в настройках вашего профиля GitLab: ${UNDERLINE}https://gitlab.com/-/profile/applications${NC}"
+                safe_echo "2. Создайте новое приложение."
+                safe_echo "3. В 'Redirect URI' укажите URL для коллбэка. Будет показан после ввода данных."
+                safe_echo "   Пример: https://auth.your-domain.com/upstream/callback/YOUR_ULID"
+                safe_echo "4. Включите скоупы: 'openid', 'profile', 'email'."
+                safe_echo "5. Сохраните и скопируйте 'Application ID' (это Client ID) и 'Secret'."
+                ;;
+            "discord")
+                safe_echo "1. Перейдите на Discord Developer Portal: ${UNDERLINE}https://discord.com/developers/applications${NC}"
+                safe_echo "2. Создайте новое приложение."
+                safe_echo "3. Перейдите во вкладку 'OAuth2'."
+                safe_echo "4. В 'Redirects' добавьте URL для коллбэка. Будет показан после ввода данных."
+                safe_echo "   Пример: https://auth.your-domain.com/upstream/callback/YOUR_ULID"
+                safe_echo "5. Сохраните изменения и скопируйте 'Client ID' и 'Client Secret'."
+                ;;
+        esac
+        echo
+
+        read -p "$(safe_echo "${YELLOW}Введите Client ID: ${NC}")" client_id
+        read -p "$(safe_echo "${YELLOW}Введите Client Secret: ${NC}")" client_secret
+
+        if [ -z "$client_id" ] || [ -z "$client_secret" ]; then
+            log "ERROR" "Client ID и Client Secret не могут быть пустыми."
+            read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+            return
+        fi
+
+        local ulid=$(generate_ulid)
+        local mas_public_base=$(yq eval '.http.public_base' "$MAS_CONFIG_FILE")
+        local redirect_uri="${mas_public_base}upstream/callback/${ulid}"
+        
+        safe_echo "${BOLD}${BLUE}Ваш Redirect URI для настройки в $human_name:${NC}"
+        safe_echo "${CYAN}$redirect_uri${NC}"
+        echo
+
+        if ! ask_confirmation "Продолжить добавление провайдера?"; then
+            return
+        fi
+
+        local provider_yaml
+        provider_yaml=$(cat <<EOF
+{
+  "id": "$ulid",
+  "human_name": "$human_name",
+  "brand_name": "$brand_name",
+  "client_id": "$client_id",
+  "client_secret": "$client_secret",
+  "scope": "$scope"
+}
+EOF
+)
+        # Добавляем специфичные для провайдера поля
+        provider_yaml=$(echo "$provider_yaml" | yq eval '. as $item | '"$extra_config"' | $item * .' -)
+
+        # Добавляем провайдер в конфиг
+        yq eval -i '.upstream_oauth2.providers += [load_str("-")]' "$MAS_CONFIG_FILE" -- - "$provider_yaml"
+        
+        sync_and_restart_mas
+        read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+    }
+
+    # Функция удаления провайдера
+    remove_sso_provider() {
+        print_header "УДАЛЕНИЕ SSO ПРОВАЙДЕРА" "$RED"
+        local providers=$(yq eval '.upstream_oauth2.providers[] | .id + " " + .human_name' "$MAS_CONFIG_FILE")
+        if [ -z "$providers" ]; then
+            safe_echo "${YELLOW}Нет настроенных SSO провайдеров для удаления.${NC}"
+            read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+            return
+        fi
+
+        safe_echo "Список настроенных провайдеров:"
+        echo "$providers"
+        echo
+        read -p "Введите ID провайдера для удаления: " id_to_remove
+
+        if [ -z "$id_to_remove" ]; then
+            log "WARN" "ID не указан."
+            return
+        fi
+
+        if ask_confirmation "Вы уверены, что хотите удалить провайдера с ID $id_to_remove?"; then
+            yq eval -i 'del(.upstream_oauth2.providers[] | select(.id == "'"$id_to_remove"'"))' "$MAS_CONFIG_FILE"
+            sync_and_restart_mas
+        fi
+        read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+    }
+
+    while true; do
+        print_header "УПРАВЛЕНИЕ SSO" "$BLUE"
+        
+        safe_echo "${BOLD}${CYAN}Текущие SSO провайдеры:${NC}"
+        local current_providers=$(yq eval -o=json '.upstream_oauth2.providers' "$MAS_CONFIG_FILE")
+        if [ -z "$current_providers" ] || [ "$current_providers" = "null" ] || [ "$current_providers" = "[]" ]; then
+            safe_echo "${YELLOW}SSO провайдеры не настроены.${NC}"
+        else
+            echo "$current_providers" | yq eval -P '.[] | .human_name + " (ID: " + .id + ")"' -
+        fi
+        echo
+
+        safe_echo "${BOLD}${CYAN}Доступные опции:${NC}"
+        safe_echo "${GREEN}1.${NC} ➕ Добавить Google"
+        safe_echo "${GREEN}2.${NC} ➕ Добавить GitHub"
+        safe_echo "${GREEN}3.${NC} ➕ Добавить GitLab"
+        safe_echo "${GREEN}4.${NC} ➕ Добавить Discord"
+        safe_echo "${GREEN}5.${NC} 🗑️  Удалить провайдера"
+        safe_echo "${GREEN}6.${NC} ↩️  Вернуться в главное меню"
+        echo
+        
+        read -p "$(safe_echo "${YELLOW}Выберите опцию [1-6]: ${NC}")" choice
+
+        case $choice in
+            1)
+                add_sso_provider "google" "Google" "google" "" "openid profile email" \
+                '.issuer = "https://accounts.google.com" | .token_endpoint_auth_method = "client_secret_post"'
+                ;;
+            2)
+                add_sso_provider "github" "GitHub" "github" "" "read:user" \
+                '.discovery_mode = "disabled" | .fetch_userinfo = true | .token_endpoint_auth_method = "client_secret_post" | .authorization_endpoint = "https://github.com/login/oauth/authorize" | .token_endpoint = "https://github.com/login/oauth/access_token" | .userinfo_endpoint = "https://api.github.com/user" | .claims_imports.subject.template = "{{ userinfo_claims.id }}"'
+                ;;
+            3)
+                add_sso_provider "gitlab" "GitLab" "gitlab" "" "openid profile email" \
+                '.issuer = "https://gitlab.com" | .token_endpoint_auth_method = "client_secret_post"'
+                ;;
+            4)
+                add_sso_provider "discord" "Discord" "discord" "" "identify email" \
+                '.discovery_mode = "disabled" | .fetch_userinfo = true | .token_endpoint_auth_method = "client_secret_post" | .authorization_endpoint = "https://discord.com/oauth2/authorize" | .token_endpoint = "https://discord.com/api/oauth2/token" | .userinfo_endpoint = "https://discord.com/api/users/@me"'
+                ;;
+            5)
+                remove_sso_provider
+                ;;
+            6)
+                return 0
+                ;;
+            *)
+                log "ERROR" "Неверный выбор. Попробуйте снова"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# Меню управления CAPTCHA
+manage_captcha_settings() {
+    print_header "УПРАВЛЕНИЕ CAPTCHA" "$BLUE"
+
+    if [ ! -f "$MAS_CONFIG_FILE" ]; then
+        log "ERROR" "Файл конфигурации MAS не найден: $MAS_CONFIG_FILE"
+        read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+        return 1
+    fi
+
+    # Проверяем наличие yq
+    if ! command -v yq &> /dev/null; then
+        log "ERROR" "Утилита 'yq' не найдена. Она необходима для управления YAML конфигурацией."
+        log "INFO" "Пожалуйста, установите 'yq' (например, 'sudo apt install yq' или 'sudo snap install yq')"
+        read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+        return 1
+    fi
+
+    # Функция для записи настроек CAPTCHA
+    write_captcha_settings() {
+        local service="$1"
+        local site_key="$2"
+        local secret_key="$3"
+
+        log "INFO" "Обновление конфигурации CAPTCHA..."
+        
+        if [ "$service" = "null" ]; then
+            # Отключение CAPTCHA
+            if ! yq eval -i '.captcha.service = null | .captcha |= (del(.site_key) | del(.secret_key))' "$MAS_CONFIG_FILE"; then
+                log "ERROR" "Не удалось отключить CAPTCHA в $MAS_CONFIG_FILE"
+                return 1
+            fi
+        else
+            # Включение CAPTCHA
+            if ! yq eval -i '.captcha.service = "'"$service"'" | .captcha.site_key = "'"$site_key"'" | .captcha.secret_key = "'"$secret_key"'"' "$MAS_CONFIG_FILE"; then
+                log "ERROR" "Не удалось записать настройки CAPTCHA в $MAS_CONFIG_FILE"
+                return 1
+            fi
+        fi
+
+        log "INFO" "Перезапуск MAS для применения изменений..."
+        if systemctl restart matrix-auth-service; then
+            log "SUCCESS" "Настройки CAPTCHA успешно обновлены"
+            sleep 3
+        else
+            log "ERROR" "Ошибка перезапуска matrix-auth-service"
+            return 1
+        fi
+    }
+
+    while true; do
+        print_header "УПРАВЛЕНИЕ CAPTCHA" "$BLUE"
+        
+        local service=$(yq eval '.captcha.service' "$MAS_CONFIG_FILE")
+        local site_key=$(yq eval '.captcha.site_key' "$MAS_CONFIG_FILE")
+
+        safe_echo -n "Текущий статус CAPTCHA: "
+        if [ -z "$service" ] || [ "$service" = "null" ]; then
+            safe_echo "${RED}ОТКЛЮЧЕНО${NC}"
+        elif [ "$service" = "recaptcha_v2" ]; then
+            safe_echo "${GREEN}Google reCAPTCHA v2 (Включено)${NC}"
+            safe_echo "  Site Key: $site_key"
+        elif [ "$service" = "cloudflare_turnstile" ]; then
+            safe_echo "${GREEN}Cloudflare Turnstile (Включено)${NC}"
+            safe_echo "  Site Key: $site_key"
+        else
+            safe_echo "${YELLOW}Неизвестный сервис ($service)${NC}"
+        fi
+        echo
+
+        safe_echo "${BOLD}${CYAN}Доступные опции:${NC}"
+        safe_echo "${GREEN}1.${NC} ⚙️  Настроить Google reCAPTCHA v2"
+        safe_echo "${GREEN}2.${NC} ⚙️  Настроить Cloudflare Turnstile"
+        safe_echo "${GREEN}3.${NC} ❌ Отключить CAPTCHA"
+        safe_echo "${GREEN}4.${NC} ↩️  Вернуться в меню MAS"
+        echo
+        
+        read -p "$(safe_echo "${YELLOW}Выберите опцию [1-4]: ${NC}")" choice
+
+        case $choice in
+            1)
+                print_header "НАСТРОЙКА GOOGLE RECAPTCHA V2" "$CYAN"
+                safe_echo "Для настройки вам понадобятся 'Site Key' и 'Secret Key'."
+                safe_echo "1. Перейдите в консоль администратора Google reCAPTCHA:"
+                safe_echo "   ${UNDERLINE}https://www.google.com/recaptcha/admin/create${NC}"
+                safe_echo "2. Зарегистрируйте новый сайт:"
+                safe_echo "   - ${BOLD}Label:${NC} Придумайте любое имя, например, 'Matrix Server'."
+                safe_echo "   - ${BOLD}reCAPTCHA type:${NC} Выберите 'reCAPTCHA v2' и подтип '\"I'm not a robot\" Checkbox'."
+                safe_echo "   - ${BOLD}Domains:${NC} Укажите домен, на котором будет доступен MAS."
+                safe_echo "     - Если у вас MAS на поддомене: ${CYAN}auth.your-domain.com${NC}"
+                safe_echo "     - Если MAS доступен на основном домене: ${CYAN}your-domain.com${NC}"
+                safe_echo "3. Примите условия использования и нажмите 'Submit'."
+                safe_echo "4. Скопируйте 'Site Key' и 'Secret Key'."
+                echo
+                read -p "$(safe_echo "${YELLOW}Введите Site Key: ${NC}")" new_site_key
+                read -p "$(safe_echo "${YELLOW}Введите Secret Key: ${NC}")" new_secret_key
+
+                if [ -n "$new_site_key" ] && [ -n "$new_secret_key" ]; then
+                    write_captcha_settings "recaptcha_v2" "$new_site_key" "$new_secret_key"
+                else
+                    log "WARN" "Site Key и Secret Key не могут быть пустыми."
+                fi
+                read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+                ;;
+            2)
+                print_header "НАСТРОЙКА CLOUDFLARE TURNSTILE" "$CYAN"
+                safe_echo "Для настройки вам понадобятся 'Site Key' и 'Secret Key'."
+                safe_echo "1. Войдите в свою панель управления Cloudflare."
+                safe_echo "2. В меню слева выберите 'Turnstile'."
+                safe_echo "3. Нажмите 'Add site':"
+                safe_echo "   - ${BOLD}Site name:${NC} Придумайте любое имя, например, 'Matrix Server'."
+                safe_echo "   - ${BOLD}Domain:${NC} Укажите домен, на котором будет доступен MAS."
+                safe_echo "     - Если у вас MAS на поддомене: ${CYAN}auth.your-domain.com${NC}"
+                safe_echo "     - Если MAS доступен на основном домене: ${CYAN}your-domain.com${NC}"
+                safe_echo "   - ${BOLD}Widget Mode:${NC} Выберите 'Managed'."
+                safe_echo "4. Нажмите 'Create'."
+                safe_echo "5. Скопируйте 'Site Key' и 'Secret Key' в поля ниже."
+                echo
+                read -p "$(safe_echo "${YELLOW}Введите Site Key: ${NC}")" new_site_key
+                read -p "$(safe_echo "${YELLOW}Введите Secret Key: ${NC}")" new_secret_key
+
+                if [ -n "$new_site_key" ] && [ -n "$new_secret_key" ]; then
+                    write_captcha_settings "cloudflare_turnstile" "$new_site_key" "$new_secret_key"
+                else
+                    log "WARN" "Site Key и Secret Key не могут быть пустыми."
+                fi
+                read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+                ;;
+            3)
+                if ask_confirmation "Вы уверены, что хотите отключить CAPTCHA?"; then
+                    write_captcha_settings "null" "" ""
+                fi
+                read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+                ;;
+            4)
+                return 0
+                ;;
+            *)
+                log "ERROR" "Неверный выбор. Попробуйте снова"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# Меню управления заблокированными именами
+manage_banned_usernames() {
+    print_header "УПРАВЛЕНИЕ ЗАБЛОКИРОВАННЫМИ ИМЕНАМИ" "$BLUE"
+
+    if [ ! -f "$MAS_CONFIG_FILE" ]; then
+        log "ERROR" "Файл конфигурации MAS не найден: $MAS_CONFIG_FILE"
+        read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+        return 1
+    fi
+
+    # Функция для чтения заблокированных имен из YAML
+    read_banned_usernames() {
+        yq eval '.policy.data.registration.banned_usernames' "$MAS_CONFIG_FILE"
+    }
+
+    # Функция для записи заблокированных имен в YAML
+    write_banned_usernames() {
+        local yaml_string="$1"
+        if ! yq eval -i '.policy.data.registration.banned_usernames = '"$yaml_string"'' "$MAS_CONFIG_FILE"; then
+            log "ERROR" "Не удалось записать данные в $MAS_CONFIG_FILE"
+            return 1
+        fi
+        log "INFO" "Перезапуск MAS для применения изменений..."
+        if systemctl restart matrix-auth-service; then
+            log "SUCCESS" "Настройки заблокированных имен обновлены"
+            sleep 3
+        else
+            log "ERROR" "Ошибка перезапуска matrix-auth-service"
+            return 1
+        fi
+    }
+
+    # Проверяем наличие yq
+    if ! command -v yq &> /dev/null; then
+        log "ERROR" "Утилита 'yq' не найдена. Она необходима для управления YAML конфигурацией."
+        log "INFO" "Пожалуйста, установите 'yq' (например, 'sudo apt install yq' или 'sudo snap install yq')"
+        read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+        return 1
+    fi
+
+    while true; do
+        print_header "УПРАВЛЕНИЕ ЗАБЛОКИРОВАННЫМИ ИМЕНАМИ" "$BLUE"
+        
+        safe_echo "${BOLD}${CYAN}Текущие заблокированные имена:${NC}"
+        local current_config=$(read_banned_usernames)
+        
+        if [ -z "$current_config" ] || [ "$current_config" = "null" ]; then
+            safe_echo "${YELLOW}Списки заблокированных имен пусты.${NC}"
+        else
+            echo "$current_config" | yq eval -P -
+        fi
+        echo
+
+        safe_echo "${BOLD}${CYAN}Доступные опции:${NC}"
+        safe_echo "${GREEN}1.${NC} ➕ Добавить значение"
+        safe_echo "${GREEN}2.${NC} 🗑️  Очистить все списки"
+        safe_echo "${GREEN}3.${NC} ⚙️  Установить значения по умолчанию"
+        safe_echo "${GREEN}4.${NC} ↩️  Вернуться в меню MAS"
+        echo
+        
+        read -p "$(safe_echo "${YELLOW}Выберите опцию [1-4]: ${NC}")" choice
+
+        case $choice in
+            1)
+                safe_echo "Выберите тип блокировки:"
+                safe_echo "  1. literals (Точное совпадение)"
+                safe_echo "  2. substrings (Вхождение подстроки)"
+                safe_echo "  3. regexes (Регулярное выражение)"
+                read -p "Ваш выбор [1-3]: " type_choice
+
+                local key_to_add=""
+                case $type_choice in
+                    1) key_to_add="literals";;
+                    2) key_to_add="substrings";;
+                    3) key_to_add="regexes";;
+                    *) log "ERROR" "Неверный выбор"; continue;;
+                esac
+
+                read -p "Введите значение для добавления в '$key_to_add': " value_to_add
+                if [ -n "$value_to_add" ]; then
+                    yq eval -i ".policy.data.registration.banned_usernames.$key_to_add += [\"$value_to_add\"]" "$MAS_CONFIG_FILE"
+                    log "SUCCESS" "Значение '$value_to_add' добавлено в '$key_to_add'"
+                    systemctl restart matrix-auth-service
+                else
+                    log "WARN" "Значение не может быть пустым"
+                fi
+                read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+                ;;
+            2)
+                if ask_confirmation "Вы уверены, что хотите очистить все списки заблокированных имен?"; then
+                    write_banned_usernames "null"
+                fi
+                read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+                ;;
+            3)
+                if ask_confirmation "Вы уверены, что хотите установить значения по умолчанию?"; then
+                    local default_yaml="{literals: [\"admin\", \"root\", \"test\"], substrings: [\"admin\", \"mod\"], regexes: [\"^system.*\", \".*bot\$\"]}"
+                    write_banned_usernames "$default_yaml"
+                fi
+                read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+                ;;
+            4)
+                return 0
+                ;;
+            *)
+                log "ERROR" "Неверный выбор. Попробуйте снова"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# Меню управления регистрацией MAS
+manage_mas_registration() {
+    while true; do
+        print_header "УПРАВЛЕНИЕ РЕГИСТРАЦИЕЙ MAS" "$BLUE"
+        
+        local open_reg_status=$(get_mas_registration_status)
+        local token_reg_status=$(get_mas_token_registration_status)
+        
+        safe_echo -n "Статус открытой регистрации: "
+        if [ "$open_reg_status" = "enabled" ]; then
+            safe_echo "${GREEN}ON (Регистрация разрешена)${NC}"
+        else
+            safe_echo "${RED}OFF (Регистрация запрещена)${NC}"
+        fi
+        
+        safe_echo -n "Требование токена для регистрации: "
+        if [ "$token_reg_status" = "enabled" ]; then
+            safe_echo "${GREEN}ON (Токен обязателен)${NC}"
+        else
+            safe_echo "${RED}OFF (Токен не требуется)${NC}"
+        fi
+        echo
+        
+        safe_echo "${BOLD}${CYAN}Доступные опции:${NC}"
+        safe_echo "${GREEN}1.${NC} Включить/Отключить открытую регистрацию"
+        safe_echo "${GREEN}2.${NC} Включить/Отключить требование токена"
+        
+        if [ "$token_reg_status" = "enabled" ]; then
+            safe_echo "${GREEN}3.${NC} 🔑 Сгенерировать токен регистрации"
+            safe_echo "${GREEN}4.${NC} 👁️  Просмотреть токены регистрации"
+        fi
+        
+        safe_echo "${GREEN}5.${NC} 🚫 Управление заблокированными именами"
+        safe_echo "${GREEN}6.${NC} 🛡️  Управление CAPTCHA"
+        safe_echo "${GREEN}7.${NC} ↩️  Вернуться в меню MAS"
+        echo
+        
+        read -p "$(safe_echo "${YELLOW}Выберите опцию: ${NC}")" choice
+        
+        case $choice in
+            1)
+                if [ "$open_reg_status" = "enabled" ]; then
+                    set_mas_config_value "password_registration_enabled" "false"
+                else
+                    set_mas_config_value "password_registration_enabled" "true"
+                fi
+                read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+                ;;
+            2)
+                if [ "$token_reg_status" = "enabled" ]; then
+                    set_mas_config_value "registration_token_required" "false"
+                else
+                    set_mas_config_value "registration_token_required" "true"
+                fi
+                read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
+                ;;
+            3)
+                if [ "$token_reg_status" = "enabled" ]; then
+                    generate_registration_token
+                else
+                    log "ERROR" "Неверный выбор. Попробуйте снова"
+                    sleep 1
+                fi
+                ;;
+            4)
+                if [ "$token_reg_status" = "enabled" ]; then
+                    view_registration_tokens
+                else
+                    log "ERROR" "Неверный выбор. Попробуйте снова"
+                    sleep 1
+                fi
+                ;;
+            5)
+                manage_banned_usernames
+                ;;
+            6)
+                manage_captcha_settings
+                ;;
+            7)
+                return 0
+                ;;
+            *)
+                log "ERROR" "Неверный выбор. Попробуйте снова"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
 # Главное меню модуля
 show_main_menu() {
     while true; do
@@ -1013,12 +1695,14 @@ show_main_menu() {
         safe_echo "${BOLD}${CYAN}Доступные опции:${NC}"
         safe_echo "${GREEN}1.${NC} 🚀 Установить Matrix Authentication Service"
         safe_echo "${GREEN}2.${NC} 📊 Проверить статус MAS"
-        safe_echo "${GREEN}3.${NC} 🔧 Диагностика MAS"
-        safe_echo "${GREEN}4.${NC} 🗑️  Удалить MAS"
-        safe_echo "${GREEN}5.${NC} ↩️  Вернуться в главное меню"
+        safe_echo "${GREEN}3.${NC} 🚪 Управление регистрацией MAS"
+        safe_echo "${GREEN}4.${NC} 🔧 Диагностика MAS"
+        safe_echo "${GREEN}5.${NC} SSO Управление внешними провайдерами (SSO)"
+        safe_echo "${GREEN}6.${NC} 🗑️  Удалить MAS"
+        safe_echo "${GREEN}7.${NC} ↩️  Вернуться в главное меню"
         echo
         
-        read -p "$(safe_echo "${YELLOW}Выберите опцию [1-5]: ${NC}")" choice
+        read -p "$(safe_echo "${YELLOW}Выберите опцию [1-7]: ${NC}")" choice
         
         case $choice in
             1)
@@ -1030,14 +1714,20 @@ show_main_menu() {
                 read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
                 ;;
             3)
+                manage_mas_registration
+                ;;
+            4)
                 diagnose_mas
                 read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
                 ;;
-            4)
+            5)
+                manage_sso_providers
+                ;;
+            6)
                 uninstall_mas
                 read -p "$(safe_echo "${CYAN}Нажмите Enter для продолжения...${NC}")"
                 ;;
-            5)
+            7)
                 log "INFO" "Возврат в главное меню"
                 return 0
                 ;;
