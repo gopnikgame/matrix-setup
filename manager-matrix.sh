@@ -743,7 +743,7 @@ manage_postgresql_service() {
     safe_echo "${BOLD}Доступные действия:${NC}"
     safe_echo "${GREEN}1.${NC} Запустить"
     safe_echo "${GREEN}2.${NC} Остановить"
-    safe_echo "${GREEN}3.${NC} Перезапустить"
+    safe_echo "${GREEN}3.${NC} Перезагрузить"
     safe_echo "${GREEN}4.${NC} Показать логи"
     safe_echo "${GREEN}5.${NC} Подключиться к базе данных"
     safe_echo "${GREEN}6.${NC} Назад"
@@ -1137,8 +1137,8 @@ initialize() {
     done
     
     if [ ${#missing_modules[@]} -gt 0 ]; then
-        log "ERROR" "Отсутствуют модули: ${missing_modules[*]}"
-        log "ERROR" "Проверьте структуру проекта"
+        log "ERROR" "Отсутствуют критически важные модули: ${missing_modules[*]}"
+        log "ERROR" "Проверьте подключение к интернету и права доступа, затем перезапустите скрипт для повторной попытки обновления."
         return 1
     fi
     
@@ -1190,10 +1190,10 @@ manage_additional_components() {
 
 # Функция обновления модулей и библиотеки
 update_modules_and_library() {
-    print_header "ОБНОВЛЕНИЕ МОДУЛЕЙ И БИБЛИОТЕКИ" "$YELLOW"
+    # Эта функция не должна выводить заголовок, так как она работает в "тихом" режиме при старте
     
-    if ! check_internet; then
-        log "ERROR" "Нет подключения к интернету. Обновление невозможно."
+    if ! check_internet >/dev/null 2>&1; then
+        log "WARN" "Нет подключения к интернету. Обновление невозможно."
         return 1
     fi
     
@@ -1202,7 +1202,7 @@ update_modules_and_library() {
     local repo_raw_url="https://raw.githubusercontent.com/gopnikgame/matrix-setup/main"
     local repo_api_url="https://api.github.com/repos/gopnikgame/matrix-setup/contents/modules"
     local updated_files=0
-    local checked_files=0
+    local manager_updated=false
     
     # Список файлов для проверки
     local files_to_check=()
@@ -1214,52 +1214,43 @@ update_modules_and_library() {
     files_to_check+=("manager-matrix.sh")
     
     # Получаем список модулей из репозитория
-    log "INFO" "Получение списка модулей из репозитория GitHub..."
     local remote_modules=()
     
-    # Проверяем наличие curl и jq
     if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
-        log "WARN" "curl или jq не установлены. Невозможно получить список новых модулей."
-        log "INFO" "Будут обновлены только существующие файлы."
-        # Добавляем все существующие модули
+        log "WARN" "curl или jq не установлены. Невозможно получить список новых модулей. Будут обновлены только существующие."
         for module_path in "$MODULES_DIR"/*.sh; do
             if [ -f "$module_path" ]; then
                 files_to_check+=("modules/$(basename "$module_path")")
             fi
         done
     else
-        # Используем API GitHub для получения списка файлов в директории modules
         local modules_json=$(curl -sL --fail "$repo_api_url")
         if [ $? -eq 0 ] && [ -n "$modules_json" ]; then
-            # Используем jq для парсинга JSON и получения имен файлов
             while IFS= read -r line; do
                 remote_modules+=("$line")
             done < <(echo "$modules_json" | jq -r '.[] | select(.type == "file" and .name | endswith(".sh")) | .name')
             
             if [ ${#remote_modules[@]} -gt 0 ]; then
-                log "INFO" "Найдено ${#remote_modules[@]} модулей в репозитории."
                 for module_name in "${remote_modules[@]}"; do
                     files_to_check+=("modules/$module_name")
                 done
             else
                 log "WARN" "Не удалось получить список модулей из репозитория. Обновляем только существующие."
-                for module_path in "$MODULES_DIR"/*.sh; do
-                    if [ -f "$module_path" ]; then
-                        files_to_check+=("modules/$(basename "$module_path")")
-                    fi
-                done
             fi
         else
             log "WARN" "Не удалось связаться с API GitHub. Обновляем только существующие модули."
-            for module_path in "$MODULES_DIR"/*.sh; do
-                if [ -f "$module_path" ]; then
+        fi
+        # Добавляем существующие на случай, если API недоступен
+        for module_path in "$MODULES_DIR"/*.sh; do
+            if [ -f "$module_path" ]; then
+                # Избегаем дублирования
+                if ! [[ " ${files_to_check[*]} " =~ " modules/$(basename "$module_path") " ]]; then
                     files_to_check+=("modules/$(basename "$module_path")")
                 fi
-            done
-        fi
+            fi
+        done
     fi
     
-    # Проверка зависимостей
     if ! command -v sha256sum >/dev/null 2>&1; then
         log "ERROR" "Команда 'sha256sum' не найдена. Установите coreutils (sudo apt install coreutils)."
         return 1
@@ -1268,20 +1259,16 @@ update_modules_and_library() {
     for file_rel_path in "${files_to_check[@]}"; do
         local local_file_path="${SCRIPT_DIR}/${file_rel_path}"
         local remote_file_url="${repo_raw_url}/${file_rel_path}"
-        local temp_file=$(mktemp)
-        
-        ((checked_files++))
-        
-        log "DEBUG" "Проверка файла: $file_rel_path"
+        local temp_file
+        temp_file=$(mktemp)
         
         # Скачиваем удаленный файл
         if ! curl -sL --fail "$remote_file_url" -o "$temp_file"; then
-            log "WARN" "Не удалось скачать удаленный файл: $remote_file_url"
+            log "WARN" "Не удалось скачать файл: $remote_file_url"
             rm -f "$temp_file"
             continue
         fi
         
-        # Проверяем размер загруженного файла
         if [ ! -s "$temp_file" ]; then
             log "WARN" "Загруженный файл пуст: $file_rel_path"
             rm -f "$temp_file"
@@ -1290,11 +1277,8 @@ update_modules_and_library() {
         
         # Если локального файла нет, это новый файл
         if [ ! -f "$local_file_path" ]; then
-            log "INFO" "Найден новый файл: $file_rel_path"
-            
-            # Создаем директорию если нужно
+            log "INFO" "Загрузка нового файла: $file_rel_path"
             mkdir -p "$(dirname "$local_file_path")"
-            
             if mv "$temp_file" "$local_file_path"; then
                 chmod +x "$local_file_path"
                 log "SUCCESS" "Файл $file_rel_path успешно загружен."
@@ -1307,46 +1291,25 @@ update_modules_and_library() {
         fi
         
         # Сравниваем хеши
-        local local_hash=$(sha256sum "$local_file_path" | awk '{print $1}')
-        local remote_hash=$(sha256sum "$temp_file" | awk '{print $1}')
+        local local_hash
+        local remote_hash
+        local_hash=$(sha256sum "$local_file_path" | awk '{print $1}')
+        remote_hash=$(sha256sum "$temp_file" | awk '{print $1}')
         
         if [ "$local_hash" != "$remote_hash" ]; then
             log "INFO" "Обнаружено обновление для: $file_rel_path"
+            cp "$local_file_path" "${local_file_path}.backup.$(date +%Y%m%d_%H%M%S)"
             
-            # Особая обработка для главного менеджера
-            if [ "$file_rel_path" = "manager-matrix.sh" ]; then
-                log "WARN" "Обновление главного менеджера требует перезапуска скрипта!"
-                
-                if ask_confirmation "Обновить главный менеджер? (потребуется перезапуск)"; then
-                    # Создаем резервную копию
-                    cp "$local_file_path" "${local_file_path}.backup.$(date +%Y%m%d_%H%M%S)"
-                    
-                    if mv "$temp_file" "$local_file_path"; then
-                        chmod +x "$local_file_path"
-                        log "SUCCESS" "Главный менеджер обновлен."
-                        log "INFO" "Для применения изменений необходимо перезапустить скрипт."
-                        safe_echo "${YELLOW}Перезапустите команду: manager-matrix${NC}"
-                        ((updated_files++))
-                        
-                        # Немедленный выход для перезагрузки
-                        exit 0
-                    else
-                        log "ERROR" "Ошибка при обновлении главного менеджера"
-                        rm -f "$temp_file"
-                    fi
-                else
-                    rm -f "$temp_file"
+            if mv "$temp_file" "$local_file_path"; then
+                chmod +x "$local_file_path"
+                log "SUCCESS" "Файл $file_rel_path обновлен."
+                ((updated_files++))
+                if [ "$file_rel_path" = "manager-matrix.sh" ]; then
+                    manager_updated=true
                 fi
             else
-                # Обычная обработка для других файлов
-                if mv "$temp_file" "$local_file_path"; then
-                    chmod +x "$local_file_path"
-                    log "SUCCESS" "Файл $file_rel_path обновлен."
-                    ((updated_files++))
-                else
-                    log "ERROR" "Ошибка при обновлении файла: $local_file_path"
-                    rm -f "$temp_file"
-                fi
+                log "ERROR" "Ошибка при обновлении файла: $local_file_path"
+                rm -f "$temp_file"
             fi
         else
             rm -f "$temp_file"
@@ -1354,14 +1317,14 @@ update_modules_and_library() {
     done
     
     if [ $updated_files -gt 0 ]; then
-        log "SUCCESS" "Обновление завершено. Обновлено/загружено файлов: $updated_files из $checked_files."
-        
-        # Если обновились модули, перезагружаем их
-        if [ $updated_files -gt 0 ] && [ "$file_rel_path" != "manager-matrix.sh" ]; then
-            log "INFO" "Для применения изменений в модулях рекомендуется перезагрузить менеджер."
+        log "SUCCESS" "Обновление завершено. Обновлено/загружено файлов: $updated_files."
+        if [ "$manager_updated" = true ]; then
+            log "WARN" "Главный менеджер был обновлен."
+            safe_echo "${YELLOW}Пожалуйста, перезапустите скрипт, чтобы применить изменения.${NC}"
+            exit 0
         fi
     else
-        log "INFO" "Все модули, библиотека и менеджер уже в актуальном состоянии."
+        log "INFO" "Все модули, библиотека и менеджер в актуальном состоянии."
     fi
     
     return 0
@@ -2136,7 +2099,7 @@ diagnose_registration_issues() {
     
     # 4. Проверка macaroon_secret_key
     safe_echo "${BLUE}4. Проверка macaroon_secret_key:${NC}"
-    if grep -q "macaroon_secret_key:" /etc/matrix-synapse/homeserver.yaml; then
+    if grep -q "macaroon_secret_key:" /etc/matrix-synapse/homeserver.yaml 2>/dev/null; then
         safe_echo "   ${GREEN}✅ macaroon_secret_key найден в homeserver.yaml${NC}"
     else
         safe_echo "   ${RED}❌ macaroon_secret_key не найден${NC}"
@@ -2146,7 +2109,7 @@ diagnose_registration_issues() {
     
     # 5. Проверка form_secret
     safe_echo "${BLUE}5. Проверка form_secret:${NC}"
-    if grep -q "form_secret:" /etc/matrix-synapse/homeserver.yaml; then
+    if grep -q "form_secret:" /etc/matrix-synapse/homeserver.yaml 2>/dev/null; then
         safe_echo "   ${GREEN}✅ form_secret найден в homeserver.yaml${NC}"
     else
         safe_echo "   ${RED}❌ form_secret не найден${NC}"
@@ -2272,7 +2235,7 @@ fix_registration_issues() {
         fi
     fi
     
-    # Создаем резервную копию конфигурации один раз
+    # Создаем резервнуюコピー конфигурации один раз
     if [ ! -f "/etc/matrix-synapse/homeserver.yaml.backup.$(date +%Y%m%d)" ]; then
         safe_echo "${BLUE}🔧 Создание резервной копии конфигурации...${NC}"
         cp /etc/matrix-synapse/homeserver.yaml /etc/matrix-synapse/homeserver.yaml.backup.$(date +%Y%m%d_%H%M%S)
@@ -2456,9 +2419,12 @@ fix_registration_issues() {
 
 # Главная функция
 main() {
+    # Автоматическое обновление при запуске
+    update_modules_and_library
+    
     # Инициализация
     if ! initialize; then
-        log "ERROR" "Ошибка инициализации"
+        # Сообщение об ошибке уже выводится в initialize()
         exit 1
     fi
     
@@ -2467,13 +2433,7 @@ main() {
     
     log "INFO" "Запуск $LIB_NAME v$LIB_VERSION"
     log "INFO" "Проект: $PROJECT_NAME"
-    
-    # Проверка обновлений при запуске
-    if ask_confirmation "Проверить наличие обновлений для модулей и библиотеки?"; then
-        update_modules_and_library
-        read -p "Нажмите Enter для продолжения..."
-    fi
-    
+
     # Запуск главного меню
     main_menu
 }
