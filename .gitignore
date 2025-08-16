@@ -449,3 +449,5 @@ docs/caddy.txt
 docs/doc-MAS-matrix.txt
 docs/mas-deployment-guide.md
 docs/mas-overview.md
+docs/reverv.txt
+test_mas_fix.sh
