@@ -9,6 +9,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Подключение общей библиотеки
 if [ -f "${SCRIPT_DIR}/../common/common_lib.sh" ]; then
     source "${SCRIPT_DIR}/../common/common_lib.sh"
+else
+    echo "ОШИБКА: Не найдена общая библиотека common_lib.sh"
+    exit 1
 fi
 
 # Настройки модуля
@@ -23,24 +26,70 @@ MAS_PORT_HOSTING="8080"
 MAS_PORT_PROXMOX="8082"
 MAS_DB_NAME="mas_db"
 
+# Проверка root прав
+check_root
+
+# Загружаем тип сервера
+load_server_type
+
 # --- Управляющие функции MAS ---
 
 # Проверка статуса MAS
 check_mas_status() {
     print_header "СТАТУС MATRIX AUTHENTICATION SERVICE" "$CYAN"
 
-    # Проверяем, запущен ли процесс MAS
-    if pgrep -f "mas" >/dev/null 2>&1; then
-        echo "MAS запущен."
+    # Проверяем статус службы matrix-auth-service
+    if systemctl is-active --quiet matrix-auth-service; then
+        log "SUCCESS" "MAS служба запущена"
+        
+        # Показываем статус
+        systemctl status matrix-auth-service --no-pager -l
+        
+        # Проверяем порт MAS
+        local mas_port=""
+        if [ -f "$CONFIG_DIR/mas.conf" ]; then
+            mas_port=$(grep "MAS_PORT=" "$CONFIG_DIR/mas.conf" | cut -d'=' -f2 | tr -d '"')
+        fi
+        
+        if [ -n "$mas_port" ]; then
+            if ss -tlnp | grep -q ":$mas_port "; then
+                log "SUCCESS" "MAS слушает на порту $mas_port"
+            else
+                log "WARN" "MAS НЕ слушает на порту $mas_port"
+            fi
+            
+            # Проверяем доступность API
+            local health_url="http://localhost:$mas_port/health"
+            if curl -s -f --connect-timeout 3 "$health_url" >/dev/null 2>&1; then
+                log "SUCCESS" "MAS API доступен"
+            else
+                log "WARN" "MAS API недоступен"
+            fi
+        else
+            log "WARN" "Порт MAS не определен"
+        fi
     else
-        echo "MAS не запущен."
+        log "ERROR" "MAS служба не запущена"
+        
+        # Проверяем, установлен ли MAS
+        if command -v mas >/dev/null 2>&1; then
+            log "INFO" "MAS установлен, но служба не запущена"
+        else
+            log "ERROR" "MAS не установлен"
+        fi
     fi
-
-    # Проверяем, слушает ли MAS нужный порт
-    if lsof -iTCP:$MAS_PORT_HOSTING -sTCP:LISTEN >/dev/null 2>&1; then
-        echo "MAS слушает на порту $MAS_PORT_HOSTING."
+    
+    # Проверяем конфигурационные файлы
+    if [ -f "$MAS_CONFIG_FILE" ]; then
+        log "SUCCESS" "Конфигурационный файл MAS найден"
     else
-        echo "MAS НЕ слушает на порту $MAS_PORT_HOSTING."
+        log "ERROR" "Конфигурационный файл MAS не найден: $MAS_CONFIG_FILE"
+    fi
+    
+    if [ -f "$SYNAPSE_MAS_CONFIG" ]; then
+        log "SUCCESS" "Интеграция Synapse с MAS настроена"
+    else
+        log "WARN" "Интеграция Synapse с MAS не настроена"
     fi
 }
 
@@ -48,42 +97,143 @@ check_mas_status() {
 uninstall_mas() {
     print_header "УДАЛЕНИЕ MATRIX AUTHENTICATION SERVICE" "$RED"
 
-    echo "Удаление MAS..."
+    if ! ask_confirmation "Вы действительно хотите удалить Matrix Authentication Service?"; then
+        log "INFO" "Удаление отменено"
+        return 0
+    fi
+
+    log "INFO" "Удаление MAS..."
 
     # Остановка службы MAS
-    systemctl stop matrix-synapse.service
+    if systemctl is-active --quiet matrix-auth-service; then
+        log "INFO" "Остановка службы matrix-auth-service..."
+        systemctl stop matrix-auth-service
+    fi
 
-    # Удаление пакетов MAS
-    apt-get remove --purge matrix-synapse mas -y
+    # Отключение автозапуска
+    if systemctl is-enabled --quiet matrix-auth-service 2>/dev/null; then
+        log "INFO" "Отключение автозапуска matrix-auth-service..."
+        systemctl disable matrix-auth-service
+    fi
 
-    # Удаление оставшихся конфигурационных файлов
-    rm -rf $MAS_CONFIG_DIR
-    rm -rf /etc/matrix-synapse/conf.d/mas.yaml
-    rm -rf /etc/matrix-synapse/homeserver.yaml
+    # Удаление systemd сервиса
+    if [ -f "/etc/systemd/system/matrix-auth-service.service" ]; then
+        log "INFO" "Удаление systemd сервиса..."
+        rm -f /etc/systemd/system/matrix-auth-service.service
+        systemctl daemon-reload
+    fi
 
-    echo "MAS успешно удалён."
+    # Удаление бинарного файла MAS
+    if [ -f "/usr/local/bin/mas" ]; then
+        log "INFO" "Удаление бинарного файла MAS..."
+        rm -f /usr/local/bin/mas
+    fi
+
+    # Удаление конфигурационных файлов MAS
+    if [ -d "$MAS_CONFIG_DIR" ]; then
+        log "INFO" "Удаление конфигурации MAS..."
+        rm -rf "$MAS_CONFIG_DIR"
+    fi
+
+    # Удаление интеграции с Synapse
+    if [ -f "$SYNAPSE_MAS_CONFIG" ]; then
+        log "INFO" "Удаление интеграции с Synapse..."
+        rm -f "$SYNAPSE_MAS_CONFIG"
+        
+        # Перезапуск Synapse для применения изменений
+        if systemctl is-active --quiet matrix-synapse; then
+            log "INFO" "Перезапуск Synapse..."
+            systemctl restart matrix-synapse
+        fi
+    fi
+
+    # Удаление данных MAS
+    if [ -d "/var/lib/mas" ]; then
+        log "INFO" "Удаление данных MAS..."
+        rm -rf /var/lib/mas
+    fi
+
+    # Удаление конфигурационных файлов установщика
+    if [ -f "$CONFIG_DIR/mas.conf" ]; then
+        rm -f "$CONFIG_DIR/mas.conf"
+    fi
+    
+    if [ -f "$CONFIG_DIR/mas_database.conf" ]; then
+        rm -f "$CONFIG_DIR/mas_database.conf"
+    fi
+
+    # Удаление базы данных MAS (опционально)
+    if ask_confirmation "Удалить также базу данных MAS ($MAS_DB_NAME)?"; then
+        if sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$MAS_DB_NAME"; then
+            log "INFO" "Удаление базы данных $MAS_DB_NAME..."
+            sudo -u postgres dropdb "$MAS_DB_NAME"
+        fi
+    fi
+
+    log "SUCCESS" "MAS успешно удалён"
 }
 
 # Диагностика MAS
 diagnose_mas() {
     print_header "ДИАГНОСТИКА MATRIX AUTHENTICATION SERVICE" "$BLUE"
 
-    echo "Диагностика MAS..."
+    log "INFO" "Диагностика MAS..."
 
     # Проверка состояния службы MAS
-    systemctl status matrix-synapse.service
+    log "INFO" "Проверка службы matrix-auth-service..."
+    systemctl status matrix-auth-service --no-pager -l || log "ERROR" "Служба matrix-auth-service недоступна"
 
     # Проверка логов MAS
-    journalctl -u matrix-synapse.service --no-pager | tail -n 50
+    log "INFO" "Последние логи matrix-auth-service:"
+    journalctl -u matrix-auth-service --no-pager -n 20 || log "ERROR" "Не удалось получить логи"
 
-    # Проверка конфигурационных файлов MAS на наличие ошибок
-    synapse_config="/etc/matrix-synapse/homeserver.yaml"
-    if [ -f "$synapse_config" ]; then
-        echo "Проверка конфигурации Synapse..."
-        python3 -m synapse.config -c $synapse_config --validate
+    # Проверка конфигурационных файлов MAS
+    if [ -f "$MAS_CONFIG_FILE" ]; then
+        log "INFO" "Проверка конфигурации MAS..."
+        if command -v mas >/dev/null 2>&1; then
+            if mas doctor --config "$MAS_CONFIG_FILE"; then
+                log "SUCCESS" "Конфигурация MAS корректна"
+            else
+                log "ERROR" "Обнаружены проблемы в конфигурации MAS"
+            fi
+        else
+            log "WARN" "Команда 'mas' не найдена, пропускаем проверку конфигурации"
+        fi
+    else
+        log "ERROR" "Конфигурационный файл MAS не найден: $MAS_CONFIG_FILE"
     fi
 
-    echo "Диагностика завершена."
+    # Проверка интеграции с Synapse
+    if [ -f "$SYNAPSE_MAS_CONFIG" ]; then
+        log "SUCCESS" "Файл интеграции Synapse найден"
+        
+        # Проверяем, что Synapse запущен
+        if systemctl is-active --quiet matrix-synapse; then
+            log "SUCCESS" "Matrix Synapse запущен"
+        else
+            log "ERROR" "Matrix Synapse не запущен"
+        fi
+    else
+        log "ERROR" "Файл интеграции Synapse не найден: $SYNAPSE_MAS_CONFIG"
+    fi
+
+    # Проверка доступности API MAS
+    if [ -f "$CONFIG_DIR/mas.conf" ]; then
+        local mas_port=$(grep "MAS_PORT=" "$CONFIG_DIR/mas.conf" | cut -d'=' -f2 | tr -d '"')
+        
+        if [ -n "$mas_port" ]; then
+            log "INFO" "Проверка API MAS на порту $mas_port..."
+            local health_url="http://localhost:$mas_port/health"
+            
+            if curl -s -f --connect-timeout 3 "$health_url" >/dev/null 2>&1; then
+                log "SUCCESS" "MAS API доступен"
+            else
+                log "ERROR" "MAS API недоступен"
+            fi
+        fi
+    fi
+
+    log "INFO" "Диагностика завершена"
 }
 
 # Проверка наличия yq
@@ -163,6 +313,24 @@ get_mas_token_registration_status() {
     fi
 }
 
+# Получение статуса CAPTCHA
+get_mas_captcha_status() {
+    if [ ! -f "$MAS_CONFIG_FILE" ]; then
+        echo "unknown"
+        return 1
+    fi
+    if ! check_yq_dependency; then
+        echo "unknown"
+        return 1
+    fi
+    local service=$(yq eval '.captcha.service' "$MAS_CONFIG_FILE" 2>/dev/null)
+    if [ "$service" = "null" ] || [ "$service" = "~" ] || [ -z "$service" ]; then
+        echo "disabled"
+    else
+        echo "$service"
+    fi
+}
+
 # Изменение параметра в YAML файле
 set_mas_config_value() {
     local key="$1"
@@ -180,15 +348,33 @@ set_mas_config_value() {
         "password_registration_enabled"|"registration_token_required"|"email_change_allowed"|"displayname_change_allowed"|"password_change_allowed"|"password_recovery_enabled"|"account_deactivation_allowed")
             full_path=".account.$key"
             ;;
+        "captcha_service")
+            full_path=".captcha.service"
+            ;;
+        "captcha_site_key")
+            full_path=".captcha.site_key"
+            ;;
+        "captcha_secret_key")
+            full_path=".captcha.secret_key"
+            ;;
         *)
             log "ERROR" "Неизвестный параметр конфигурации: $key"
             return 1
             ;;
     esac
+    
+    # Создаем резервную копию
+    cp "$MAS_CONFIG_FILE" "$MAS_CONFIG_FILE.backup.$(date +%s)"
+    
     if ! yq eval -i "$full_path = $value" "$MAS_CONFIG_FILE"; then
         log "ERROR" "Не удалось изменить $key в $MAS_CONFIG_FILE"
         return 1
     fi
+    
+    # Устанавливаем права
+    chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE"
+    chmod 600 "$MAS_CONFIG_FILE"
+    
     log "INFO" "Перезапуск MAS для применения изменений..."
     if systemctl restart matrix-auth-service; then
         log "SUCCESS" "Настройка $key успешно изменена на $value"
@@ -199,38 +385,525 @@ set_mas_config_value() {
     return 0
 }
 
-# Генерация токена регистрации
-generate_registration_token() {
-    print_header "ГЕНЕРАЦИЯ ТОКЕНА РЕГИСТРАЦИИ" "$GREEN"
-
-    local token_length=32
-
-    # Генерация случайного токена
-    local token=$(openssl rand -hex $token_length)
-
-    echo "$token"
+# Установка CAPTCHA конфигурации
+set_mas_captcha_config() {
+    local service="$1"
+    local site_key="$2"
+    local secret_key="$3"
+    
+    if [ ! -f "$MAS_CONFIG_FILE" ]; then
+        log "ERROR" "Файл конфигурации MAS не найден: $MAS_CONFIG_FILE"
+        return 1
+    fi
+    
+    if ! check_yq_dependency; then
+        return 1
+    fi
+    
+    log "INFO" "Настройка CAPTCHA сервиса $service..."
+    
+    # Создаем резервную копию
+    cp "$MAS_CONFIG_FILE" "$MAS_CONFIG_FILE.backup.$(date +%s)"
+    
+    # Устанавливаем сервис
+    if [ "$service" = "disabled" ]; then
+        yq eval -i '.captcha.service = null' "$MAS_CONFIG_FILE"
+        yq eval -i 'del(.captcha.site_key)' "$MAS_CONFIG_FILE"
+        yq eval -i 'del(.captcha.secret_key)' "$MAS_CONFIG_FILE"
+    else
+        yq eval -i '.captcha.service = "'"$service"'"' "$MAS_CONFIG_FILE"
+        yq eval -i '.captcha.site_key = "'"$site_key"'"' "$MAS_CONFIG_FILE"
+        yq eval -i '.captcha.secret_key = "'"$secret_key"'"' "$MAS_CONFIG_FILE"
+    fi
+    
+    # Устанавливаем права
+    chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE"
+    chmod 600 "$MAS_CONFIG_FILE"
+    
+    log "INFO" "Перезапуск MAS для применения изменений..."
+    if systemctl restart matrix-auth-service; then
+        log "SUCCESS" "CAPTCHA конфигурация успешно обновлена"
+    else
+        log "ERROR" "Ошибка перезапуска matrix-auth-service"
+        return 1
+    fi
+    
+    return 0
 }
 
-# Просмотр существующих токенов
-view_registration_tokens() {
-    print_header "ПРОСМОТР ТОКЕНОВ РЕГИСТРАЦИИ" "$BLUE"
+# Управление настройками CAPTCHA
+manage_captcha_settings() {
+    print_header "УПРАВЛЕНИЕ НАСТРОЙКАМИ CAPTCHA" "$BLUE"
 
-    if [ ! -f "$MAS_CONFIG_FILE" ]; then
-        echo "Файл конфигурации MAS не найден: $MAS_CONFIG_FILE"
+    # Проверка наличия yq
+    if ! check_yq_dependency; then
+        read -p "Нажмите Enter для возврата..."
         return 1
     fi
 
-    # Извлечение и отображение токенов с использованием yq
-    yq eval '.registration.tokens[]' "$MAS_CONFIG_FILE"
+    while true; do
+        # Показываем текущий статус
+        local current_status=$(get_mas_captcha_status)
+        
+        safe_echo "Текущий статус CAPTCHA:"
+        case "$current_status" in
+            "disabled"|"null") safe_echo "• CAPTCHA: ${RED}ОТКЛЮЧЕНА${NC}" ;;
+            "recaptcha_v2") safe_echo "• CAPTCHA: ${GREEN}Google reCAPTCHA v2${NC}" ;;
+            "cloudflare_turnstile") safe_echo "• CAPTCHA: ${GREEN}Cloudflare Turnstile${NC}" ;;
+            "hcaptcha") safe_echo "• CAPTCHA: ${GREEN}hCaptcha${NC}" ;;
+            *) safe_echo "• CAPTCHA: ${YELLOW}$current_status${NC}" ;;
+        esac
+        
+        echo
+        safe_echo "Доступные провайдеры CAPTCHA:"
+        safe_echo "1. Отключить CAPTCHA"
+        safe_echo "2. Настроить Google reCAPTCHA v2"
+        safe_echo "3. Настроить Cloudflare Turnstile"
+        safe_echo "4. Настроить hCaptcha"
+        safe_echo "5. Назад"
+
+        read -p "Выберите действие [1-5]: " action
+
+        case $action in
+            1)
+                log "INFO" "Отключение CAPTCHA..."
+                set_mas_captcha_config "disabled" "" ""
+                ;;
+            2)
+                print_header "НАСТРОЙКА GOOGLE reCAPTCHA v2" "$CYAN"
+                safe_echo "Для настройки Google reCAPTCHA v2:"
+                safe_echo "1. Перейдите на https://www.google.com/recaptcha/admin"
+                safe_echo "2. Создайте новый сайт с типом 'reCAPTCHA v2'"
+                safe_echo "3. Добавьте ваш домен в список разрешенных доменов"
+                safe_echo "4. Скопируйте 'Site Key' и 'Secret Key'"
+                echo
+                read -p "Введите Site Key: " site_key
+                read -p "Введите Secret Key: " secret_key
+                
+                if [ -n "$site_key" ] && [ -n "$secret_key" ]; then
+                    set_mas_captcha_config "recaptcha_v2" "$site_key" "$secret_key"
+                else
+                    log "ERROR" "Site Key и Secret Key не могут быть пустыми"
+                fi
+                ;;
+            3)
+                print_header "НАСТРОЙКА CLOUDFLARE TURNSTILE" "$CYAN"
+                safe_echo "Для настройки Cloudflare Turnstile:"
+                safe_echo "1. Перейдите в Cloudflare Dashboard → Turnstile"
+                safe_echo "2. Создайте новый сайт"
+                safe_echo "3. Добавьте ваш домен"
+                safe_echo "4. Скопируйте 'Site Key' и 'Secret Key'"
+                echo
+                read -p "Введите Site Key: " site_key
+                read -p "Введите Secret Key: " secret_key
+                
+                if [ -n "$site_key" ] && [ -n "$secret_key" ]; then
+                    set_mas_captcha_config "cloudflare_turnstile" "$site_key" "$secret_key"
+                else
+                    log "ERROR" "Site Key и Secret Key не могут быть пустыми"
+                fi
+                ;;
+            4)
+                print_header "НАСТРОЙКА hCAPTCHA" "$CYAN"
+                safe_echo "Для настройки hCaptcha:"
+                safe_echo "1. Перейдите на https://dashboard.hcaptcha.com/"
+                safe_echo "2. Создайте новый сайт"
+                safe_echo "3. Добавьте ваш домен"
+                safe_echo "4. Скопируйте 'Site Key' и 'Secret Key'"
+                echo
+                read -p "Введите Site Key: " site_key
+                read -p "Введите Secret Key: " secret_key
+                
+                if [ -n "$site_key" ] && [ -n "$secret_key" ]; then
+                    set_mas_captcha_config "hcaptcha" "$site_key" "$secret_key"
+                else
+                    log "ERROR" "Site Key и Secret Key не могут быть пустыми"
+                fi
+                ;;
+            5)
+                return 0
+                ;;
+            *)
+                log "ERROR" "Некорректный ввод. Попробуйте ещё раз."
+                sleep 1
+                ;;
+        esac
+    done
 }
 
+# Управление заблокированными именами пользователей
+manage_banned_usernames() {
+    print_header "УПРАВЛЕНИЕ ЗАБЛОКИРОВАННЫМИ ИМЕНАМИ ПОЛЬЗОВАТЕЛЕЙ" "$BLUE"
+
+    # Проверка наличия yq
+    if ! check_yq_dependency; then
+        read -p "Нажмите Enter для возврата..."
+        return 1
+    fi
+
+    # Функция для показа текущих заблокированных имен
+    show_current_banned() {
+        local banned_literals=$(yq eval '.policy.data.registration.banned_usernames.literals[]' "$MAS_CONFIG_FILE" 2>/dev/null)
+        local banned_substrings=$(yq eval '.policy.data.registration.banned_usernames.substrings[]' "$MAS_CONFIG_FILE" 2>/dev/null)
+        local banned_regexes=$(yq eval '.policy.data.registration.banned_usernames.regexes[]' "$MAS_CONFIG_FILE" 2>/dev/null)
+        local banned_prefixes=$(yq eval '.policy.data.registration.banned_usernames.prefixes[]' "$MAS_CONFIG_FILE" 2>/dev/null)
+        local banned_suffixes=$(yq eval '.policy.data.registration.banned_usernames.suffixes[]' "$MAS_CONFIG_FILE" 2>/dev/null)
+        
+        safe_echo "${BOLD}Текущие заблокированные имена:${NC}"
+        
+        if [ -n "$banned_literals" ] && [ "$banned_literals" != "null" ]; then
+            safe_echo "${CYAN}Точные имена:${NC}"
+            echo "$banned_literals" | while read -r name; do
+                [ -n "$name" ] && safe_echo "  • $name"
+            done
+        fi
+        
+        if [ -n "$banned_substrings" ] && [ "$banned_substrings" != "null" ]; then
+            safe_echo "${CYAN}Подстроки:${NC}"
+            echo "$banned_substrings" | while read -r substring; do
+                [ -n "$substring" ] && safe_echo "  • *$substring*"
+            done
+        fi
+        
+        if [ -n "$banned_regexes" ] && [ "$banned_regexes" != "null" ]; then
+            safe_echo "${CYAN}Регулярные выражения:${NC}"
+            echo "$banned_regexes" | while read -r regex; do
+                [ -n "$regex" ] && safe_echo "  • $regex"
+            done
+        fi
+        
+        if [ -n "$banned_prefixes" ] && [ "$banned_prefixes" != "null" ]; then
+            safe_echo "${CYAN}Префиксы:${NC}"
+            echo "$banned_prefixes" | while read -r prefix; do
+                [ -n "$prefix" ] && safe_echo "  • $prefix*"
+            done
+        fi
+        
+        if [ -n "$banned_suffixes" ] && [ "$banned_suffixes" != "null" ]; then
+            safe_echo "${CYAN}Суффиксы:${NC}"
+            echo "$banned_suffixes" | while read -r suffix; do
+                [ -n "$suffix" ] && safe_echo "  • *$suffix"
+            done
+        fi
+        
+        if [ -z "$banned_literals$banned_substrings$banned_regexes$banned_prefixes$banned_suffixes" ] || 
+           [ "$banned_literals$banned_substrings$banned_regexes$banned_prefixes$banned_suffixes" = "nullnullnullnullnull" ]; then
+            safe_echo "Заблокированные имена не настроены"
+        fi
+    }
+
+    # Функция для добавления заблокированного имени
+    add_banned_username() {
+        local type="$1"
+        local type_name="$2"
+        local path="$3"
+        
+        read -p "Введите ${type_name,,}: " username
+        
+        if [ -z "$username" ]; then
+            log "ERROR" "Имя не может быть пустым"
+            return 1
+        fi
+        
+        # Создаем резервную копию
+        cp "$MAS_CONFIG_FILE" "$MAS_CONFIG_FILE.backup.$(date +%s)"
+        
+        # Инициализируем структуру если не существует
+        yq eval -i '.policy.data.registration.banned_usernames //= {}' "$MAS_CONFIG_FILE"
+        yq eval -i ".policy.data.registration.banned_usernames.$path //= []" "$MAS_CONFIG_FILE"
+        
+        # Добавляем новое имя
+        if yq eval -i ".policy.data.registration.banned_usernames.$path += [\"$username\"]" "$MAS_CONFIG_FILE"; then
+            # Устанавливаем права
+            chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE"
+            chmod 600 "$MAS_CONFIG_FILE"
+            
+            log "INFO" "Перезапуск MAS для применения изменений..."
+            if systemctl restart matrix-auth-service; then
+                log "SUCCESS" "$type_name '$username' добавлен в заблокированные"
+            else
+                log "ERROR" "Ошибка перезапуска matrix-auth-service"
+                return 1
+            fi
+        else
+            log "ERROR" "Не удалось добавить $type_name"
+            return 1
+        fi
+    }
+
+    # Функция для удаления заблокированного имени
+    remove_banned_username() {
+        local type="$1"
+        local type_name="$2"
+        local path="$3"
+        
+        # Показываем текущие значения этого типа
+        local current_items=$(yq eval ".policy.data.registration.banned_usernames.$path[]" "$MAS_CONFIG_FILE" 2>/dev/null)
+        
+        if [ -z "$current_items" ] || [ "$current_items" = "null" ]; then
+            log "WARN" "Нет заблокированных $type_name для удаления"
+            return 0
+        fi
+        
+        safe_echo "Текущие заблокированные $type_name:"
+        echo "$current_items" | nl
+        echo
+        
+        read -p "Введите $type_name для удаления: " username
+        
+        if [ -z "$username" ]; then
+            log "ERROR" "Имя не может быть пустым"
+            return 1
+        fi
+        
+        # Создаем резервную копию
+        cp "$MAS_CONFIG_FILE" "$MAS_CONFIG_FILE.backup.$(date +%s)"
+        
+        # Удаляем имя
+        if yq eval -i "del(.policy.data.registration.banned_usernames.$path[] | select(. == \"$username\"))" "$MAS_CONFIG_FILE"; then
+            # Устанавливаем права
+            chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE"
+            chmod 600 "$MAS_CONFIG_FILE"
+            
+            log "INFO" "Перезапуск MAS для применения изменений..."
+            if systemctl restart matrix-auth-service; then
+                log "SUCCESS" "$type_name '$username' удален из заблокированных"
+            else
+                log "ERROR" "Ошибка перезапуска matrix-auth-service"
+                return 1
+            fi
+        else
+            log "ERROR" "Не удалось удалить $type_name"
+            return 1
+        fi
+    }
+
+    # Функция для установки предустановленного набора заблокированных имен
+    set_default_banned_usernames() {
+        log "INFO" "Установка стандартного набора заблокированных имен..."
+        
+        # Создаем резервную копию
+        cp "$MAS_CONFIG_FILE" "$MAS_CONFIG_FILE.backup.$(date +%s)"
+        
+        # Стандартный набор заблокированных имен
+        local default_banned='
+{
+  "literals": ["admin", "root", "administrator", "system", "support", "help", "info", "mail", "postmaster", "hostmaster", "webmaster", "abuse", "noreply", "no-reply", "security", "test", "user", "guest", "api", "www", "ftp", "mx", "ns", "dns", "smtp", "pop", "imap"],
+  "substrings": ["admin", "root", "system"],
+  "prefixes": ["admin-", "root-", "system-", "support-", "help-"],
+  "suffixes": ["-admin", "-root", "-system", "-support"],
+  "regexes": ["^admin.*", "^root.*", "^system.*", ".*admin$", ".*root$"]
+}'
+        
+        # Инициализируем структуру
+        yq eval -i '.policy.data.registration.banned_usernames //= {}' "$MAS_CONFIG_FILE"
+        
+        # Устанавливаем стандартные значения
+        echo "$default_banned" | yq eval -i '.policy.data.registration.banned_usernames = .' "$MAS_CONFIG_FILE"
+        
+        # Устанавливаем права
+        chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE"
+        chmod 600 "$MAS_CONFIG_FILE"
+        
+        log "INFO" "Перезапуск MAS для применения изменений..."
+        if systemctl restart matrix-auth-service; then
+            log "SUCCESS" "Стандартный набор заблокированных имен установлен"
+        else
+            log "ERROR" "Ошибка перезапуска matrix-auth-service"
+            return 1
+        fi
+    }
+
+    # Функция для полной очистки заблокированных имен
+    clear_all_banned_usernames() {
+        if ask_confirmation "Вы уверены, что хотите удалить ВСЕ заблокированные имена?"; then
+            # Создаем резервную копию
+            cp "$MAS_CONFIG_FILE" "$MAS_CONFIG_FILE.backup.$(date +%s)"
+            
+            # Удаляем всю секцию
+            yq eval -i 'del(.policy.data.registration.banned_usernames)' "$MAS_CONFIG_FILE"
+            
+            # Устанавливаем права
+            chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE"
+            chmod 600 "$MAS_CONFIG_FILE"
+            
+            log "INFO" "Перезапуск MAS для применения изменений..."
+            if systemctl restart matrix-auth-service; then
+                log "SUCCESS" "Все заблокированные имена удалены"
+            else
+                log "ERROR" "Ошибка перезапуска matrix-auth-service"
+                return 1
+            fi
+        fi
+    }
+
+    while true; do
+        show_current_banned
+        
+        echo
+        safe_echo "Управление заблокированными именами:"
+        safe_echo "1. Добавить точное имя (literals)"
+        safe_echo "2. Добавить подстроку (substrings)"
+        safe_echo "3. Добавить регулярное выражение (regexes)"
+        safe_echo "4. Добавить префикс (prefixes)"
+        safe_echo "5. Добавить суффикс (suffixes)"
+        safe_echo "6. Удалить точное имя"
+        safe_echo "7. Удалить подстроку"
+        safe_echo "8. Удалить регулярное выражение"
+        safe_echo "9. Удалить префикс"
+        safe_echo "10. Удалить суффикс"
+        safe_echo "11. Установить стандартный набор"
+        safe_echo "12. Очистить все заблокированные имена"
+        safe_echo "13. Назад"
+
+        read -p "Выберите действие [1-13]: " action
+
+        case $action in
+            1) add_banned_username "literal" "Точное имя" "literals" ;;
+            2) add_banned_username "substring" "Подстрока" "substrings" ;;
+            3) add_banned_username "regex" "Регулярное выражение" "regexes" ;;
+            4) add_banned_username "prefix" "Префикс" "prefixes" ;;
+            5) add_banned_username "suffix" "Суффикс" "suffixes" ;;
+            6) remove_banned_username "literal" "точное имя" "literals" ;;
+            7) remove_banned_username "substring" "подстрока" "substrings" ;;
+            8) remove_banned_username "regex" "регулярное выражение" "regexes" ;;
+            9) remove_banned_username "prefix" "префикс" "prefixes" ;;
+            10) remove_banned_username "suffix" "суффикс" "suffixes" ;;
+            11) set_default_banned_usernames ;;
+            12) clear_all_banned_usernames ;;
+            13) return 0 ;;
+            *)
+                log "ERROR" "Некорректный ввод. Попробуйте ещё раз."
+                sleep 1
+                ;;
+        esac
+        
+        if [ $action -ne 13 ]; then
+            echo
+            read -p "Нажмите Enter для продолжения..."
+        fi
+    done
+}
+
+# Управление токенами регистрации MAS
+manage_mas_registration_tokens() {
+    print_header "УПРАВЛЕНИЕ ТОКЕНАМИ РЕГИСТРАЦИИ MAS" "$BLUE"
+
+    # Функция для создания токена регистрации
+    create_registration_token() {
+        print_header "СОЗДАНИЕ ТОКЕНА РЕГИСТРАЦИИ" "$CYAN"
+        
+        # Параметры токена
+        read -p "Введите кастомный токен (или оставьте пустым для автогенерации): " custom_token
+        read -p "Лимит использований (или оставьте пустым для неограниченного): " usage_limit
+        read -p "Срок действия в секундах (или оставьте пустым для бессрочного): " expires_in
+        
+        # Формируем команду
+        local cmd="mas manage issue-user-registration-token --config $MAS_CONFIG_FILE"
+        
+        if [ -n "$custom_token" ]; then
+            cmd="$cmd --token '$custom_token'"
+        fi
+        
+        if [ -n "$usage_limit" ]; then
+            cmd="$cmd --usage-limit $usage_limit"
+        fi
+        
+        if [ -n "$expires_in" ]; then
+            cmd="$cmd --expires-in $expires_in"
+        fi
+        
+        log "INFO" "Создание токена регистрации..."
+        
+        # Выполняем команду как пользователь MAS
+        if sudo -u "$MAS_USER" eval "$cmd"; then
+            log "SUCCESS" "Токен регистрации создан"
+        else
+            log "ERROR" "Ошибка создания токена регистрации"
+        fi
+    }
+    
+    # Функция для показа информации о токенах
+    show_registration_tokens_info() {
+        print_header "ИНФОРМАЦИЯ О ТОКЕНАХ РЕГИСТРАЦИИ" "$CYAN"
+        
+        safe_echo "Токены регистрации позволяют контролировать регистрацию пользователей."
+        safe_echo "Когда включено требование токенов (registration_token_required: true),"
+        safe_echo "пользователи должны предоставить действительный токен для регистрации."
+        echo
+        safe_echo "${BOLD}Как использовать токены:${NC}"
+        safe_echo "1. Создайте токен с помощью этого меню"
+        safe_echo "2. Передайте токен пользователю"
+        safe_echo "3. При регистрации пользователь вводит токен"
+        safe_echo "4. После использования лимит токена уменьшается"
+        echo
+        safe_echo "${BOLD}Параметры токенов:${NC}"
+        safe_echo "• ${CYAN}Кастомный токен${NC} - задайте свою строку (или автогенерация)"
+        safe_echo "• ${CYAN}Лимит использований${NC} - сколько раз можно использовать"
+        safe_echo "• ${CYAN}Срок действия${NC} - время жизни токена в секундах"
+        echo
+        safe_echo "${BOLD}Примеры сроков действия:${NC}"
+        safe_echo "• 3600 = 1 час"
+        safe_echo "• 86400 = 1 день"
+        safe_echo "• 604800 = 1 неделя"
+        safe_echo "• 2592000 = 1 месяц"
+    }
+
+    while true; do
+        # Показываем текущий статус токенов
+        local token_status=$(get_mas_token_registration_status)
+        
+        case "$token_status" in
+            "enabled") safe_echo "• Токены регистрации: ${GREEN}ТРЕБУЮТСЯ${NC}" ;;
+            "disabled") safe_echo "• Токены регистрации: ${RED}НЕ ТРЕБУЮТСЯ${NC}" ;;
+            *) safe_echo "• Токены регистрации: ${YELLOW}НЕИЗВЕСТНО${NC}" ;;
+        esac
+        
+        echo
+        safe_echo "Управление токенами регистрации:"
+        safe_echo "1. Включить требование токенов регистрации"
+        safe_echo "2. Отключить требование токенов регистрации"
+        safe_echo "3. Создать новый токен регистрации"
+        safe_echo "4. Показать информацию о токенах"
+        safe_echo "5. Назад"
+
+        read -p "Выберите действие [1-5]: " action
+
+        case $action in
+            1)
+                set_mas_config_value "registration_token_required" "true"
+                ;;
+            2)
+                set_mas_config_value "registration_token_required" "false"
+                ;;
+            3)
+                create_registration_token
+                ;;
+            4)
+                show_registration_tokens_info
+                ;;
+            5)
+                return 0
+                ;;
+            *)
+                log "ERROR" "Некорректный ввод. Попробуйте ещё раз."
+                sleep 1
+                ;;
+        esac
+        
+        if [ $action -ne 5 ]; then
+            echo
+            read -p "Нажмите Enter для продолжения..."
+        fi
+    done
+}
+
+# Управление SSO провайдителями
 manage_sso_providers() {
     print_header "УПРАВЛЕНИЕ ВНЕШНИМИ ПРОВАЙДЕРАМИ (SSO)" "$BLUE"
 
     # Проверка наличия yq
-    if ! command -v yq &>/dev/null; then
-        log "ERROR" "Утилита 'yq' не найдена. Она необходима для управления YAML конфигурацией MAS."
-        log "INFO" "Пожалуйста, установите 'yq' (например, 'sudo apt install yq' или 'sudo snap install yq')"
+    if ! check_yq_dependency; then
         read -p "Нажмите Enter для возврата..."
         return 1
     fi
@@ -254,7 +927,7 @@ manage_sso_providers() {
 
     # Функция для генерации ULID
     generate_ulid() {
-        local timestamp=$(printf '%x' $(date +%s))
+        local timestamp=$(printf '%010x' $(date +%s))
         local random_part=$(openssl rand -hex 10)
         echo "$(echo "$timestamp$random_part" | tr '[:lower:]' '[:upper:]')"
     }
@@ -268,7 +941,7 @@ manage_sso_providers() {
         local scope="$5"
         local extra_config="$6"
 
-        print_header "НАСТРОЙКА $human_name SSO" "$CYAN"
+        print_header "NAСТРОЙКА $human_name SSO" "$CYAN"
         case $provider_name in
             "google")
                 safe_echo "1. Перейдите в Google API Console: https://console.developers.google.com/apis/credentials"
@@ -313,14 +986,13 @@ manage_sso_providers() {
         fi
         local ulid=$(generate_ulid)
         local mas_public_base=$(yq eval '.http.public_base' "$MAS_CONFIG_FILE")
-        local redirect_uri="${mas_public_base}upstream/callback/${ulid}"
+        local redirect_uri="${mas_public_base}/upstream/callback/${ulid}"
         safe_echo "Ваш Redirect URI для настройки в $human_name: $redirect_uri"
         echo
         if ! ask_confirmation "Продолжить добавление провайдера?"; then
             return
         fi
-        local provider_yaml
-        provider_yaml=$(cat <<EOF
+        local provider_yaml=$(cat <<EOF
 {
   "id": "$ulid",
   "human_name": "$human_name",
@@ -331,8 +1003,10 @@ manage_sso_providers() {
 }
 EOF
 )
-        provider_yaml=$(echo "$provider_yaml" | yq eval '. as $item | '"$extra_config"' | $item * .' -)
-        yq eval -i '.upstream_oauth2.providers += [load_str("-")]' "$MAS_CONFIG_FILE" -- - "$provider_yaml"
+        if [ -n "$extra_config" ]; then
+            provider_yaml=$(echo "$provider_yaml" | yq eval '. as $item | '"$extra_config"' | $item * .' -)
+        fi
+        yq eval -i '.upstream_oauth2.providers += ['"$provider_yaml"']' "$MAS_CONFIG_FILE"
         sync_and_restart_mas
         read -p "Нажмите Enter для продолжения..."
     }
@@ -340,8 +1014,8 @@ EOF
     # Функция удаления провайдера
     remove_sso_provider() {
         print_header "УДАЛЕНИЕ SSO-ПРОВАЙДЕРА" "$RED"
-        local providers=$(yq eval '.upstream_oauth2.providers[] | .id + " " + .human_name' "$MAS_CONFIG_FILE")
-        if [ -z "$providers" ]; then
+        local providers=$(yq eval '.upstream_oauth2.providers[] | .id + " " + .human_name' "$MAS_CONFIG_FILE" 2>/dev/null)
+        if [ -z "$providers" ] || [ "$providers" = "null null" ]; then
             safe_echo "Нет настроенных SSO-провайдеров для удаления."
             read -p "Нажмите Enter для продолжения..."
             return
@@ -364,11 +1038,11 @@ EOF
     while true; do
         print_header "УПРАВЛЕНИЕ SSO" "$BLUE"
         safe_echo "Текущие SSO-провайдеры:"
-        local current_providers=$(yq eval -o=json '.upstream_oauth2.providers' "$MAS_CONFIG_FILE")
+        local current_providers=$(yq eval -o=json '.upstream_oauth2.providers' "$MAS_CONFIG_FILE" 2>/dev/null)
         if [ -z "$current_providers" ] || [ "$current_providers" = "null" ] || [ "$current_providers" = "[]" ]; then
             safe_echo "SSO-провайдеры не настроены."
         else
-            echo "$current_providers" | yq eval -P '.[] | .human_name + " (ID: " + .id + ")"' -
+            echo "$current_providers" | yq eval -P '.[] | .human_name + " (ID: " + .id + ")"' - 2>/dev/null || safe_echo "Ошибка отображения провайдеров"
         fi
         echo
         safe_echo "Доступные опции:"
@@ -407,294 +1081,156 @@ EOF
     done
 }
 
-# Меню управления CAPTCHA
-manage_captcha_settings() {
-    print_header "УПРАВЛЕНИЕ CAPTCHA" "$BLUE"
-
-    # Проверка наличия yq
-    if ! command -v yq &>/dev/null; then
-        log "ERROR" "Утилита 'yq' не найдена. Она необходима для управления YAML конфигурацией MAS."
-        log "INFO" "Пожалуйста, установите 'yq' (например, 'sudo apt install yq' или 'sudo snap install yq')"
-        read -p "Нажмите Enter для возврата..."
-        return 1
-    fi
-
-    # Инструкция по интеграции reCAPTCHA
-    show_captcha_instructions() {
-        print_header "ИНТЕГРАЦИЯ reCAPTCHA" "$CYAN"
-        safe_echo "Для работы CAPTCHA требуется получить ключи reCAPTCHA v2 или v3:"
-        safe_echo "1. Перейдите на https://www.google.com/recaptcha/admin/create"
-        safe_echo "2. Зарегистрируйте домен, выберите тип reCAPTCHA (v2/v3)"
-        safe_echo "3. Получите Site Key и Secret Key"
-        safe_echo "4. Вставьте их в конфиг MAS:"
-        safe_echo "   .registration.captcha_site_key"
-        safe_echo "   .registration.captcha_secret_key"
-        safe_echo "5. Включите CAPTCHA в настройках"
-        echo
-    }
-
-    # Включение CAPTCHA
-    enable_captcha() {
-        show_captcha_instructions
-        read -p "Введите Site Key: " site_key
-        read -p "Введите Secret Key: " secret_key
-        if [ -z "$site_key" ] || [ -z "$secret_key" ]; then
-            log "ERROR" "Site Key и Secret Key не могут быть пустыми."
-            read -p "Нажмите Enter для продолжения..."
-            return
-        fi
-        yq eval -i '.registration.captcha_enabled = true' "$MAS_CONFIG_FILE"
-        yq eval -i '.registration.captcha_site_key = "'$site_key'"' "$MAS_CONFIG_FILE"
-        yq eval -i '.registration.captcha_secret_key = "'$secret_key'"' "$MAS_CONFIG_FILE"
-        log "SUCCESS" "CAPTCHA включена и ключи сохранены."
-        systemctl restart matrix-auth-service
-        read -p "Нажмите Enter для продолжения..."
-    }
-
-    # Отключение CAPTCHA
-    disable_captcha() {
-        yq eval -i '.registration.captcha_enabled = false' "$MAS_CONFIG_FILE"
-        log "SUCCESS" "CAPTCHA отключена."
-        systemctl restart matrix-auth-service
-        read -p "Нажмите Enter для продолжения..."
-    }
-
-    # Изменение секретного ключа
-    change_captcha_secret() {
-        read -p "Введите новый Secret Key: " secret_key
-        if [ -z "$secret_key" ]; then
-            log "ERROR" "Secret Key не может быть пустым."
-            read -p "Нажмите Enter для продолжения..."
-            return
-        fi
-        yq eval -i '.registration.captcha_secret_key = "'$secret_key'"' "$MAS_CONFIG_FILE"
-        log "SUCCESS" "Secret Key обновлён."
-        systemctl restart matrix-auth-service
-        read -p "Нажмите Enter для продолжения..."
-    }
-
-    while true; do
-        print_header "CAPTCHA" "$BLUE"
-        safe_echo "Текущий статус CAPTCHA:"
-        local status=$(yq eval '.registration.captcha_enabled' "$MAS_CONFIG_FILE")
-        if [ "$status" = "true" ]; then
-            safe_echo "CAPTCHA включена."
-        else
-            safe_echo "CAPTCHA отключена."
-        fi
-        echo
-        safe_echo "1. Включить CAPTCHA (и задать ключи)"
-        safe_echo "2. Выключить CAPTCHA"
-        safe_echo "3. Изменить Secret Key"
-        safe_echo "4. Показать инструкцию по интеграции"
-        safe_echo "5. Назад"
-        echo
-        read -p "Выберите действие [1-5]: " action
-        case $action in
-            1)
-                enable_captcha
-                ;;
-            2)
-                disable_captcha
-                ;;
-            3)
-                change_captcha_secret
-                ;;
-            4)
-                show_captcha_instructions
-                read -p "Нажмите Enter для продолжения..."
-                ;;
-            5)
-                return 0
-                ;;
-            *)
-                log "ERROR" "Некорректный ввод. Попробуйте ещё раз."
-                sleep 1
-                ;;
-        esac
-    done
-}
-
-# Меню управления заблокированными именами
-manage_banned_usernames() {
-    print_header "УПРАВЛЕНИЕ ЗАБЛОКИРОВАННЫМИ ИМЕНАМИ" "$BLUE"
-
-    # Проверка наличия yq
-    if ! command -v yq &>/dev/null; then
-        log "ERROR" "Утилита 'yq' не найдена. Она необходима для управления YAML конфигурацией MAS."
-        log "INFO" "Пожалуйста, установите 'yq' (например, 'sudo apt install yq' или 'sudo snap install yq')"
-        read -p "Нажмите Enter для возврата..."
-        return 1
-    fi
-
-    # Инструкция по использованию заблокированных имён
-    show_banned_usernames_instructions() {
-        print_header "ИНСТРУКЦИЯ ПО ЗАБЛОКИРОВАННЫМ ИМЕНАМ" "$CYAN"
-        safe_echo "Блокировка имён предотвращает регистрацию пользователей с определёнными именами."
-        safe_echo "1. Добавьте имя в список, чтобы запретить его регистрацию."
-        safe_echo "2. Удалите имя из списка для разблокировки."
-        safe_echo "3. Список хранится в .registration.banned_usernames в $MAS_CONFIG_FILE."
-        safe_echo "4. После изменений требуется перезапуск MAS."
-        echo
-    }
-
-    # Добавление заблокированного имени
-    add_banned_username() {
-        read -p "Введите имя для блокировки: " username
-        if [ -z "$username" ]; then
-            log "ERROR" "Имя не может быть пустым."
-            read -p "Нажмите Enter для продолжения..."
-            return
-        fi
-        yq eval -i '.registration.banned_usernames += ["'$username'"]' "$MAS_CONFIG_FILE"
-        log "SUCCESS" "Имя '$username' добавлено в список заблокированных."
-        systemctl restart matrix-auth-service
-        read -p "Нажмите Enter для продолжения..."
-    }
-
-    # Удаление заблокированного имени
-    remove_banned_username() {
-        read -p "Введите имя для разблокировки: " username
-        if [ -z "$username" ]; then
-            log "ERROR" "Имя не может быть пустым."
-            read -p "Нажмите Enter для продолжения..."
-            return
-        fi
-        yq eval -i 'del(.registration.banned_usernames[] | select(. == "'$username'"))' "$MAS_CONFIG_FILE"
-        log "SUCCESS" "Имя '$username' удалено из списка заблокированных."
-        systemctl restart matrix-auth-service
-        read -p "Нажмите Enter для продолжения..."
-    }
-
-    # Показать заблокированные имена
-    show_banned_usernames() {
-        print_header "СПИСОК ЗАБЛОКИРОВАННЫХ ИМЁН" "$CYAN"
-        local banned=$(yq eval '.registration.banned_usernames' "$MAS_CONFIG_FILE")
-        if [ -z "$banned" ] || [ "$banned" = "null" ]; then
-            safe_echo "Список заблокированных имён пуст."
-        else
-            echo "$banned" | yq eval -P '.' -
-        fi
-        echo
-        read -p "Нажмите Enter для продолжения..."
-    }
-
-    while true; do
-        print_header "ЗАБЛОКИРОВАННЫЕ ИМЕНА" "$BLUE"
-        safe_echo "1. Добавить заблокированное имя"
-        safe_echo "2. Удалить заблокированное имя"
-        safe_echo "3. Показать заблокированные имена"
-        safe_echo "4. Показать инструкцию по использованию"
-        safe_echo "5. Назад"
-        echo
-        read -p "Выберите действие [1-5]: " action
-        case $action in
-            1)
-                add_banned_username
-                ;;
-            2)
-                remove_banned_username
-                ;;
-            3)
-                show_banned_usernames
-                ;;
-            4)
-                show_banned_usernames_instructions
-                read -p "Нажмите Enter для продолжения..."
-                ;;
-            5)
-                return 0
-                ;;
-            *)
-                log "ERROR" "Некорректный ввод. Попробуйте ещё раз."
-                sleep 1
-                ;;
-        esac
-    done
-}
-
 # Меню управления регистрацией MAS
 manage_mas_registration() {
     print_header "УПРАВЛЕНИЕ РЕГИСТРАЦИЕЙ MATRIX AUTHENTICATION SERVICE" "$BLUE"
 
-    echo "Управление регистрацией MAS:"
-    echo "1. Включить открытую регистрацию"
-    echo "2. Выключить открытую регистрацию"
-    echo "3. Настроить регистрацию по токенам"
-    echo "4. Назад"
+    if ! check_yq_dependency; then
+        read -p "Нажмите Enter для возврата..."
+        return 1
+    fi
 
-    read -p "Выберите действие: " action
+    while true; do
+        # Показываем текущий статус
+        local current_status=$(get_mas_registration_status)
+        local token_status=$(get_mas_token_registration_status)
+        
+        safe_echo "Текущий статус регистрации:"
+        case "$current_status" in
+            "enabled") safe_echo "• Открытая регистрация: ${GREEN}ВКЛЮЧЕНА${NC}" ;;
+            "disabled") safe_echo "• Открытая регистрация: ${RED}ОТКЛЮЧЕНА${NC}" ;;
+            *) safe_echo "• Открытая регистрация: ${YELLOW}НЕИЗВЕСТНО${NC}" ;;
+        esac
+        
+        case "$token_status" in
+            "enabled") safe_echo "• Регистрация по токенам: ${GREEN}ТРЕБУЕТСЯ${NC}" ;;
+            "disabled") safe_echo "• Регистрация по токенам: ${RED}НЕ ТРЕБУЕТСЯ${NC}" ;;
+            *) safe_echo "• Регистрация по токенам: ${YELLOW}НЕИЗВЕСТНО${NC}" ;;
+        esac
+        
+        echo
+        safe_echo "Управление регистрацией MAS:"
+        safe_echo "1. Включить открытую регистрацию"
+        safe_echo "2. Выключить открытую регистрацию"
+        safe_echo "3. Включить требование токенов регистрации"
+        safe_echo "4. Отключить требование токенов регистрации"
+        safe_echo "5. Назад"
 
-    case $action in
-        1)
-            set_mas_config_value '.registration.enable_registration' 'true'
-            ;;
-        2)
-            set_mas_config_value '.registration.enable_registration' 'false'
-            ;;
-        3)
-            read -p "Введите новый лимит регистраций: " registration_limit
-            set_mas_config_value '.registration.registration_limit' "$registration_limit"
-            ;;
-        4)
-            echo "Возврат в главное меню."
-            ;;
-        *)
-            echo "Некорректный ввод. Попробуйте ещё раз."
-            manage_mas_registration
-            ;;
-    esac
+        read -p "Выберите действие [1-5]: " action
+
+        case $action in
+            1)
+                set_mas_config_value "password_registration_enabled" "true"
+                ;;
+            2)
+                set_mas_config_value "password_registration_enabled" "false"
+                ;;
+            3)
+                set_mas_config_value "registration_token_required" "true"
+                ;;
+            4)
+                set_mas_config_value "registration_token_required" "false"
+                ;;
+            5)
+                return 0
+                ;;
+            *)
+                log "ERROR" "Некорректный ввод. Попробуйте ещё раз."
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 # Главное меню модуля
 show_main_menu() {
-    echo "Matrix Authentication Service (MAS) - Главное меню"
-    echo "1. Проверить статус MAS"
-    echo "2. Удалить MAS"
-    echo "3. Диагностика MAS"
-    echo "4. Управление регистрацией MAS"
-    echo "5. Управление SSO-провайдерами"
-    echo "6. Управление CAPTCHA"
-    echo "7. Управление заблокированными именами"
-    echo "8. Выход"
+    while true; do
+        print_header "MATRIX AUTHENTICATION SERVICE (MAS) - УПРАВЛЕНИЕ" "$MAGENTA"
+        
+        # Проверяем статус MAS
+        if systemctl is-active --quiet matrix-auth-service 2>/dev/null; then
+            safe_echo "${GREEN}✅ Matrix Authentication Service: АКТИВЕН${NC}"
+        else
+            safe_echo "${RED}❌ Matrix Authentication Service: НЕ АКТИВЕН${NC}"
+        fi
+        
+        if [ -f "$CONFIG_DIR/mas.conf" ]; then
+            local mas_mode=$(grep "MAS_MODE=" "$CONFIG_DIR/mas.conf" | cut -d'=' -f2 | tr -d '"' 2>/dev/null)
+            local mas_port=$(grep "MAS_PORT=" "$CONFIG_DIR/mas.conf" | cut -d'=' -f2 | tr -d '"' 2>/dev/null)
+            if [ -n "$mas_mode" ]; then
+                safe_echo "${BLUE}ℹ️  Режим: $mas_mode${NC}"
+            fi
+            if [ -n "$mas_port" ]; then
+                safe_echo "${BLUE}ℹ️  Порт: $mas_port${NC}"
+            fi
+        fi
+        
+        echo
+        safe_echo "Доступные действия:"
+        safe_echo "${GREEN}1.${NC} 📊 Проверить статус MAS"
+        safe_echo "${GREEN}2.${NC} 🗑️  Удалить MAS"
+        safe_echo "${GREEN}3.${NC} 🔍 Диагностика MAS"
+        safe_echo "${GREEN}4.${NC} 👥 Управление регистрацией MAS"
+        safe_echo "${GREEN}5.${NC} 🔐 Управление SSO-провайдерами"
+        safe_echo "${GREEN}6.${NC} 🤖 Настройки CAPTCHA"
+        safe_echo "${GREEN}7.${NC} 🚫 Заблокированные имена пользователей"
+        safe_echo "${GREEN}8.${NC} 🎫 Токены регистрации"
+        safe_echo "${GREEN}9.${NC} ↩️  Назад в главное меню"
 
-    read -p "Выберите действие: " action
+        read -p "$(safe_echo "${YELLOW}Выберите действие [1-9]: ${NC}")" action
 
-    case $action in
-        1)
-            check_mas_status
-            ;;
-        2)
-            uninstall_mas
-            ;;
-        3)
-            diagnose_mas
-            ;;
-        4)
-            manage_mas_registration
-            ;;
-        5)
-            manage_sso_providers
-            ;;
-        6)
-            manage_captcha_settings
-            ;;
-        7)
-            manage_banned_usernames
-            ;;
-        8)
-            echo "Выход из MAS Management Module."
-            exit 0
-            ;;
-        *)
-            echo "Некорректный ввод. Попробуйте ещё раз."
-            show_main_menu
-            ;;
-    esac
+        case $action in
+            1)
+                check_mas_status
+                ;;
+            2)
+                uninstall_mas
+                ;;
+            3)
+                diagnose_mas
+                ;;
+            4)
+                manage_mas_registration
+                ;;
+            5)
+                manage_sso_providers
+                ;;
+            6)
+                manage_captcha_settings
+                ;;
+            7)
+                manage_banned_usernames
+                ;;
+            8)
+                manage_mas_registration_tokens
+                ;;
+            9)
+                return 0
+                ;;
+            *)
+                log "ERROR" "Некорректный ввод. Попробуйте ещё раз."
+                sleep 1
+                ;;
+        esac
+        
+        if [ $action -ne 9 ]; then
+            echo
+            read -p "Нажмите Enter для продолжения..."
+        fi
+    done
 }
 
 # Главная функция управления MAS
 main() {
+    # Проверяем, что MAS установлен
+    if ! command -v mas >/dev/null 2>&1 && [ ! -f "$MAS_CONFIG_FILE" ]; then
+        print_header "MATRIX AUTHENTICATION SERVICE НЕ УСТАНОВЛЕН" "$RED"
+        log "ERROR" "Matrix Authentication Service не установлен"
+        log "INFO" "Установите MAS через главное меню:"
+        log "INFO" "  Дополнительные компоненты → Matrix Authentication Service (MAS)"
+        return 1
+    fi
+    
     show_main_menu
 }
 

@@ -406,7 +406,7 @@ check_matrix_status() {
     if [ $active_servers -eq 0 ]; then
         safe_echo "  ${RED}❌ Нет активных веб-серверов${NC}"
     elif [ $active_servers -gt 1 ]; then
-        safe_echo "  ${YELLOW}⚠️  Запущено несколько веб-серверов (возможны конфликты портов)${NC}"
+        safe_echo "  ${YELLOW}⚠️  Запущено несколько веб-серверов (возможныconfликты портов)${NC}"
     fi
     
     echo
@@ -1127,7 +1127,7 @@ initialize() {
     mkdir -p "$LOG_DIR"
     
     # Проверка наличия модулей
-    local required_modules=("core_install" "element_web" "coturn_setup" "caddy_config" "synapse_admin" "federation_control" "registration_control" "registration_mas" "ufw_config")
+    local required_modules=("core_install" "element_web" "coturn_setup" "caddy_config" "synapse_admin" "federation_control" "registration_control" "registration_mas" "mas_manage" "ufw_config")
     local missing_modules=()
     
     for module in "${required_modules[@]}"; do
@@ -1162,10 +1162,11 @@ manage_additional_components() {
         safe_echo "${GREEN}5.${NC} 🔒 Настройка файрвола (UFW)"
         safe_echo "${GREEN}6.${NC} 🔧 Настройка Reverse Proxy (Caddy)"
         safe_echo "${GREEN}7.${NC} 🔑 Matrix Authentication Service (MAS)"
-        safe_echo "${GREEN}8.${NC} Назад в главное меню"
+        safe_echo "${GREEN}8.${NC} ⚙️  Управление MAS (настройки)"
+        safe_echo "${GREEN}9.${NC} Назад в главное меню"
         
         echo
-        read -p "$(safe_echo "${YELLOW}Выберите действие (1-8): ${NC}")" choice
+        read -p "$(safe_echo "${YELLOW}Выберите действие (1-9): ${NC}")" choice
         
         case $choice in
             1) run_module "coturn_setup" ;;
@@ -1175,14 +1176,15 @@ manage_additional_components() {
             5) run_module "ufw_config" ;;
             6) run_module "caddy_config" ;;
             7) run_module "registration_mas" ;;
-            8) return 0 ;;
+            8) run_module "mas_manage" ;;
+            9) return 0 ;;
             *)
                 log "ERROR" "Неверный выбор"
                 sleep 1
                 ;;
         esac
         
-        if [ $choice -ne 8 ]; then
+        if [ $choice -ne 9 ]; then
             read -p "Нажмите Enter для продолжения..."
         fi
     done
@@ -2285,7 +2287,7 @@ fix_registration_issues() {
         fi
     fi
     
-    # Создаем резервнуюコピー конфигурации один раз
+    # Создаем резервную copie конфигурации один раз
     if [ ! -f "/etc/matrix-synapse/homeserver.yaml.backup.$(date +%Y%m%d)" ]; then
         safe_echo "${BLUE}🔧 Создание резервной копии конфигурации...${NC}"
         cp /etc/matrix-synapse/homeserver.yaml /etc/matrix-synapse/homeserver.yaml.backup.$(date +%Y%m%d_%H%M%S)
