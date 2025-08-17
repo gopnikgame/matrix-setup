@@ -384,24 +384,38 @@ generate_mas_config() {
     
     # Создаем ИСПРАВЛЕННУЮ конфигурацию с правильным URI базы данных
     log "INFO" "Создание конфигурации MAS с правильным URI базы данных..."
-    
-    # КРИТИЧЕСКИ ВАЖНО: убеждаемся, что переменные не содержат log-сообщений
-    # Очищаем переменные от возможных артефактов
-    mas_port=$(echo "$mas_port" | grep -E '^[0-9]+$' | head -1)
-    if [ -z "$mas_port" ]; then
-        log "ERROR" "Некорректное значение порта MAS"
-        return 1
-    fi
-    
-    # Генерируем правильный секрет шифрования
-    local encryption_secret=$(openssl rand -hex 32)
-    
-    cat > "$MAS_CONFIG_FILE" <<EOF
+
+    # Пытаемся сгенерировать конфигурацию с помощью mas config generate для получения правильных секретов
+    log "INFO" "Генерация базовой конфигурации с помощью mas config generate..."
+
+    local temp_config="/tmp/mas_generated_config_$$"
+    local base_config_generated=false
+
+    if mas config generate > "$temp_config" 2>/dev/null; then
+        base_config_generated=true
+        log "SUCCESS" "Базовая конфигурация сгенерирована командой 'mas config generate'"
+        
+        # Извлекаем правильные секреты из сгенерированной конфигурации
+        local secrets_start=$(grep -n "^secrets:" "$temp_config" | cut -d: -f1)
+        
+        if [ -n "$secrets_start" ]; then
+            log "INFO" "Создание конфигурации с использованием правильно сгенерированных секретов"
+            
+            # Найдем конец секции secrets (следующая секция верхнего уровня)
+            local secrets_end=$(tail -n +$((secrets_start + 1)) "$temp_config" | grep -n "^[a-zA-Z]" | head -1 | cut -d: -f1)
+            if [ -n "$secrets_end" ]; then
+                secrets_end=$((secrets_start + secrets_end - 1))
+            else
+                secrets_end=$(wc -l < "$temp_config")
+            fi
+            
+            # Создаем нашу конфигурацию с правильными секретами
+            cat > "$MAS_CONFIG_FILE" <<EOF
 # Matrix Authentication Service Configuration - ИСПРАВЛЕНО
 # Generated: $(date '+%Y-%m-%d %H:%M:%S')
 # Server Type: ${SERVER_TYPE:-hosting}
 # Port: $mas_port
-# Database: $expected_db (ИСПРАВЛЕНО!)
+# Database: $expected_db
 
 http:
   public_base: "$mas_public_base"
@@ -419,7 +433,92 @@ http:
         - address: "$BIND_ADDRESS:$mas_port"
       proxy_protocol: false
 
-# ИСПРАВЛЕННАЯ СЕКЦИЯ DATABASE - ИСПОЛЬЗУЕМ ПРАВИЛЬНОЕ ИМЯ БАЗЫ ДАННЫХ
+database:
+  uri: "$db_uri"
+
+matrix:
+  homeserver: "$matrix_domain"
+  secret: "$mas_secret"
+  endpoint: "http://localhost:8008"
+
+EOF
+
+            # Добавляем секцию secrets из сгенерированной конфигурации
+            sed -n "${secrets_start},${secrets_end}p" "$temp_config" >> "$MAS_CONFIG_FILE"
+            
+            # Добавляем остальные секции
+            cat >> "$MAS_CONFIG_FILE" <<EOF
+
+clients:
+  - client_id: "0000000000000000000SYNAPSE"
+    client_auth_method: client_secret_basic
+    client_secret: "$mas_secret"
+
+passwords:
+  enabled: true
+  schemes:
+    - version: 1
+      algorithm: bcrypt
+      unicode_normalization: true
+    - version: 2
+      algorithm: argon2id
+
+account:
+  email_change_allowed: true
+  displayname_change_allowed: true
+  password_registration_enabled: false
+  password_change_allowed: true
+  password_recovery_enabled: false
+  account_deactivation_allowed: true
+  registration_token_required: false
+
+experimental:
+  access_token_ttl: 300
+  compat_token_ttl: 300
+EOF
+
+        else
+            log "WARN" "Не удалось найти секцию secrets в сгенерированной конфигурации, создаем вручную"
+            base_config_generated=false
+        fi
+        
+        rm -f "$temp_config"
+    else
+        log "WARN" "Не удалось использовать 'mas config generate', создаем конфигурацию вручную"
+        base_config_generated=false
+    fi
+    
+    # Если автоматическая генерация не удалась, создаем конфигурацию вручную
+    if [ "$base_config_generated" = false ]; then
+        log "INFO" "Создание конфигурации MAS вручную..."
+        
+        # Генерируем правильные секреты вручную
+        local encryption_secret=$(openssl rand -hex 32)
+        local rsa_key_kid=$(date +%s | sha256sum | cut -c1-8)
+        
+        cat > "$MAS_CONFIG_FILE" <<EOF
+# Matrix Authentication Service Configuration - ИСПРАВЛЕНО
+# Generated: $(date '+%Y-%m-%d %H:%M:%S')
+# Server Type: ${SERVER_TYPE:-hosting}
+# Port: $mas_port
+# Database: $expected_db
+
+http:
+  public_base: "$mas_public_base"
+  issuer: "$mas_issuer"
+  listeners:
+    - name: web
+      resources:
+        - name: discovery
+        - name: human
+        - name: oauth
+        - name: compat
+        - name: graphql
+        - name: assets
+      binds:
+        - address: "$BIND_ADDRESS:$mas_port"
+      proxy_protocol: false
+
 database:
   uri: "$db_uri"
 
@@ -431,7 +530,7 @@ matrix:
 secrets:
   encryption: "$encryption_secret"
   keys:
-    - kid: "$(date +%s | sha256sum | cut -c1-8)"
+    - kid: "$rsa_key_kid"
       key: |
 $(openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 | sed 's/^/        /')
 
@@ -462,59 +561,6 @@ experimental:
   access_token_ttl: 300
   compat_token_ttl: 300
 EOF
-
-    # Пытаемся сгенерировать конфигурацию с помощью mas config generate для получения лучших секретов
-    log "INFO" "Генерация дополнительных секретов MAS..."
-    
-    local base_config_generated=false
-    if mas config generate > /tmp/mas_base_config.yaml 2>/dev/null; then
-        base_config_generated=true
-        log "SUCCESS" "Базовая конфигурация сгенерирована командой 'mas config generate'"
-        
-        # Извлекаем ТОЛЬКО секрет шифрования из сгенерированной конфигурации
-        local new_encryption_secret=$(grep -A 10 "^secrets:" /tmp/mas_base_config.yaml | grep "encryption:" | cut -d'"' -f2 2>/dev/null)
-        if [ -n "$new_encryption_secret" ]; then
-            log "INFO" "Использование секрета шифрования из сгенерированной конфигурации"
-            sed -i "s/encryption: \".*\"/encryption: \"$new_encryption_secret\"/" "$MAS_CONFIG_FILE"
-        fi
-        
-        # Извлекаем ключи более безопасным способом
-        local temp_keys_file="/tmp/mas_keys_$$"
-        if sed -n '/^  keys:/,/^[^ ]/p' /tmp/mas_base_config.yaml | sed '$d' > "$temp_keys_file" 2>/dev/null; then
-            if [ -s "$temp_keys_file" ]; then
-                log "INFO" "Использование ключей из сгенерированной конфигурации"
-                
-                # Создаем резервную копию конфигурации
-                cp "$MAS_CONFIG_FILE" "$MAS_CONFIG_FILE.backup"
-                
-                # Создаем новый файл с заменой секции keys
-                {
-                    # Все до секции keys
-                    sed '/^  keys:/,$d' "$MAS_CONFIG_FILE"
-                    # Секция keys из сгенерированной конфигурации
-                    cat "$temp_keys_file"
-                    # Все после секции keys (если есть)
-                    sed -n '/^  keys:/,/^[^ ]/p' "$MAS_CONFIG_FILE" | sed '1,/^[^ ]/d' 2>/dev/null || true
-                } > "$MAS_CONFIG_FILE.new"
-                
-                # Проверяем, что новый файл корректный
-                if [ -s "$MAS_CONFIG_FILE.new" ] && grep -q "database:" "$MAS_CONFIG_FILE.new" && grep -q "$db_uri" "$MAS_CONFIG_FILE.new"; then
-                    mv "$MAS_CONFIG_FILE.new" "$MAS_CONFIG_FILE"
-                    log "SUCCESS" "Ключи из сгенерированной конфигурации применены"
-                else
-                    log "WARN" "Не удалось применить ключи, оставляем сгенерированные вручную"
-                    mv "$MAS_CONFIG_FILE.backup" "$MAS_CONFIG_FILE"
-                    rm -f "$MAS_CONFIG_FILE.new"
-                fi
-                
-                rm -f "$MAS_CONFIG_FILE.backup"
-            fi
-        fi
-        
-        rm -f "$temp_keys_file"
-        rm -f /tmp/mas_base_config.yaml
-    else
-        log "WARN" "Не удалось использовать 'mas config generate', используем конфигурацию созданную вручную"
     fi
     
     # Устанавливаем права доступа
@@ -531,6 +577,32 @@ EOF
     if ! grep -q "$db_uri" "$MAS_CONFIG_FILE"; then
         log "ERROR" "Конфигурация MAS повреждена: не содержит корректный URI базы данных!"
         return 1
+    fi
+    
+    if ! grep -q "^secrets:" "$MAS_CONFIG_FILE"; then
+        log "ERROR" "Конфигурация MAS повреждена: секция secrets отсутствует!"
+        return 1
+    fi
+    
+    # Проверяем YAML синтаксис если доступен python
+    if command -v python3 >/dev/null 2>&1; then
+        if python3 -c "import yaml; yaml.safe_load(open('$MAS_CONFIG_FILE'))" 2>/dev/null; then
+            log "SUCCESS" "YAML синтаксис конфигурации корректен"
+        else
+            log "ERROR" "Ошибка в YAML синтаксисе конфигурации!"
+            log "INFO" "Проверьте конфигурацию: $MAS_CONFIG_FILE"
+            return 1
+        fi
+    fi
+    
+    # Проверяем конфигурацию с помощью MAS если возможно
+    if command -v mas >/dev/null 2>&1; then
+        log "INFO" "Проверка конфигурации с помощью mas config check..."
+        if mas config check --config "$MAS_CONFIG_FILE" 2>/dev/null; then
+            log "SUCCESS" "Конфигурация MAS прошла проверку"
+        else
+            log "WARN" "Конфигурация MAS имеет предупреждения (но это нормально для первого запуска)"
+        fi
     fi
     
     # Финальная проверка: убеждаемся, что в конфигурации указана правильная база данных
@@ -1189,4 +1261,4 @@ main() {
 # Если скрипт запущен напрямую
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     main "$@"
-fi
+fifi

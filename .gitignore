@@ -458,3 +458,5 @@ docs/mas-problems-analysis.md
 fix_mas_complete.sh
 docs/mas-registration-fixes.md
 fix_mas_config_issues.sh
+docs/mas-yaml-fix-guide.md
+fix_mas_yaml_issues.sh
