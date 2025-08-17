@@ -66,30 +66,30 @@ check_mas_port() {
             ;;
     esac
     
-    log "INFO" "Проверка доступности порта $port для MAS..."
+    log "INFO" "Проверка доступности порта $port для MAS..." >&2
     check_port "$port"
     local port_status=$?
     
     if [ $port_status -eq 1 ]; then
-        log "WARN" "Порт $port занят, поиск альтернативного..."
+        log "WARN" "Порт $port занят, поиск альтернативного..." >&2
         
         for alt_port in "${alternative_ports[@]}"; do
             check_port "$alt_port"
             if [ $? -eq 0 ]; then
-                log "SUCCESS" "Найден свободный порт: $alt_port"
+                log "SUCCESS" "Найден свободный порт: $alt_port" >&2
                 echo "$alt_port"
                 return 0
             fi
         done
         
-        log "ERROR" "Не удалось найти свободный порт для MAS"
+        log "ERROR" "Не удалось найти свободный порт для MAS" >&2
         return 1
     elif [ $port_status -eq 0 ]; then
-        log "SUCCESS" "Порт $port свободен"
+        log "SUCCESS" "Порт $port свободен" >&2
         echo "$port"
         return 0
     else
-        log "WARN" "Не удалось проверить порт (lsof не установлен), продолжаем с портом $port"
+        log "WARN" "Не удалось проверить порт (lsof не установлен), продолжаем с портом $port" >&2
         echo "$port"
         return 0
     fi
@@ -892,7 +892,7 @@ EOF
     
     # Выполняем миграции базы данных с очищенным окружением
     log "INFO" "Выполнение миграций базы данных MAS..."
-    if sudo -u "$MAS_USER" env -i RUST_LOG=info /usr/local/bin/mas database migrate --config "$MAS_CONFIG_FILE"; then
+    if sudo -u "$MAS_USER" env -i RUST_LOG=info DATABASE_URL="" /usr/local/bin/mas database migrate --config "$MAS_CONFIG_FILE"; then
         log "SUCCESS" "Миграции базы данных MAS выполнены"
     else
         log "ERROR" "Ошибка выполнения миграций базы данных MAS"
@@ -948,7 +948,7 @@ EOF
     
     # Синхронизируем конфигурацию с базой данных
     log "INFO" "Синхронизация конфигурации с базой данных..."
-    if sudo -u "$MAS_USER" env -i RUST_LOG=info /usr/local/bin/mas config sync --config "$MAS_CONFIG_FILE"; then
+    if sudo -u "$MAS_USER" env -i RUST_LOG=info DATABASE_URL="" /usr/local/bin/mas config sync --config "$MAS_CONFIG_FILE"; then
         log "SUCCESS" "Конфигурация MAS синхронизирована с базой данных"
     else
         log "WARN" "Ошибка синхронизации конфигурации MAS (но миграции выполнены успешно)"
