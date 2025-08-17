@@ -67,14 +67,14 @@ check_mas_port() {
     esac
     
     log "INFO" "Проверка доступности порта $port для MAS..." >&2
-    check_port "$port"
+    check_port "$port" >&2
     local port_status=$?
     
     if [ $port_status -eq 1 ]; then
         log "WARN" "Порт $port занят, поиск альтернативного..." >&2
         
         for alt_port in "${alternative_ports[@]}"; do
-            check_port "$alt_port"
+            check_port "$alt_port" >&2
             if [ $? -eq 0 ]; then
                 log "SUCCESS" "Найден свободный порт: $alt_port" >&2
                 echo "$alt_port"
@@ -85,7 +85,7 @@ check_mas_port() {
         log "ERROR" "Не удалось найти свободный порт для MAS" >&2
         return 1
     elif [ $port_status -eq 0 ]; then
-        log "SUCCESS" "Порт $port свободен" >&2
+        # Убираем вывод log сообщения в stdout
         echo "$port"
         return 0
     else
@@ -384,6 +384,18 @@ generate_mas_config() {
     
     # Создаем ИСПРАВЛЕННУЮ конфигурацию с правильным URI базы данных
     log "INFO" "Создание конфигурации MAS с правильным URI базы данных..."
+    
+    # КРИТИЧЕСКИ ВАЖНО: убеждаемся, что переменные не содержат log-сообщений
+    # Очищаем переменные от возможных артефактов
+    mas_port=$(echo "$mas_port" | grep -E '^[0-9]+$' | head -1)
+    if [ -z "$mas_port" ]; then
+        log "ERROR" "Некорректное значение порта MAS"
+        return 1
+    fi
+    
+    # Генерируем правильный секрет шифрования
+    local encryption_secret=$(openssl rand -hex 32)
+    
     cat > "$MAS_CONFIG_FILE" <<EOF
 # Matrix Authentication Service Configuration - ИСПРАВЛЕНО
 # Generated: $(date '+%Y-%m-%d %H:%M:%S')
@@ -417,7 +429,7 @@ matrix:
   endpoint: "http://localhost:8008"
 
 secrets:
-  encryption: "$(openssl rand -hex 32)"
+  encryption: "$encryption_secret"
   keys:
     - kid: "$(date +%s | sha256sum | cut -c1-8)"
       key: |
@@ -460,10 +472,10 @@ EOF
         log "SUCCESS" "Базовая конфигурация сгенерирована командой 'mas config generate'"
         
         # Извлекаем ТОЛЬКО секрет шифрования из сгенерированной конфигурации
-        local encryption_secret=$(grep -A 10 "^secrets:" /tmp/mas_base_config.yaml | grep "encryption:" | cut -d'"' -f2 2>/dev/null)
-        if [ -n "$encryption_secret" ]; then
+        local new_encryption_secret=$(grep -A 10 "^secrets:" /tmp/mas_base_config.yaml | grep "encryption:" | cut -d'"' -f2 2>/dev/null)
+        if [ -n "$new_encryption_secret" ]; then
             log "INFO" "Использование секрета шифрования из сгенерированной конфигурации"
-            sed -i "s/encryption: \".*\"/encryption: \"$encryption_secret\"/" "$MAS_CONFIG_FILE"
+            sed -i "s/encryption: \".*\"/encryption: \"$new_encryption_secret\"/" "$MAS_CONFIG_FILE"
         fi
         
         # Извлекаем ключи более безопасным способом
@@ -658,7 +670,7 @@ experimental_features:
 enable_registration: false
 disable_msisdn_registration: true
 
-# Современные функции Matrix
+# Современые функции Matrix
 experimental_features:
   spaces_enabled: true
   msc3440_enabled: true  # Threading

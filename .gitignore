@@ -457,3 +457,4 @@ MAS_DATABASE_FIX_SUMMARY.md
 docs/mas-problems-analysis.md
 fix_mas_complete.sh
 docs/mas-registration-fixes.md
+fix_mas_config_issues.sh
