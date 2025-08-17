@@ -463,3 +463,5 @@ fix_mas_yaml_issues.sh
 docs/mas-opa-policy-fix.md
 fix_mas_opa_policy.sh
 quick_fix_mas_opa.sh
+docs/mas-policy-wasm-fix.md
+modules/fix_mas_policy_config.sh
