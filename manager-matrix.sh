@@ -2697,12 +2697,6 @@ main() {
         # Сообщение об ошибке уже выводится in initialize()
         exit 1
     fi
-    
-    # Приветствие
-    print_header "ДОБРО ПОЖАЛОВАТЬ В MATRIX SETUP TOOL!" "$GREEN"
-    
-    log "INFO" "Запуск $LIB_NAME v$LIB_VERSION"
-    log "INFO" "Проект: $PROJECT_NAME"
 
     # Запуск главного меню
     main_menu
