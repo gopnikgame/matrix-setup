@@ -1014,26 +1014,30 @@ main_menu() {
         echo
         safe_echo "${GREEN}1.${NC}  🚀 Установить Matrix Synapse (базовая система)"
         safe_echo "${GREEN}2.${NC}  🌐 Установить Element Web (веб-клиент)"
-        
+        safe_echo "${GREEN}3.${NC}  👥 Установить Synapse Admin (веб-админка)"
+        safe_echo "${GREEN}4.${NC}  🔑 Установить MAS (Система для пользовательских регистраций)"
+        safe_echo "${GREEN}5.${NC}  📞 Установить Coturn TURN Server (для VoIP через сервер)"
+
         echo
         safe_echo "${BOLD}Управление системой:${NC}"
         echo
-        safe_echo "${GREEN}3.${NC}  📊 Проверить статус системы"
-        safe_echo "${GREEN}4.${NC}  ⚙️  Управление службами"
-        safe_echo "${GREEN}5.${NC}  👥 Управление пользователями Matrix"
-        safe_echo "${GREEN}6.${NC}  🔧 Дополнительные компоненты"
+        safe_echo "${GREEN}6.${NC}  🌍 Управление федерацией"
+        safe_echo "${GREEN}7.${NC}  🔐 Управление регистрацией"
+        safe_echo "${GREEN}8.${NC}  👥 Управление пользователями Matrix"
+        safe_echo "${GREEN}9.${NC}  ⚙️  Управление MAS (настройки)"
+        safe_echo "${GREEN}10.${NC} 🔧 Дополнительные компоненты"
         
         echo
         safe_echo "${BOLD}Инструменты:${NC}"
         echo
-        safe_echo "${GREEN}7.${NC}  📋 Показать конфигурацию"
-        safe_echo "${GREEN}8.${NC}  💾 Создать резервную копию"
-        safe_echo "${GREEN}9.${NC}  🔄 Обновить модули и библиотеку"
-        safe_echo "${GREEN}10.${NC} 🔍 Диагностика и устранение проблем"
-        safe_echo "${GREEN}11.${NC} 📖 Показать системную информацию"
+        safe_echo "${GREEN}11.${NC} 📋 Показать конфигурацию"
+        safe_echo "${GREEN}12.${NC} 💾 Создать резервную копию"
+        safe_echo "${GREEN}13.${NC} 🔄 Обновить модули и библиотеку"
+        safe_echo "${GREEN}14.${NC} 🔍 Диагностика и устранение проблем"
+        safe_echo "${GREEN}15.${NC} 📖 Показать системную информацию"
         
         echo
-        safe_echo "${GREEN}12.${NC} ❌ Выход"
+        safe_echo "${GREEN}00.${NC} ❌ Выход"
         
         echo
         
@@ -1063,7 +1067,7 @@ main_menu() {
         fi
         
         echo
-        read -p "$(safe_echo "${YELLOW}Выберите действие (1-12): ${NC}")" choice
+        read -p "$(safe_echo "${YELLOW}Выберите действие (00-15): ${NC}")" choice
         
         case $choice in
             1)
@@ -1073,35 +1077,47 @@ main_menu() {
                 install_element_web
                 ;;
             3)
-                check_matrix_status
+                run_module "synapse_admin"
                 ;;
             4)
-                manage_services
+                run_module "install_mas"
                 ;;
             5)
-                manage_matrix_users
+                run_module "coturn_setup"
                 ;;
             6)
-                manage_additional_components
+                run_module "federation_control"
                 ;;
             7)
-                show_configuration_info
+                run_module "registration_control"
                 ;;
             8)
-                create_backup
+                manage_matrix_users
                 ;;
             9)
-                update_modules_and_library
+                run_module "mas_manage"
                 ;;
             10)
+                manage_additional_components
+                ;;
+            11)
+                show_configuration_info
+                ;;
+            12)
+                create_backup
+                ;;
+            13)
+                update_modules_and_library
+                ;;
+            14)
                 log "INFO" "Запуск диагностики..."
                 get_system_info
                 check_matrix_status
                 ;;
-            11)
+            15)
                 get_system_info
                 ;;
-            12)
+            "00")
                 print_header "ЗАВЕРШЕНИЕ РАБОТЫ" "$GREEN"
                 log "INFO" "Спасибо за использование Matrix Setup Tool!"
                 safe_echo "${GREEN}До свидания! 👋${NC}"
@@ -1113,7 +1129,7 @@ main_menu() {
                 ;;
         esac
         
-        if [ $choice -ne 12 ]; then
+        if [ "$choice" != "00" ]; then
             echo
             read -p "Нажмите Enter для возврата в главное меню..."
         fi
@@ -1127,7 +1143,7 @@ initialize() {
     mkdir -p "$LOG_DIR"
     
     # Проверка наличия модулей
-    local required_modules=("core_install" "element_web" "coturn_setup" "caddy_config" "synapse_admin" "federation_control" "registration_control" "registration_mas" "mas_manage" "ufw_config")
+    local required_modules=("core_install" "element_web" "coturn_setup" "caddy_config" "synapse_admin" "federation_control" "registration_control" "install_mas" "mas_manage" "ufw_config")
     local missing_modules=()
     
     for module in "${required_modules[@]}"; do
@@ -1155,36 +1171,28 @@ manage_additional_components() {
         print_header "ДОПОЛНИТЕЛЬНЫЕ КОМПОНЕНТЫ" "$YELLOW"
         
         safe_echo "${BOLD}Доступные компоненты:${NC}"
-        safe_echo "${GREEN}1.${NC} 📞 Coturn TURN Server (для VoIP)"
-        safe_echo "${GREEN}2.${NC} 👥 Synapse Admin (веб-интерфейс)"
-        safe_echo "${GREEN}3.${NC} 🔐 Управление регистрацией"
-        safe_echo "${GREEN}4.${NC} 🌍 Управление федерацией"
-        safe_echo "${GREEN}5.${NC} 🔒 Настройка файрвола (UFW)"
-        safe_echo "${GREEN}6.${NC} 🔧 Настройка Reverse Proxy (Caddy)"
-        safe_echo "${GREEN}7.${NC} 🔑 Matrix Authentication Service (MAS)"
-        safe_echo "${GREEN}8.${NC} ⚙️  Управление MAS (настройки)"
-        safe_echo "${GREEN}9.${NC} Назад в главное меню"
+        safe_echo "${GREEN}1.${NC} 🔒 Настройка файрвола (UFW)"
+        safe_echo "${GREEN}2.${NC} 🔧 Настройка Reverse Proxy (Caddy)"
+        safe_echo "${GREEN}3.${NC} 📊 Проверить статус системы"
+        safe_echo "${GREEN}4.${NC} ⚙️  Управление службами"
+        safe_echo "${GREEN}0.${NC} ↩️  Назад в главное меню"
         
         echo
-        read -p "$(safe_echo "${YELLOW}Выберите действие (1-9): ${NC}")" choice
+        read -p "$(safe_echo "${YELLOW}Выберите действие (0-4): ${NC}")" choice
         
         case $choice in
-            1) run_module "coturn_setup" ;;
-            2) run_module "synapse_admin" ;;
-            3) run_module "registration_control" ;;
-            4) run_module "federation_control" ;;
-            5) run_module "ufw_config" ;;
-            6) run_module "caddy_config" ;;
-            7) run_module "registration_mas" ;;
-            8) run_module "mas_manage" ;;
-            9) return 0 ;;
+            1) run_module "ufw_config" ;;
+            2) run_module "caddy_config" ;;
+            3) check_matrix_status ;;
+            4) manage_services ;;
+            0) return 0 ;;
             *)
                 log "ERROR" "Неверный выбор"
                 sleep 1
                 ;;
         esac
         
-        if [ $choice -ne 9 ]; then
+        if [ "$choice" -ne 0 ]; then
             read -p "Нажмите Enter для продолжения..."
         fi
     done
@@ -1444,6 +1452,8 @@ manage_matrix_users() {
         fi
         
         echo
+        safe_echo "${YELLOW}Предупреждение! чтобы создать пользователя, сначала сгенерируйте токен регистрации и включите регистрацию, она по умолчанию выключена(пункт 6).${NC}"
+        echo
         safe_echo "${BOLD}Управление пользователями:${NC}"
         safe_echo "${GREEN}1.${NC} 👤 Создать администратора"
         safe_echo "${GREEN}2.${NC} 👥 Создать обычного пользователя"
@@ -1453,13 +1463,13 @@ manage_matrix_users() {
         
         echo
         safe_echo "${BOLD}Дополнительные возможности:${NC}"
-        safe_echo "${GREEN}6.${NC} ⚙️  Настройка регистрации (полный модуль)"
+        safe_echo "${GREEN}6.${NC} ⚙️  Настройка регистрации"
         safe_echo "${GREEN}7.${NC} 🔑 Управление токенами регистрации"
         safe_echo "${GREEN}8.${NC} 📝 Показать команды для ручного управления"
-        safe_echo "${GREEN}9.${NC} ↩️  Назад в главное меню"
+        safe_echo "${GREEN}0.${NC} ↩️  Назад в главное меню"
         
         echo
-        read -p "$(safe_echo "${YELLOW}Выберите действие (1-9): ${NC}")" choice
+        read -p "$(safe_echo "${YELLOW}Выберите действие (0-8): ${NC}")" choice
         
         case $choice in
             1)
@@ -1495,7 +1505,7 @@ manage_matrix_users() {
             8)
                 show_manual_commands
                 ;;
-            9)
+            0)
                 return 0
                 ;;
             *)
@@ -1504,7 +1514,7 @@ manage_matrix_users() {
                 ;;
         esac
         
-        if [ $choice -ne 9 ]; then
+        if [ "$choice" -ne 0 ]; then
             echo
             read -p "Нажмите Enter для продолжения..."
         fi
@@ -1655,7 +1665,7 @@ create_admin_user_local() {
         fi
         
         # Очищаем временный файл
-        rm -f "$temp_output"
+        rm -f "$temp_file"
         
     else
         log "ERROR" "Ошибка создания административного пользователя"
@@ -2476,7 +2486,7 @@ main() {
     
     # Инициализация
     if ! initialize; then
-        # Сообщение об ошибке уже выводится в initialize()
+        # Сообщение об ошибке уже выводится in initialize()
         exit 1
     fi
     
