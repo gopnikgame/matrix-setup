@@ -465,3 +465,5 @@ fix_mas_opa_policy.sh
 quick_fix_mas_opa.sh
 docs/mas-policy-wasm-fix.md
 modules/fix_mas_policy_config.sh
+docs/mas-policy-missing-files-fix.md
+modules/fix_mas_policy_missing_files.sh

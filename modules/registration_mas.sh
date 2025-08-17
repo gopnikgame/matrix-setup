@@ -218,7 +218,7 @@ setup_mas_database() {
     return 0
 }
 
-# Скачивание и установка MAS
+# Скачивание и установка MAS (ИСПРАВЛЕННАЯ ВЕРСИЯ)
 download_and_install_mas() {
     log "INFO" "Скачивание Matrix Authentication Service..."
     
@@ -254,6 +254,10 @@ download_and_install_mas() {
         return 1
     fi
     
+    # КРИТИЧЕСКИ ВАЖНО: Создаем директорию установки MAS
+    local mas_install_dir="/usr/local/share/mas-cli"
+    mkdir -p "$mas_install_dir"
+    
     # Создаем временную директорию для извлечения
     local temp_dir=$(mktemp -d)
     
@@ -276,12 +280,59 @@ download_and_install_mas() {
         return 1
     fi
     
-    # Копируем дополнительные файлы если они есть
+    # КРИТИЧЕСКИ ВАЖНО: Устанавливаем ВСЕ файлы share (включая policy.wasm)
     if [ -d "$temp_dir/share" ]; then
-        mkdir -p /usr/local/share/mas-cli
-        cp -r "$temp_dir/share"/* /usr/local/share/mas-cli/
-        log "INFO" "Дополнительные файлы MAS скопированы"
+        log "INFO" "Установка файлов MAS (assets, policy, templates, translations)..."
+        
+        # Копируем все содержимое share в правильное место
+        cp -r "$temp_dir/share"/* "$mas_install_dir/"
+        
+        # Проверяем, что критически важные файлы установлены
+        if [ -f "$mas_install_dir/policy.wasm" ]; then
+            log "SUCCESS" "✅ Файл политики policy.wasm установлен"
+        else
+            log "ERROR" "❌ Файл политики policy.wasm отсутствует!"
+            ls -la "$mas_install_dir/" 2>/dev/null | head -10
+            return 1
+        fi
+        
+        if [ -f "$mas_install_dir/manifest.json" ]; then
+            log "SUCCESS" "✅ Манифест frontend assets установлен"
+        else
+            log "WARN" "⚠️  Манифест frontend assets отсутствует"
+        fi
+        
+        if [ -d "$mas_install_dir/assets" ]; then
+            log "SUCCESS" "✅ Frontend assets установлены"
+        else
+            log "WARN" "⚠️  Frontend assets отсутствуют"
+        fi
+        
+        if [ -d "$mas_install_dir/templates" ]; then
+            log "SUCCESS" "✅ Templates установлены"
+        else
+            log "WARN" "⚠️  Templates отсутствуют"
+        fi
+        
+        if [ -d "$mas_install_dir/translations" ]; then
+            log "SUCCESS" "✅ Translations установлены"
+        else
+            log "WARN" "⚠️  Translations отсутствуют"
+        fi
+        
+        log "INFO" "Дополнительные файлы MAS установлены в $mas_install_dir"
+    else
+        log "ERROR" "❌ Директория share отсутствует в архиве MAS!"
+        log "ERROR" "Содержимое архива:"
+        ls -la "$temp_dir/" 2>/dev/null
+        rm -rf "$temp_dir"
+        return 1
     fi
+    
+    # Устанавливаем правильные права доступа
+    chown -R root:root "$mas_install_dir"
+    find "$mas_install_dir" -type f -exec chmod 644 {} \;
+    find "$mas_install_dir" -type d -exec chmod 755 {} \;
     
     # Удаляем временные файлы
     rm -f "/tmp/$mas_binary"
@@ -291,8 +342,407 @@ download_and_install_mas() {
     if mas --version >/dev/null 2>&1; then
         local mas_version=$(mas --version | head -1)
         log "SUCCESS" "Matrix Authentication Service установлен: $mas_version"
+        log "SUCCESS" "Файлы установлены в: $mas_install_dir"
     else
         log "ERROR" "Установка MAS завершилась с ошибкой"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Генерация конфигурации MAS (ИСПРАВЛЕННАЯ ВЕРСИЯ С ПРАВИЛЬНЫМИ ПУТЯМИ)
+generate_mas_config() {
+    local mas_port="$1"
+    local matrix_domain="$2"
+    local mas_secret="$3"
+    local db_uri="$4"
+    
+    log "INFO" "Генерация конфигурации MAS..."
+    
+    # Создаем системного пользователя для MAS если нужно
+    if ! create_mas_user; then
+        return 1
+    fi
+    
+    # Создаем директории
+    mkdir -p "$MAS_CONFIG_DIR"
+    mkdir -p /var/lib/mas
+    
+    # Определяем публичную базу и issuer в зависимости от типа сервера
+    local mas_public_base
+    local mas_issuer
+    
+    case "${SERVER_TYPE:-hosting}" in
+        "proxmox"|"home_server"|"openvz"|"docker")
+            mas_public_base="https://$matrix_domain"
+            mas_issuer="https://$matrix_domain"
+            log "INFO" "Домашний сервер: MAS будет доступен через reverse proxy"
+            ;;
+        *)
+            mas_public_base="https://auth.$matrix_domain"
+            mas_issuer="https://auth.$matrix_domain"
+            log "INFO" "Облачный хостинг: MAS получит отдельный поддомен"
+            ;;
+    esac
+    
+    # КРИТИЧЕСКАЯ ПРОВЕРКА: убеждаемся, что URI содержит правильное имя базы данных
+    local expected_db="mas_db"
+    local config_db=$(echo "$db_uri" | sed 's|.*@localhost/||' | sed 's|?.*||')
+    
+    if [ "$config_db" != "$expected_db" ]; then
+        log "ERROR" "КРИТИЧЕСКАЯ ОШИБКА: URI содержит неправильное имя базы данных: '$config_db' (ожидается: '$expected_db')"
+        log "ERROR" "URI: $(echo "$db_uri" | sed 's/:[^:]*@/:***@/')"  # Скрываем пароль
+        return 1
+    fi
+    
+    log "SUCCESS" "URI содержит правильное имя базы данных: $config_db"
+    
+    # ВАЖНО: Проверяем, что все необходимые файлы установлены
+    local mas_share_dir="/usr/local/share/mas-cli"
+    local policy_path="$mas_share_dir/policy.wasm"
+    local assets_path="$mas_share_dir/assets"
+    local templates_path="$mas_share_dir/templates"
+    local translations_path="$mas_share_dir/translations"
+    local manifest_path="$mas_share_dir/manifest.json"
+    
+    log "INFO" "Проверка наличия файлов MAS..."
+    if [ ! -f "$policy_path" ]; then
+        log "ERROR" "❌ Файл политики не найден: $policy_path"
+        log "ERROR" "Это означает, что установка MAS неполная"
+        log "ERROR" "Содержимое $mas_share_dir:"
+        ls -la "$mas_share_dir/" 2>/dev/null || log "ERROR" "Директория $mas_share_dir не существует"
+        return 1
+    else
+        log "SUCCESS" "✅ Файл политики найден: $policy_path"
+    fi
+    
+    # Проверяем остальные файлы
+    [ -d "$assets_path" ] && log "SUCCESS" "✅ Assets найдены: $assets_path" || log "WARN" "⚠️  Assets отсутствуют: $assets_path"
+    [ -d "$templates_path" ] && log "SUCCESS" "✅ Templates найдены: $templates_path" || log "WARN" "⚠️  Templates отсутствуют: $templates_path"
+    [ -d "$translations_path" ] && log "SUCCESS" "✅ Translations найдены: $translations_path" || log "WARN" "⚠️  Translations отсутствуют: $translations_path"
+    [ -f "$manifest_path" ] && log "SUCCESS" "✅ Manifest найден: $manifest_path" || log "WARN" "⚠️  Manifest отсутствует: $manifest_path"
+    
+    # Создаем ИСПРАВЛЕННУЮ конфигурацию с правильными секретами И ПРАВИЛЬНЫМИ ПУТЯМИ
+    log "INFO" "Создание конфигурации MAS с правильными секретами И ПРАВИЛЬНЫМИ ПУТЯМИ..."
+
+    # Пытаемся сгенерировать конфигурацию с помощью mas config generate для получения правильных секретов
+    log "INFO" "Генерация базовой конфигурации с помощью mas config generate..."
+
+    local temp_config="/tmp/mas_generated_config_$$"
+    local base_config_generated=false
+
+    if mas config generate > "$temp_config" 2>/dev/null; then
+        base_config_generated=true
+        log "SUCCESS" "Базовая конфигурация сгенерирована командой 'mas config generate'"
+        
+        # Извлекаем правильные секреты из сгенерированной конфигурации
+        local secrets_start=$(grep -n "^secrets:" "$temp_config" | cut -d: -f1)
+        
+        if [ -n "$secrets_start" ]; then
+            log "INFO" "Создание конфигурации с использованием правильно сгенерированных секретов"
+            
+            # Найдем конец секции secrets (следующая секция верхнего уровня)
+            local secrets_end=$(tail -n +$((secrets_start + 1)) "$temp_config" | grep -n "^[a-zA-Z]" | head -1 | cut -d: -f1)
+            if [ -n "$secrets_end" ]; then
+                secrets_end=$((secrets_start + secrets_end - 1))
+            else
+                secrets_end=$(wc -l < "$temp_config")
+            fi
+            
+            # Создаем нашу конфигурацию с правильными секретами И ПРАВИЛЬНЫМИ ПУТЯМИ
+            cat > "$MAS_CONFIG_FILE" <<EOF
+# Matrix Authentication Service Configuration - ИСПРАВЛЕНО С ПРАВИЛЬНЫМИ ПУТЯМИ
+# Generated: $(date '+%Y-%m-%d %H:%M:%S')
+# Server Type: ${SERVER_TYPE:-hosting}
+# Port: $mas_port
+# Database: $expected_db
+
+http:
+  public_base: "$mas_public_base"
+  issuer: "$mas_issuer"
+  listeners:
+    - name: web
+      resources:
+        - name: discovery
+        - name: human
+        - name: oauth
+        - name: compat
+        - name: graphql
+        - name: assets
+          path: "$assets_path"
+      binds:
+        - address: "$BIND_ADDRESS:$mas_port"
+      proxy_protocol: false
+
+database:
+  uri: "$db_uri"
+
+matrix:
+  homeserver: "$matrix_domain"
+  secret: "$mas_secret"
+  endpoint: "http://localhost:8008"
+
+# КРИТИЧЕСКИ ВАЖНО: Правильная конфигурация политики OPA с путем к файлу
+policy:
+  # Указываем правильный путь к файлу policy.wasm
+  wasm_module: "$policy_path"
+  
+  # Данные для политики - базовые правила регистрации и управления
+  data:
+    registration:
+      # Базовые настройки регистрации
+      enabled: true
+      require_registration_token: false
+      
+      # Заблокированные имена пользователей (базовый набор)
+      banned_usernames:
+        literals: ["admin", "root", "administrator", "system", "support", "help", "info"]
+        substrings: ["admin", "root"]
+        prefixes: ["admin-", "root-", "system-"]
+        suffixes: ["-admin", "-root"]
+        regexes: ["^admin.*", "^root.*", ".*admin$"]
+
+# ВАЖНО: Настройка templates с правильными путями
+templates:
+  path: "$templates_path"
+  assets_manifest: "$manifest_path"
+  translations_path: "$translations_path"
+
+EOF
+
+            # Добавляем секцию secrets из сгенерированной конфигурации
+            sed -n "${secrets_start},${secrets_end}p" "$temp_config" >> "$MAS_CONFIG_FILE"
+            
+            # Добавляем остальные секции
+            cat >> "$MAS_CONFIG_FILE" <<EOF
+
+clients:
+  - client_id: "0000000000000000000SYNAPSE"
+    client_auth_method: client_secret_basic
+    client_secret: "$mas_secret"
+
+passwords:
+  enabled: true
+  schemes:
+    - version: 1
+      algorithm: bcrypt
+      unicode_normalization: true
+    - version: 2
+      algorithm: argon2id
+
+account:
+  email_change_allowed: true
+  displayname_change_allowed: true
+  password_registration_enabled: false
+  password_change_allowed: true
+  password_recovery_enabled: false
+  account_deactivation_allowed: true
+  registration_token_required: false
+
+experimental:
+  access_token_ttl: 300
+  compat_token_ttl: 300
+EOF
+
+        else
+            log "WARN" "Не удалось найти секцию secrets в сгенерированной конфигурации, создаем вручную"
+            base_config_generated=false
+        fi
+        
+        rm -f "$temp_config"
+    else
+        log "WARN" "Не удалось использовать 'mas config generate', создаем конфигурацию вручную"
+        base_config_generated=false
+    fi
+    
+    # Если автоматическая генерация не удалась, создаем конфигурацию вручную с правильными путями
+    if [ "$base_config_generated" = false ]; then
+        log "INFO" "Создание конфигурации MAS вручную с правильными путями..."
+        
+        # Генерируем правильные секреты вручную
+        local encryption_secret=$(openssl rand -hex 32)
+        local rsa_key_kid=$(date +%s | sha256sum | cut -c1-8)
+        
+        cat > "$MAS_CONFIG_FILE" <<EOF
+# Matrix Authentication Service Configuration - ИСПРАВЛЕНО С ПРАВИЛЬНЫМИ ПУТЯМИ
+# Generated: $(date '+%Y-%m-%d %H:%M:%S')
+# Server Type: ${SERVER_TYPE:-hosting}
+# Port: $mas_port
+# Database: $expected_db
+
+http:
+  public_base: "$mas_public_base"
+  issuer: "$mas_issuer"
+  listeners:
+    - name: web
+      resources:
+        - name: discovery
+        - name: human
+        - name: oauth
+        - name: compat
+        - name: graphql
+        - name: assets
+          path: "$assets_path"
+      binds:
+        - address: "$BIND_ADDRESS:$mas_port"
+      proxy_protocol: false
+
+database:
+  uri: "$db_uri"
+
+matrix:
+  homeserver: "$matrix_domain"
+  secret: "$mas_secret"
+  endpoint: "http://localhost:8008"
+
+# КРИТИЧЕСКИ ВАЖНО: Правильная конфигурация политики OPA с путем к файлу
+policy:
+  # Указываем правильный путь к файлу policy.wasm
+  wasm_module: "$policy_path"
+  
+  # Данные для политики - базовые правила регистрации и управления
+  data:
+    registration:
+      # Базовые настройки регистрации
+      enabled: true
+      require_registration_token: false
+      
+      # Заблокированные имена пользователей (базовый набор)
+      banned_usernames:
+        literals: ["admin", "root", "administrator", "system", "support", "help", "info"]
+        substrings: ["admin", "root"]
+        prefixes: ["admin-", "root-", "system-"]
+        suffixes: ["-admin", "-root"]
+        regexes: ["^admin.*", "^root.*", ".*admin$"]
+
+# ВАЖНО: Настройка templates с правильными путями
+templates:
+  path: "$templates_path"
+  assets_manifest: "$manifest_path"
+  translations_path: "$translations_path"
+
+secrets:
+  encryption: "$encryption_secret"
+  keys:
+    - kid: "$rsa_key_kid"
+      key: |
+$(openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 | sed 's/^/        /')
+
+clients:
+  - client_id: "0000000000000000000SYNAPSE"
+    client_auth_method: client_secret_basic
+    client_secret: "$mas_secret"
+
+passwords:
+  enabled: true
+  schemes:
+    - version: 1
+      algorithm: bcrypt
+      unicode_normalization: true
+    - version: 2
+      algorithm: argon2id
+
+account:
+  email_change_allowed: true
+  displayname_change_allowed: true
+  password_registration_enabled: false
+  password_change_allowed: true
+  password_recovery_enabled: false
+  account_deactivation_allowed: true
+  registration_token_required: false
+
+experimental:
+  access_token_ttl: 300
+  compat_token_ttl: 300
+EOF
+    fi
+    
+    # Устанавливаем права доступа
+    chown -R "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_DIR"
+    chown -R "$MAS_USER:$MAS_GROUP" /var/lib/mas
+    chmod 600 "$MAS_CONFIG_FILE"
+    
+    # КРИТИЧЕСКАЯ ПРОВЕРКА: убеждаемся, что конфигурация создана правильно
+    if ! grep -q "^database:" "$MAS_CONFIG_FILE"; then
+        log "ERROR" "Конфигурация MAS повреждена: секция database отсутствует!"
+        return 1
+    fi
+    
+    if ! grep -q "$db_uri" "$MAS_CONFIG_FILE"; then
+        log "ERROR" "Конфигурация MAS повреждена: не содержит корректный URI базы данных!"
+        return 1
+    fi
+    
+    if ! grep -q "^secrets:" "$MAS_CONFIG_FILE"; then
+        log "ERROR" "Конфигурация MAS повреждена: секция secrets отсутствует!"
+        return 1
+    fi
+    
+    # НОВАЯ ПРОВЕРКА: убеждаемся, что секция policy добавлена с правильным путем
+    if ! grep -q "^policy:" "$MAS_CONFIG_FILE"; then
+        log "ERROR" "Конфигурация MAS повреждена: секция policy отсутствует!"
+        return 1
+    fi
+    
+    # ВАЖНАЯ ПРОВЕРКА: убеждаемся, что wasm_module указывает на правильный файл
+    if ! grep -q "wasm_module: \"$policy_path\"" "$MAS_CONFIG_FILE"; then
+        log "ERROR" "Конфигурация MAS не содержит правильный путь к policy.wasm!"
+        log "ERROR" "Ожидаемый путь: $policy_path"
+        return 1
+    else
+        log "SUCCESS" "✅ Конфигурация MAS содержит правильный путь к policy.wasm"
+    fi
+    
+    # ВАЖНАЯ ПРОВЕРКА: убеждаемся, что templates правильно настроены
+    if ! grep -q "^templates:" "$MAS_CONFIG_FILE"; then
+        log "ERROR" "Конфигурация MAS не содержит секцию templates!"
+        return 1
+    else
+        log "SUCCESS" "✅ Конфигурация MAS содержит секцию templates"
+    fi
+    
+    # Проверяем YAML синтаксис если доступен python
+    if command -v python3 >/dev/null 2>&1; then
+        if python3 -c "import yaml; yaml.safe_load(open('$MAS_CONFIG_FILE'))" 2>/dev/null; then
+            log "SUCCESS" "YAML синтаксис конфигурации корректен"
+        else
+            log "ERROR" "Ошибка в YAML синтаксисе конфигурации!"
+            log "INFO" "Проверьте конфигурацию: $MAS_CONFIG_FILE"
+            return 1
+        fi
+    fi
+    
+    # Проверяем конфигурацию с помощью MAS если возможно
+    if command -v mas >/dev/null 2>&1; then
+        log "INFO" "Проверка конфигурации с помощью mas config check..."
+        if mas config check --config "$MAS_CONFIG_FILE" 2>/dev/null; then
+            log "SUCCESS" "Конфигурация MAS прошла проверку"
+        else
+            log "WARN" "Конфигурация MAS имеет предупреждения (но это нормально для первого запуска)"
+        fi
+    fi
+    
+    # Финальная проверка: убеждаемся, что в конфигурации указана правильная база данных
+    local final_config_db=$(grep -A 1 "^database:" "$MAS_CONFIG_FILE" | grep "uri:" | sed 's/.*@localhost\///' | sed 's/".*$//' 2>/dev/null)
+    if [ "$final_config_db" = "$expected_db" ]; then
+        log "SUCCESS" "✅ Конфигурация MAS создана успешно с правильной базой данных: $final_config_db"
+        log "INFO" "Конфигурация содержит:"
+        log "INFO" "  - Порт: $mas_port"
+        log "INFO" "  - Домен: $matrix_domain" 
+        log "INFO" "  - База данных: $final_config_db"
+        log "INFO" "  - Bind адрес: $BIND_ADDRESS:$mas_port"
+        log "INFO" "  - Policy файл: $policy_path"
+        log "INFO" "  - Assets: $assets_path"
+        log "INFO" "  - Templates: $templates_path"
+        log "INFO" "  - Translations: $translations_path"
+        log "INFO" "  - Manifest: $manifest_path"
+    else
+        log "ERROR" "КРИТИЧЕСКАЯ ОШИБКА: Финальная проверка не прошла!"
+        log "ERROR" "Ожидается база данных: $expected_db"
+        log "ERROR" "Найдена база данных: $final_config_db"
+        log "DEBUG" "Содержимое секции database:"
+        grep -A 2 "^database:" "$MAS_CONFIG_FILE" 2>/dev/null || log "ERROR" "Секция database не найдена"
         return 1
     fi
     
@@ -382,8 +832,33 @@ generate_mas_config() {
     
     log "SUCCESS" "URI содержит правильное имя базы данных: $config_db"
     
-    # Создаем ИСПРАВЛЕННУЮ конфигурацию с правильным URI базы данных
-    log "INFO" "Создание конфигурации MAS с правильным URI базы данных..."
+    # ВАЖНО: Проверяем, что все необходимые файлы установлены
+    local mas_share_dir="/usr/local/share/mas-cli"
+    local policy_path="$mas_share_dir/policy.wasm"
+    local assets_path="$mas_share_dir/assets"
+    local templates_path="$mas_share_dir/templates"
+    local translations_path="$mas_share_dir/translations"
+    local manifest_path="$mas_share_dir/manifest.json"
+    
+    log "INFO" "Проверка наличия файлов MAS..."
+    if [ ! -f "$policy_path" ]; then
+        log "ERROR" "❌ Файл политики не найден: $policy_path"
+        log "ERROR" "Это означает, что установка MAS неполная"
+        log "ERROR" "Содержимое $mas_share_dir:"
+        ls -la "$mas_share_dir/" 2>/dev/null || log "ERROR" "Директория $mas_share_dir не существует"
+        return 1
+    else
+        log "SUCCESS" "✅ Файл политики найден: $policy_path"
+    fi
+    
+    # Проверяем остальные файлы
+    [ -d "$assets_path" ] && log "SUCCESS" "✅ Assets найдены: $assets_path" || log "WARN" "⚠️  Assets отсутствуют: $assets_path"
+    [ -d "$templates_path" ] && log "SUCCESS" "✅ Templates найдены: $templates_path" || log "WARN" "⚠️  Templates отсутствуют: $templates_path"
+    [ -d "$translations_path" ] && log "SUCCESS" "✅ Translations найдены: $translations_path" || log "WARN" "⚠️  Translations отсутствуют: $translations_path"
+    [ -f "$manifest_path" ] && log "SUCCESS" "✅ Manifest найден: $manifest_path" || log "WARN" "⚠️  Manifest отсутствует: $manifest_path"
+    
+    # Создаем ИСПРАВЛЕННУЮ конфигурацию с правильными секретами И ПРАВИЛЬНЫМИ ПУТЯМИ
+    log "INFO" "Создание конфигурации MAS с правильными секретами И ПРАВИЛЬНЫМИ ПУТЯМИ..."
 
     # Пытаемся сгенерировать конфигурацию с помощью mas config generate для получения правильных секретов
     log "INFO" "Генерация базовой конфигурации с помощью mas config generate..."
@@ -409,9 +884,9 @@ generate_mas_config() {
                 secrets_end=$(wc -l < "$temp_config")
             fi
             
-            # Создаем нашу конфигурацию с правильными секретами
+            # Создаем нашу конфигурацию с правильными секретами И ПРАВИЛЬНЫМИ ПУТЯМИ
             cat > "$MAS_CONFIG_FILE" <<EOF
-# Matrix Authentication Service Configuration - ИСПРАВЛЕНО
+# Matrix Authentication Service Configuration - ИСПРАВЛЕНО С ПРАВИЛЬНЫМИ ПУТЯМИ
 # Generated: $(date '+%Y-%m-%d %H:%M:%S')
 # Server Type: ${SERVER_TYPE:-hosting}
 # Port: $mas_port
@@ -429,6 +904,7 @@ http:
         - name: compat
         - name: graphql
         - name: assets
+          path: "$assets_path"
       binds:
         - address: "$BIND_ADDRESS:$mas_port"
       proxy_protocol: false
@@ -441,10 +917,10 @@ matrix:
   secret: "$mas_secret"
   endpoint: "http://localhost:8008"
 
-# КРИТИЧЕСКИ ВАЖНО: Конфигурация политики OPA для предотвращения ошибок запуска
+# КРИТИЧЕСКИ ВАЖНО: Правильная конфигурация политики OPA с путем к файлу
 policy:
-  # НЕ указываем wasm_module - это заставляет MAS использовать встроенную политику
-  # Это предотвращает ошибку "invalid type: found unit, expected a UTF-8 path string"
+  # Указываем правильный путь к файлу policy.wasm
+  wasm_module: "$policy_path"
   
   # Данные для политики - базовые правила регистрации и управления
   data:
@@ -460,6 +936,12 @@ policy:
         prefixes: ["admin-", "root-", "system-"]
         suffixes: ["-admin", "-root"]
         regexes: ["^admin.*", "^root.*", ".*admin$"]
+
+# ВАЖНО: Настройка templates с правильными путями
+templates:
+  path: "$templates_path"
+  assets_manifest: "$manifest_path"
+  translations_path: "$translations_path"
 
 EOF
 
@@ -508,16 +990,16 @@ EOF
         base_config_generated=false
     fi
     
-    # Если автоматическая генерация не удалась, создаем конфигурацию вручную
+    # Если автоматическая генерация не удалась, создаем конфигурацию вручную с правильными путями
     if [ "$base_config_generated" = false ]; then
-        log "INFO" "Создание конфигурации MAS вручную..."
+        log "INFO" "Создание конфигурации MAS вручную с правильными путями..."
         
         # Генерируем правильные секреты вручную
         local encryption_secret=$(openssl rand -hex 32)
         local rsa_key_kid=$(date +%s | sha256sum | cut -c1-8)
         
         cat > "$MAS_CONFIG_FILE" <<EOF
-# Matrix Authentication Service Configuration - ИСПРАВЛЕНО
+# Matrix Authentication Service Configuration - ИСПРАВЛЕНО С ПРАВИЛЬНЫМИ ПУТЯМИ
 # Generated: $(date '+%Y-%m-%d %H:%M:%S')
 # Server Type: ${SERVER_TYPE:-hosting}
 # Port: $mas_port
@@ -535,6 +1017,7 @@ http:
         - name: compat
         - name: graphql
         - name: assets
+          path: "$assets_path"
       binds:
         - address: "$BIND_ADDRESS:$mas_port"
       proxy_protocol: false
@@ -547,10 +1030,10 @@ matrix:
   secret: "$mas_secret"
   endpoint: "http://localhost:8008"
 
-# КРИТИЧЕСКИ ВАЖНО: Конфигурация политики OPA для предотвращения ошибок запуска
+# КРИТИЧЕСКИ ВАЖНО: Правильная конфигурация политики OPA с путем к файлу
 policy:
-  # НЕ указываем wasm_module - это заставляет MAS использовать встроенную политику
-  # Это предотвращает ошибку "invalid type: found unit, expected a UTF-8 path string"
+  # Указываем правильный путь к файлу policy.wasm
+  wasm_module: "$policy_path"
   
   # Данные для политики - базовые правила регистрации и управления
   data:
@@ -566,6 +1049,12 @@ policy:
         prefixes: ["admin-", "root-", "system-"]
         suffixes: ["-admin", "-root"]
         regexes: ["^admin.*", "^root.*", ".*admin$"]
+
+# ВАЖНО: Настройка templates с правильными путями
+templates:
+  path: "$templates_path"
+  assets_manifest: "$manifest_path"
+  translations_path: "$translations_path"
 
 secrets:
   encryption: "$encryption_secret"
@@ -624,19 +1113,27 @@ EOF
         return 1
     fi
     
-    # НОВАЯ ПРОВЕРКА: убеждаемся, что секция policy добавлена
+    # НОВАЯ ПРОВЕРКА: убеждаемся, что секция policy добавлена с правильным путем
     if ! grep -q "^policy:" "$MAS_CONFIG_FILE"; then
         log "ERROR" "Конфигурация MAS повреждена: секция policy отсутствует!"
         return 1
     fi
     
-    # ВАЖНАЯ ПРОВЕРКА: убеждаемся, что wasm_module НЕ указан в конфигурации
-    if grep -q "wasm_module:" "$MAS_CONFIG_FILE"; then
-        log "ERROR" "Конфигурация MAS содержит проблемное поле wasm_module!"
-        log "ERROR" "Это может вызвать ошибку 'invalid type: found unit, expected a UTF-8 path string'"
+    # ВАЖНАЯ ПРОВЕРКА: убеждаемся, что wasm_module указывает на правильный файл
+    if ! grep -q "wasm_module: \"$policy_path\"" "$MAS_CONFIG_FILE"; then
+        log "ERROR" "Конфигурация MAS не содержит правильный путь к policy.wasm!"
+        log "ERROR" "Ожидаемый путь: $policy_path"
         return 1
     else
-        log "SUCCESS" "✅ Конфигурация MAS не содержит проблемного поля wasm_module"
+        log "SUCCESS" "✅ Конфигурация MAS содержит правильный путь к policy.wasm"
+    fi
+    
+    # ВАЖНАЯ ПРОВЕРКА: убеждаемся, что templates правильно настроены
+    if ! grep -q "^templates:" "$MAS_CONFIG_FILE"; then
+        log "ERROR" "Конфигурация MAS не содержит секцию templates!"
+        return 1
+    else
+        log "SUCCESS" "✅ Конфигурация MAS содержит секцию templates"
     fi
     
     # Проверяем YAML синтаксис если доступен python
@@ -669,7 +1166,11 @@ EOF
         log "INFO" "  - Домен: $matrix_domain" 
         log "INFO" "  - База данных: $final_config_db"
         log "INFO" "  - Bind адрес: $BIND_ADDRESS:$mas_port"
-        log "INFO" "  - OPA Policy: встроенная (без wasm_module)"
+        log "INFO" "  - Policy файл: $policy_path"
+        log "INFO" "  - Assets: $assets_path"
+        log "INFO" "  - Templates: $templates_path"
+        log "INFO" "  - Translations: $translations_path"
+        log "INFO" "  - Manifest: $manifest_path"
     else
         log "ERROR" "КРИТИЧЕСКАЯ ОШИБКА: Финальная проверка не прошла!"
         log "ERROR" "Ожидается база данных: $expected_db"
