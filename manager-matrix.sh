@@ -1198,7 +1198,7 @@ manage_additional_components() {
     done
 }
 
-# Функция обновления модулей и библиотеки
+# Функция обновления модулей и библиотеки через Git клонирование
 update_modules_and_library() {
     # Эта функция не должна выводить заголовок, так как она работает в "тихом" режиме при старте
     
@@ -1207,7 +1207,238 @@ update_modules_and_library() {
         return 1
     fi
     
-    log "INFO" "Проверка обновлений для модулей, библиотеки и менеджера..."
+    log "INFO" "Проверка обновлений через клонирование репозитория..."
+    
+    local repo_url="https://github.com/gopnikgame/matrix-setup.git"
+    local temp_dir=$(mktemp -d)
+    local updated_files=0
+    local manager_updated=false
+    
+    # Проверяем наличие git и устанавливаем при необходимости
+    if ! command -v git >/dev/null 2>&1; then
+        log "INFO" "Git не установлен. Попытка установки..."
+        if command -v apt-get >/dev/null 2>&1; then
+            if apt-get update >/dev/null 2>&1 && apt-get install -y git >/dev/null 2>&1; then
+                log "SUCCESS" "Git успешно установлен"
+            else
+                log "ERROR" "Не удалось установить Git через apt-get"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+        elif command -v yum >/dev/null 2>&1; then
+            if yum install -y git >/dev/null 2>&1; then
+                log "SUCCESS" "Git успешно установлен"
+            else
+                log "ERROR" "Не удалось установить Git через yum"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+        else
+            log "ERROR" "Не удалось установить Git. Установите вручную: apt install git"
+            log "INFO" "Возврат к старому методу обновления..."
+            rm -rf "$temp_dir"
+            return update_modules_and_library_legacy
+        fi
+    fi
+    
+    # Клонируем репозиторий (shallow clone для экономии трафика и времени)
+    log "DEBUG" "Клонирование репозитория в $temp_dir..."
+    if ! git clone --depth 1 --quiet "$repo_url" "$temp_dir/matrix-setup" 2>/dev/null; then
+        log "WARN" "Не удалось клонировать репозиторий. Возврат к старому методу..."
+        rm -rf "$temp_dir"
+        return update_modules_and_library_legacy
+    fi
+    
+    local repo_dir="$temp_dir/matrix-setup"
+    
+    # Проверяем, что репозиторий клонировался корректно
+    if [ ! -d "$repo_dir" ] || [ ! -f "$repo_dir/manager-matrix.sh" ]; then
+        log "WARN" "Репозиторий клонирован некорректно. Возврат к старому методу..."
+        rm -rf "$temp_dir"
+        return update_modules_and_library_legacy
+    fi
+    
+    # Список путей для синхронизации
+    local sync_paths=(
+        "common/common_lib.sh"
+        "manager-matrix.sh"
+        "modules"
+    )
+    
+    # Маппинг переименованных файлов (старое_имя -> новое_имя)
+    declare -A renamed_files=(
+        ["registration_mas.sh"]="install_mas.sh"
+        # Добавляйте сюда другие переименования при необходимости
+    )
+    
+    # Удаляем переименованные файлы перед синхронизацией
+    for old_name in "${!renamed_files[@]}"; do
+        local old_file="$MODULES_DIR/$old_name"
+        if [ -f "$old_file" ]; then
+            log "INFO" "Удаление переименованного файла: $old_name"
+            mv "$old_file" "${old_file}.renamed.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || rm -f "$old_file"
+            ((updated_files++))
+        fi
+    done
+    
+    # Синхронизируем файлы и директории
+    for sync_path in "${sync_paths[@]}"; do
+        local source_path="$repo_dir/$sync_path"
+        local target_path="$SCRIPT_DIR/$sync_path"
+        
+        if [ ! -e "$source_path" ]; then
+            log "WARN" "Файл/папка не найдена в репозитории: $sync_path"
+            continue
+        fi
+        
+        if [ -f "$source_path" ]; then
+            # Синхронизация отдельного файла
+            if sync_file "$source_path" "$target_path"; then
+                ((updated_files++))
+                if [ "$sync_path" = "manager-matrix.sh" ]; then
+                    manager_updated=true
+                fi
+            fi
+        elif [ -d "$source_path" ]; then
+            # Синхронизация директории
+            local dir_updates=$(sync_directory "$source_path" "$target_path")
+            updated_files=$((updated_files + dir_updates))
+        fi
+    done
+    
+    # Очистка временных файлов
+    rm -rf "$temp_dir"
+    
+    # Отчет о результатах
+    if [ $updated_files -gt 0 ]; then
+        log "SUCCESS" "Обновление завершено. Обновлено/загружено файлов: $updated_files."
+        if [ "$manager_updated" = true ]; then
+            log "WARN" "Главный менеджер был обновлен."
+            safe_echo "${YELLOW}Пожалуйста, перезапустите скрипт, чтобы применить изменения.${NC}"
+            exit 0
+        fi
+    else
+        log "INFO" "Все файлы в актуальном состоянии."
+    fi
+    
+    return 0
+}
+
+# Функция синхронизации отдельного файла
+sync_file() {
+    local source_file="$1"
+    local target_file="$2"
+    
+    # Создаем директорию если не существует
+    mkdir -p "$(dirname "$target_file")"
+    
+    # Если файла нет - копируем
+    if [ ! -f "$target_file" ]; then
+        log "INFO" "Загрузка нового файла: $(basename "$target_file")"
+        if cp "$source_file" "$target_file"; then
+            chmod +x "$target_file"
+            log "SUCCESS" "Файл $(basename "$target_file") успешно загружен."
+            return 0
+        else
+            log "ERROR" "Ошибка копирования файла: $target_file"
+            return 1
+        fi
+    fi
+    
+    # Проверяем наличие команды sha256sum
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        log "WARN" "sha256sum не найден. Используется сравнение по размеру и дате."
+        
+        # Альтернативное сравнение по размеру и времени модификации
+        local source_size=$(stat -c%s "$source_file" 2>/dev/null || echo "0")
+        local target_size=$(stat -c%s "$target_file" 2>/dev/null || echo "0")
+        
+        if [ "$source_size" != "$target_size" ] || [ "$source_file" -nt "$target_file" ]; then
+            needs_update=true
+        else
+            needs_update=false
+        fi
+    else
+        # Сравниваем хеши
+        local source_hash=$(sha256sum "$source_file" | awk '{print $1}')
+        local target_hash=$(sha256sum "$target_file" | awk '{print $1}')
+        
+        if [ "$source_hash" != "$target_hash" ]; then
+            needs_update=true
+        else
+            needs_update=false
+        fi
+    fi
+    
+    if [ "$needs_update" = true ]; then
+        log "INFO" "Обнаружено обновление для: $(basename "$target_file")"
+        
+        # Создаем резервную копию
+        cp "$target_file" "${target_file}.backup.$(date +%Y%m%d_%H%M%S)"
+        
+        if cp "$source_file" "$target_file"; then
+            chmod +x "$target_file"
+            log "SUCCESS" "Файл $(basename "$target_file") обновлен."
+            return 0
+        else
+            log "ERROR" "Ошибка обновления файла: $target_file"
+            return 1
+        fi
+    fi
+    
+    return 1  # Файл не изменился
+}
+
+# Функция синхронизации директории
+sync_directory() {
+    local source_dir="$1"
+    local target_dir="$2"
+    local updates=0
+    
+    mkdir -p "$target_dir"
+    
+    # Синхронизируем все .sh файлы из исходной директории
+    find "$source_dir" -name "*.sh" -type f | while read -r source_file; do
+        local relative_path="${source_file#$source_dir/}"
+        local target_file="$target_dir/$relative_path"
+        
+        if sync_file "$source_file" "$target_file"; then
+            echo "UPDATED:$relative_path"
+        fi
+    done | {
+        local file_updates=0
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^UPDATED: ]]; then
+                ((file_updates++))
+            fi
+        done
+        
+        # Удаляем устаревшие файлы перед синхронизацией
+        find "$target_dir" -name "*.sh" -type f | while read -r target_file; do
+            local relative_path="${target_file#$target_dir/}"
+            local source_file="$source_dir/$relative_path"
+            
+            if [ ! -f "$source_file" ]; then
+                log "INFO" "Удаление устаревшего файла: $(basename "$target_file")"
+                mv "$target_file" "${target_file}.removed.$(date +%Y%m%d_%H%M%S)"
+                echo "REMOVED:$relative_path"
+            fi
+        done | {
+            local removal_updates=0
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^REMOVED: ]]; then
+                    ((removal_updates++))
+                fi
+            done
+            
+            echo $((file_updates + removal_updates))
+        }
+    }
+}
+
+# Резервная функция обновления (старый метод через API)
+update_modules_and_library_legacy() {
+    log "INFO" "Использование резервного метода обновления через GitHub API..."
     
     local repo_raw_url="https://raw.githubusercontent.com/gopnikgame/matrix-setup/main"
     local repo_api_url="https://api.github.com/repos/gopnikgame/matrix-setup/contents/modules"
@@ -1226,103 +1457,63 @@ update_modules_and_library() {
     # Получаем список модулей из репозитория
     local remote_modules=()
     
-    if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
-        log "WARN" "curl или jq не установлены. Невозможно получить список новых модулей. Будут обновлены только существующие."
-        for module_path in "$MODULES_DIR"/*.sh; do
-            if [ -f "$module_path" ]; then
-                files_to_check+=("modules/$(basename "$module_path")")
-            fi
-        done
-    else
-        # Получаем ответ от API с таймаутом и улучшенной обработкой ошибок
-        local modules_json=""
-        local api_response_code=""
-        
-        # Проверяем доступность API GitHub
-        api_response_code=$(curl -sL --connect-timeout 10 --max-time 30 -w "%{http_code}" -o /dev/null "$repo_api_url" 2>/dev/null || echo "000")
-        
-        if [ "$api_response_code" != "200" ]; then
-            log "WARN" "API GitHub недоступен (код ответа: $api_response_code). Обновляем только существующие модули."
-        else
-            # Получаем JSON ответ
-            modules_json=$(curl -sL --connect-timeout 10 --max-time 30 --fail "$repo_api_url" 2>/dev/null)
-            local curl_exit_code=$?
-            
-            if [ $curl_exit_code -ne 0 ] || [ -z "$modules_json" ]; then
-                log "WARN" "Не удалось получить данные от API GitHub (код curl: $curl_exit_code). Обновляем только существующие модули."
-            else
-                # Проверяем, что ответ содержит валидный JSON
-                if ! echo "$modules_json" | jq empty >/dev/null 2>&1; then
-                    log "WARN" "Ответ от API GitHub содержит невалидный JSON. Обновляем только существующие модули."
-                    log "DEBUG" "Первые 200 символов ответа: $(echo "$modules_json" | head -c 200)..."
-                else
-                    # Проверяем, что ответ является JSON-массивом
-                    if ! echo "$modules_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
-                        log "WARN" "Ответ от API GitHub не является массивом. Обновляем только существующие модули."
-                        local response_type=$(echo "$modules_json" | jq -r 'type' 2>/dev/null || echo "unknown")
-                        log "DEBUG" "Тип ответа: $response_type"
-                        if echo "$modules_json" | jq -e 'has("message")' >/dev/null 2>&1; then
-                            local error_message=$(echo "$modules_json" | jq -r '.message' 2>/dev/null)
-                            log "DEBUG" "Сообщение об ошибке: $error_message"
-                        fi
-                    else
-                        # Безопасно извлекаем имена файлов .sh
-                        local jq_output=""
-                        jq_output=$(echo "$modules_json" | jq -r '.[] | select(.type == "file") | select(.name | type == "string") | select(.name | endswith(".sh")) | .name' 2>/dev/null)
-                        local jq_exit_code=$?
-                        
-                        if [ $jq_exit_code -eq 0 ] && [ -n "$jq_output" ]; then
-                            while IFS= read -r line; do
-                                if [ -n "$line" ]; then
-                                    remote_modules+=("$line")
-                                fi
-                            done <<< "$jq_output"
-                            
-                            log "DEBUG" "Найдено модулей в репозитории: ${#remote_modules[@]}"
-                        else
-                            log "WARN" "Ошибка обработки JSON ответа (код jq: $jq_exit_code). Обновляем только существующие модули."
-                        fi
-                    fi
-                fi
-            fi
-        fi
-        
-        # Добавляем найденные удаленные модули в список для проверки
-        if [ ${#remote_modules[@]} -gt 0 ]; then
-            for module_name in "${remote_modules[@]}"; do
-                files_to_check+=("modules/$module_name")
-            done
-            log "DEBUG" "Добавлено удаленных модулей для проверки: ${#remote_modules[@]}"
-        else
-            log "WARN" "Не удалось получить список модулей из репозитория. Обновляем только существующие."
-        fi
-        
-        # Добавляем существующие локальные модули на случай, если API недоступен
-        for module_path in "$MODULES_DIR"/*.sh; do
-            if [ -f "$module_path" ]; then
-                local module_basename="modules/$(basename "$module_path")"
-                # Избегаем дублирования
-                if ! printf '%s\n' "${files_to_check[@]}" | grep -q "^$module_basename$"; then
-                    files_to_check+=("$module_basename")
-                fi
-            fi
-        done
-    fi
-    
-    if ! command -v sha256sum >/dev/null 2>&1; then
-        log "ERROR" "Команда 'sha256sum' не найдена. Установите coreutils (sudo apt install coreutils)."
+    if ! command -v curl >/dev/null 2>&1; then
+        log "ERROR" "curl не установлен. Невозможно выполнить обновление."
         return 1
     fi
     
-    log "DEBUG" "Всего файлов для проверки: ${#files_to_check[@]}"
+    # Проверяем наличие jq, если нет - используем упрощенный метод
+    if command -v jq >/dev/null 2>&1; then
+        # Получаем ответ от API с таймаутом
+        local modules_json=""
+        local api_response_code=""
+        
+        api_response_code=$(curl -sL --connect-timeout 10 --max-time 30 -w "%{http_code}" -o /dev/null "$repo_api_url" 2>/dev/null || echo "000")
+        
+        if [ "$api_response_code" = "200" ]; then
+            modules_json=$(curl -sL --connect-timeout 10 --max-time 30 --fail "$repo_api_url" 2>/dev/null)
+            
+            if [ -n "$modules_json" ] && echo "$modules_json" | jq empty >/dev/null 2>&1; then
+                local jq_output=""
+                jq_output=$(echo "$modules_json" | jq -r '.[] | select(.type == "file") | select(.name | endswith(".sh")) | .name' 2>/dev/null)
+                
+                if [ -n "$jq_output" ]; then
+                    while IFS= read -r line; do
+                        if [ -n "$line" ]; then
+                            remote_modules+=("$line")
+                        fi
+                    done <<< "$jq_output"
+                fi
+            fi
+        fi
+    fi
     
+    # Добавляем найденные удаленные модули в список для проверки
+    if [ ${#remote_modules[@]} -gt 0 ]; then
+        for module_name in "${remote_modules[@]}"; do
+            files_to_check+=("modules/$module_name")
+        done
+    fi
+    
+    # Добавляем существующие локальные модули
+    for module_path in "$MODULES_DIR"/*.sh; do
+        if [ -f "$module_path" ]; then
+            local module_basename="modules/$(basename "$module_path")"
+            # Избегаем дублирования
+            if ! printf '%s\n' "${files_to_check[@]}" | grep -q "^$module_basename$"; then
+                files_to_check+=("$module_basename")
+            fi
+        fi
+    done
+    
+    # Обрабатываем файлы
     for file_rel_path in "${files_to_check[@]}"; do
         local local_file_path="${SCRIPT_DIR}/${file_rel_path}"
         local remote_file_url="${repo_raw_url}/${file_rel_path}"
         local temp_file
         temp_file=$(mktemp)
         
-        # Скачиваем удаленный файл с улучшенной обработкой ошибок
+        # Скачиваем удаленный файл
         if ! curl -sL --connect-timeout 10 --max-time 30 --fail "$remote_file_url" -o "$temp_file" 2>/dev/null; then
             log "WARN" "Не удалось скачать файл: $remote_file_url"
             rm -f "$temp_file"
@@ -1350,13 +1541,29 @@ update_modules_and_library() {
             continue
         fi
         
-        # Сравниваем хеши
-        local local_hash
-        local remote_hash
-        local_hash=$(sha256sum "$local_file_path" | awk '{print $1}')
-        remote_hash=$(sha256sum "$temp_file" | awk '{print $1}')
+        # Сравниваем файлы
+        local needs_update=false
         
-        if [ "$local_hash" != "$remote_hash" ]; then
+        if command -v sha256sum >/dev/null 2>&1; then
+            local local_hash
+            local remote_hash
+            local_hash=$(sha256sum "$local_file_path" | awk '{print $1}')
+            remote_hash=$(sha256sum "$temp_file" | awk '{print $1}')
+            
+            if [ "$local_hash" != "$remote_hash" ]; then
+                needs_update=true
+            fi
+        else
+            # Альтернативное сравнение по размеру
+            local local_size=$(stat -c%s "$local_file_path" 2>/dev/null || echo "0")
+            local remote_size=$(stat -c%s "$temp_file" 2>/dev/null || echo "0")
+            
+            if [ "$local_size" != "$remote_size" ]; then
+                needs_update=true
+            fi
+        fi
+        
+        if [ "$needs_update" = true ]; then
             log "INFO" "Обнаружено обновление для: $file_rel_path"
             cp "$local_file_path" "${local_file_path}.backup.$(date +%Y%m%d_%H%M%S)"
             
@@ -1376,6 +1583,7 @@ update_modules_and_library() {
         fi
     done
     
+    # Отчет о результатах
     if [ $updated_files -gt 0 ]; then
         log "SUCCESS" "Обновление завершено. Обновлено/загружено файлов: $updated_files."
         if [ "$manager_updated" = true ]; then
