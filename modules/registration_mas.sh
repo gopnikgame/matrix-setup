@@ -386,17 +386,6 @@ generate_mas_config() {
             ;;
     esac
     
-    # Пытаемся сгенерировать конфигурацию с помощью mas config generate
-    log "INFO" "Генерация базовой конфигурации MAS..."
-    
-    local base_config_generated=false
-    if mas config generate > /tmp/mas_base_config.yaml 2>/dev/null; then
-        base_config_generated=true
-        log "SUCCESS" "Базовая конфигурация сгенерирована командой 'mas config generate'"
-    else
-        log "WARN" "Не удалось использовать 'mas config generate', создаем конфигурацию вручную"
-    fi
-    
     # Создаем финальную конфигурацию
     cat > "$MAS_CONFIG_FILE" <<EOF
 # Matrix Authentication Service Configuration
@@ -463,25 +452,58 @@ experimental:
   compat_token_ttl: 300
 EOF
 
-    # Если базовая конфигурация была сгенерирована, используем её секреты
-    if [ "$base_config_generated" = true ]; then
-        log "INFO" "Использование секретов из сгенерированной конфигурации..."
+    # Пытаемся сгенерировать конфигурацию с помощью mas config generate для получения лучших секретов
+    log "INFO" "Генерация дополнительных секретов MAS..."
+    
+    local base_config_generated=false
+    if mas config generate > /tmp/mas_base_config.yaml 2>/dev/null; then
+        base_config_generated=true
+        log "SUCCESS" "Базовая конфигурация сгенерирована командой 'mas config generate'"
         
-        # Извлекаем секрет шифрования
-        local encryption_secret=$(grep -A 10 "^secrets:" /tmp/mas_base_config.yaml | grep "encryption:" | cut -d'"' -f2)
+        # Извлекаем ТОЛЬКО секрет шифрования из сгенерированной конфигурации
+        local encryption_secret=$(grep -A 10 "^secrets:" /tmp/mas_base_config.yaml | grep "encryption:" | cut -d'"' -f2 2>/dev/null)
         if [ -n "$encryption_secret" ]; then
+            log "INFO" "Использование секрета шифрования из сгенерированной конфигурации"
             sed -i "s/encryption: \".*\"/encryption: \"$encryption_secret\"/" "$MAS_CONFIG_FILE"
         fi
         
-        # Извлекаем ключи
-        if grep -q "keys:" /tmp/mas_base_config.yaml; then
-            # Заменяем секцию keys полностью
-            sed -i '/^  keys:/,$d' "$MAS_CONFIG_FILE"
-            echo "  keys:" >> "$MAS_CONFIG_FILE"
-            sed -n '/^  keys:/,/^[^ ]/p' /tmp/mas_base_config.yaml | sed '1d;$d' >> "$MAS_CONFIG_FILE"
+        # Извлекаем ключи более безопасным способом
+        local temp_keys_file="/tmp/mas_keys_$$"
+        if sed -n '/^  keys:/,/^[^ ]/p' /tmp/mas_base_config.yaml | sed '$d' > "$temp_keys_file" 2>/dev/null; then
+            if [ -s "$temp_keys_file" ]; then
+                log "INFO" "Использование ключей из сгенерированной конфигурации"
+                
+                # Создаем резервную копию конфигурации
+                cp "$MAS_CONFIG_FILE" "$MAS_CONFIG_FILE.backup"
+                
+                # Создаем новый файл с заменой секции keys
+                {
+                    # Все до секции keys
+                    sed '/^  keys:/,$d' "$MAS_CONFIG_FILE"
+                    # Секция keys из сгенерированной конфигурации
+                    cat "$temp_keys_file"
+                    # Все после секции keys (если есть)
+                    sed -n '/^  keys:/,/^[^ ]/p' "$MAS_CONFIG_FILE" | sed '1,/^[^ ]/d' 2>/dev/null || true
+                } > "$MAS_CONFIG_FILE.new"
+                
+                # Проверяем, что новый файл корректный
+                if [ -s "$MAS_CONFIG_FILE.new" ] && grep -q "database:" "$MAS_CONFIG_FILE.new"; then
+                    mv "$MAS_CONFIG_FILE.new" "$MAS_CONFIG_FILE"
+                    log "SUCCESS" "Ключи из сгенерированной конфигурации применены"
+                else
+                    log "WARN" "Не удалось применить ключи, оставляем сгенерированные вручную"
+                    mv "$MAS_CONFIG_FILE.backup" "$MAS_CONFIG_FILE"
+                    rm -f "$MAS_CONFIG_FILE.new"
+                fi
+                
+                rm -f "$MAS_CONFIG_FILE.backup"
+            fi
         fi
         
+        rm -f "$temp_keys_file"
         rm -f /tmp/mas_base_config.yaml
+    else
+        log "WARN" "Не удалось использовать 'mas config generate', используем конфигурацию созданную вручную"
     fi
     
     # Устанавливаем права доступа
@@ -489,7 +511,16 @@ EOF
     chown -R "$MAS_USER:$MAS_GROUP" /var/lib/mas
     chmod 600 "$MAS_CONFIG_FILE"
     
-    log "SUCCESS" "Конфигурация MAS создана"
+    # Проверяем корректность конфигурации
+    if grep -q "database:" "$MAS_CONFIG_FILE" && grep -q "$db_uri" "$MAS_CONFIG_FILE"; then
+        log "SUCCESS" "Конфигурация MAS создана и содержит корректный URI базы данных"
+    else
+        log "ERROR" "Конфигурация MAS повреждена или не содержит корректный URI базы данных"
+        log "DEBUG" "Содержимое секции database:"
+        grep -A 2 "^database:" "$MAS_CONFIG_FILE" 2>/dev/null || log "ERROR" "Секция database не найдена"
+        return 1
+    fi
+    
     return 0
 }
 
@@ -619,6 +650,55 @@ fix_mas_database_issues() {
     log "DEBUG" "  Пользователь: $db_user"
     log "DEBUG" "  База данных: $db_name"
     
+    # Проверяем секцию database в конфигурации MAS
+    if ! grep -q "^database:" "$MAS_CONFIG_FILE"; then
+        log "ERROR" "Секция database отсутствует в конфигурации MAS!"
+        log "ERROR" "Это критическая ошибка конфигурации"
+        return 1
+    fi
+    
+    # Проверяем URI в конфигурации MAS
+    local config_uri=$(grep -A 5 "^database:" "$MAS_CONFIG_FILE" | grep "uri:" | sed 's/.*uri: *"//' | sed 's/".*//' 2>/dev/null)
+    
+    if [ -z "$config_uri" ]; then
+        log "ERROR" "URI базы данных не найден в конфигурации MAS"
+        log "INFO" "Исправление конфигурации MAS..."
+        
+        # Создаем резервную копию
+        cp "$MAS_CONFIG_FILE" "$MAS_CONFIG_FILE.backup.$(date +%s)"
+        
+        # Добавляем недостающую секцию database
+        if ! grep -q "^database:" "$MAS_CONFIG_FILE"; then
+            # Если секция database полностью отсутствует, добавляем её после http секции
+            sed -i '/^http:/a\\ndatabase:\n  uri: "'"$db_uri"'"' "$MAS_CONFIG_FILE"
+        else
+            # Если секция database есть, но без uri, добавляем uri
+            sed -i '/^database:$/a\  uri: "'"$db_uri"'"' "$MAS_CONFIG_FILE"
+        fi
+        
+        # Устанавливаем права
+        chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE"
+        chmod 600 "$MAS_CONFIG_FILE"
+        
+        log "SUCCESS" "Конфигурация MAS исправлена"
+        config_uri="$db_uri"
+    elif [ "$config_uri" != "$db_uri" ]; then
+        log "WARN" "URI в конфигурации MAS не соответствует сохраненному URI"
+        log "INFO" "Исправление URI в конфигурации MAS..."
+        
+        # Создаем резервную копию
+        cp "$MAS_CONFIG_FILE" "$MAS_CONFIG_FILE.backup.$(date +%s)"
+        
+        # Исправляем URI
+        sed -i "s|uri: \".*\"|uri: \"$db_uri\"|" "$MAS_CONFIG_FILE"
+        
+        # Устанавливаем права
+        chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE"
+        chmod 600 "$MAS_CONFIG_FILE"
+        
+        log "SUCCESS" "URI в конфигурации MAS исправлен"
+    fi
+    
     # Проверяем существование пользователя PostgreSQL
     local user_exists=$(sudo -u postgres psql -t -c "SELECT 1 FROM pg_roles WHERE rolname='$db_user'" | grep -c 1)
     
@@ -676,26 +756,6 @@ fix_mas_database_issues() {
         fi
     fi
     
-    # Проверяем URI в конфигурации MAS
-    local config_uri=$(grep "uri:" "$MAS_CONFIG_FILE" | sed 's/.*uri: *"//' | sed 's/".*//')
-    
-    if [ "$config_uri" != "$db_uri" ]; then
-        log "WARN" "URI в конфигурации MAS не соответствует сохраненному URI"
-        log "INFO" "Исправление URI в конфигурации MAS..."
-        
-        # Создаем резервную копию
-        cp "$MAS_CONFIG_FILE" "$MAS_CONFIG_FILE.backup.$(date +%s)"
-        
-        # Исправляем URI
-        sed -i "s|uri: \".*\"|uri: \"$db_uri\"|" "$MAS_CONFIG_FILE"
-        
-        # Устанавливаем права
-        chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE"
-        chmod 600 "$MAS_CONFIG_FILE"
-        
-        log "SUCCESS" "URI в конфигурации MAS исправлен"
-    fi
-    
     return 0
 }
 
@@ -730,7 +790,7 @@ initialize_mas_database() {
         log "DEBUG" "Конфигурация базы данных в MAS config.yaml:"
         grep -A 2 "^database:" "$MAS_CONFIG_FILE" 2>/dev/null | sed 's/password[^"]*"[^"]*"/password:***/' || true
         
-        # Проверяем права доступа к файлам
+        # Проверяем права доступа к фајлам
         log "DEBUG" "Права доступа к файлам:"
         ls -la "$MAS_CONFIG_FILE" 2>/dev/null || log "ERROR" "Конфигурационный файл недоступен"
         ls -la "$CONFIG_DIR/mas_database.conf" 2>/dev/null || log "ERROR" "Файл конфигурации БД недоступен"
@@ -870,6 +930,110 @@ diagnose_mas_issues() {
     log "INFO" "Диагностика завершена"
 }
 
+# Функция для восстановления поврежденной конфигурации MAS
+restore_mas_config() {
+    local mas_port="$1"
+    local matrix_domain="$2"
+    local mas_secret="$3"
+    local db_uri="$4"
+    
+    log "INFO" "Восстановление поврежденной конфигурации MAS..."
+    
+    # Создаем резервную копию поврежденной конфигурации
+    if [ -f "$MAS_CONFIG_FILE" ]; then
+        cp "$MAS_CONFIG_FILE" "$MAS_CONFIG_FILE.corrupted.$(date +%s)"
+        log "INFO" "Резервная копия поврежденной конфигурации создана"
+    fi
+    
+    # Определяем публичную базу и issuer в зависимости от типа сервера
+    local mas_public_base
+    local mas_issuer
+    
+    case "${SERVER_TYPE:-hosting}" in
+        "proxmox"|"home_server"|"openvz"|"docker")
+            mas_public_base="https://$matrix_domain"
+            mas_issuer="https://$matrix_domain"
+            ;;
+        *)
+            mas_public_base="https://auth.$matrix_domain"
+            mas_issuer="https://auth.$matrix_domain"
+            ;;
+    esac
+    
+    # Создаем новую корректную конфигурацию
+    cat > "$MAS_CONFIG_FILE" <<EOF
+# Matrix Authentication Service Configuration
+# Restored: $(date '+%Y-%m-%d %H:%M:%S')
+# Server Type: ${SERVER_TYPE:-hosting}
+# Port: $mas_port
+
+http:
+  public_base: "$mas_public_base"
+  issuer: "$mas_issuer"
+  listeners:
+    - name: web
+      resources:
+        - name: discovery
+        - name: human
+        - name: oauth
+        - name: compat
+        - name: graphql
+        - name: assets
+      binds:
+        - address: "$BIND_ADDRESS:$mas_port"
+      proxy_protocol: false
+
+database:
+  uri: "$db_uri"
+
+matrix:
+  homeserver: "$matrix_domain"
+  secret: "$mas_secret"
+  endpoint: "http://localhost:8008"
+
+secrets:
+  encryption: "$(openssl rand -hex 32)"
+  keys:
+    - kid: "$(date +%s | sha256sum | cut -c1-8)"
+      key: |
+$(openssl genpkey -algorithm RSA -bits 2048 -pkcs8 | sed 's/^/        /')
+
+clients:
+  - client_id: "0000000000000000000SYNAPSE"
+    client_auth_method: client_secret_basic
+    client_secret: "$mas_secret"
+
+passwords:
+  enabled: true
+  schemes:
+    - version: 1
+      algorithm: bcrypt
+      unicode_normalization: true
+    - version: 2
+      algorithm: argon2id
+
+account:
+  email_change_allowed: true
+  displayname_change_allowed: true
+  password_registration_enabled: false
+  password_change_allowed: true
+  password_recovery_enabled: false
+  account_deactivation_allowed: true
+  registration_token_required: false
+
+experimental:
+  access_token_ttl: 300
+  compat_token_ttl: 300
+EOF
+
+    # Устанавливаем права доступа
+    chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE"
+    chmod 600 "$MAS_CONFIG_FILE"
+    
+    log "SUCCESS" "Конфигурация MAS восстановлена"
+    return 0
+}
+
 # Функция для исправления проблем MAS
 fix_mas_issues() {
     log "INFO" "Попытка исправления проблем MAS..."
@@ -878,6 +1042,39 @@ fix_mas_issues() {
     if systemctl is-active --quiet matrix-auth-service; then
         log "INFO" "Остановка сервиса MAS..."
         systemctl stop matrix-auth-service
+    fi
+    
+    # Проверяем наличие конфигурационных файлов
+    if [ ! -f "$CONFIG_DIR/mas_database.conf" ]; then
+        log "ERROR" "Файл конфигурации базы данных не найден, невозможно исправить"
+        return 1
+    fi
+    
+    if [ ! -f "$CONFIG_DIR/mas.conf" ]; then
+        log "ERROR" "Файл конфигурации MAS не найден, невозможно исправить"
+        return 1
+    fi
+    
+    # Загружаем сохраненные параметры
+    local db_uri=$(grep "MAS_DB_URI=" "$CONFIG_DIR/mas_database.conf" | cut -d'=' -f2 | tr -d '"')
+    local mas_port=$(grep "MAS_PORT=" "$CONFIG_DIR/mas.conf" | cut -d'=' -f2 | tr -d '"')
+    local mas_secret=$(grep "MAS_SECRET=" "$CONFIG_DIR/mas.conf" | cut -d'=' -f2 | tr -d '"')
+    local matrix_domain=$(grep "MAS_DOMAIN=" "$CONFIG_DIR/mas.conf" | cut -d'=' -f2 | tr -d '"')
+    
+    if [ -z "$db_uri" ] || [ -z "$mas_port" ] || [ -z "$mas_secret" ] || [ -z "$matrix_domain" ]; then
+        log "ERROR" "Не удалось загрузить сохраненные параметры конфигурации"
+        return 1
+    fi
+    
+    # Проверяем корректность конфигурации MAS
+    if [ ! -f "$MAS_CONFIG_FILE" ] || ! grep -q "^database:" "$MAS_CONFIG_FILE" || ! grep -q "$db_uri" "$MAS_CONFIG_FILE"; then
+        log "WARN" "Конфигурация MAS повреждена или отсутствует"
+        
+        # Восстанавливаем конфигурацию
+        if ! restore_mas_config "$mas_port" "$matrix_domain" "$mas_secret" "$db_uri"; then
+            log "ERROR" "Не удалось восстановить конфигурацию MAS"
+            return 1
+        fi
     fi
     
     # Исправляем проблемы с базой данных

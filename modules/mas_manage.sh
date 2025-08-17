@@ -173,6 +173,199 @@ uninstall_mas() {
     log "SUCCESS" "MAS успешно удалён"
 }
 
+# Функция для исправления поврежденной конфигурации MAS
+fix_mas_config_corruption() {
+    print_header "ИСПРАВЛЕНИЕ ПОВРЕЖДЕННОЙ КОНФИГУРАЦИИ MAS" "$YELLOW"
+    
+    log "INFO" "Проверка конфигурации MAS на наличие повреждений..."
+    
+    # Проверяем наличие файлов
+    if [ ! -f "$CONFIG_DIR/mas_database.conf" ]; then
+        log "ERROR" "Файл конфигурации базы данных не найден: $CONFIG_DIR/mas_database.conf"
+        log "ERROR" "Невозможно восстановить конфигурацию без этого файла"
+        return 1
+    fi
+    
+    if [ ! -f "$CONFIG_DIR/mas.conf" ]; then
+        log "ERROR" "Файл конфигурации MAS не найден: $CONFIG_DIR/mas.conf"
+        log "ERROR" "Невозможно восстановить конфигурацию без этого файла"
+        return 1
+    fi
+    
+    # Проверяем секцию database в конфигурации MAS
+    local has_database_section=false
+    local correct_uri=false
+    
+    if [ -f "$MAS_CONFIG_FILE" ]; then
+        if grep -q "^database:" "$MAS_CONFIG_FILE"; then
+            has_database_section=true
+            
+            # Проверяем корректность URI
+            local db_uri=$(grep "MAS_DB_URI=" "$CONFIG_DIR/mas_database.conf" | cut -d'=' -f2 | tr -d '"')
+            if grep -q "$db_uri" "$MAS_CONFIG_FILE"; then
+                correct_uri=true
+                log "SUCCESS" "Конфигурация MAS корректна"
+                return 0
+            else
+                log "WARN" "Неверный URI базы данных в конфигурации MAS"
+            fi
+        else
+            log "ERROR" "Секция database отсутствует в конфигурации MAS"
+        fi
+    else
+        log "ERROR" "Конфигурационный файл MAS не найден"
+    fi
+    
+    if ! $has_database_section || ! $correct_uri; then
+        log "WARN" "Обнаружены проблемы в конфигурации MAS"
+        
+        if ask_confirmation "Восстановить конфигурацию MAS?"; then
+            # Загружаем сохраненные параметры
+            local db_uri=$(grep "MAS_DB_URI=" "$CONFIG_DIR/mas_database.conf" | cut -d'=' -f2 | tr -d '"')
+            local mas_port=$(grep "MAS_PORT=" "$CONFIG_DIR/mas.conf" | cut -d'=' -f2 | tr -d '"')
+            local mas_secret=$(grep "MAS_SECRET=" "$CONFIG_DIR/mas.conf" | cut -d'=' -f2 | tr -d '"')
+            local matrix_domain=$(grep "MAS_DOMAIN=" "$CONFIG_DIR/mas.conf" | cut -d'=' -f2 | tr -d '"')
+            
+            if [ -z "$db_uri" ] || [ -z "$mas_port" ] || [ -z "$mas_secret" ] || [ -z "$matrix_domain" ]; then
+                log "ERROR" "Не удалось загрузить сохраненные параметры конфигурации"
+                return 1
+            fi
+            
+            log "INFO" "Восстановление конфигурации MAS..."
+            log "DEBUG" "Используемые параметры:"
+            log "DEBUG" "  Порт: $mas_port"
+            log "DEBUG" "  Домен: $matrix_domain"
+            log "DEBUG" "  URI БД: $db_uri"
+            
+            # Создаем резервную копию поврежденной конфигурации
+            if [ -f "$MAS_CONFIG_FILE" ]; then
+                cp "$MAS_CONFIG_FILE" "$MAS_CONFIG_FILE.corrupted.$(date +%s)"
+                log "INFO" "Резервная копия поврежденной конфигурации создана"
+            fi
+            
+            # Определяем публичную базу и issuer в зависимости от типа сервера
+            local mas_public_base
+            local mas_issuer
+            
+            case "${SERVER_TYPE:-hosting}" in
+                "proxmox"|"home_server"|"openvz"|"docker")
+                    mas_public_base="https://$matrix_domain"
+                    mas_issuer="https://$matrix_domain"
+                    ;;
+                *)
+                    mas_public_base="https://auth.$matrix_domain"
+                    mas_issuer="https://auth.$matrix_domain"
+                    ;;
+            esac
+            
+            # Создаем новую корректную конфигурацию
+            cat > "$MAS_CONFIG_FILE" <<EOF
+# Matrix Authentication Service Configuration
+# Restored: $(date '+%Y-%m-%d %H:%M:%S')
+# Server Type: ${SERVER_TYPE:-hosting}
+# Port: $mas_port
+
+http:
+  public_base: "$mas_public_base"
+  issuer: "$mas_issuer"
+  listeners:
+    - name: web
+      resources:
+        - name: discovery
+        - name: human
+        - name: oauth
+        - name: compat
+        - name: graphql
+        - name: assets
+      binds:
+        - address: "$BIND_ADDRESS:$mas_port"
+      proxy_protocol: false
+
+database:
+  uri: "$db_uri"
+
+matrix:
+  homeserver: "$matrix_domain"
+  secret: "$mas_secret"
+  endpoint: "http://localhost:8008"
+
+secrets:
+  encryption: "$(openssl rand -hex 32)"
+  keys:
+    - kid: "$(date +%s | sha256sum | cut -c1-8)"
+      key: |
+$(openssl genpkey -algorithm RSA -bits 2048 -pkcs8 | sed 's/^/        /')
+
+clients:
+  - client_id: "0000000000000000000SYNAPSE"
+    client_auth_method: client_secret_basic
+    client_secret: "$mas_secret"
+
+passwords:
+  enabled: true
+  schemes:
+    - version: 1
+      algorithm: bcrypt
+      unicode_normalization: true
+    - version: 2
+      algorithm: argon2id
+
+account:
+  email_change_allowed: true
+  displayname_change_allowed: true
+  password_registration_enabled: false
+  password_change_allowed: true
+  password_recovery_enabled: false
+  account_deactivation_allowed: true
+  registration_token_required: false
+
+experimental:
+  access_token_ttl: 300
+  compat_token_ttl: 300
+EOF
+
+            # Устанавливаем права доступа
+            chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE"
+            chmod 600 "$MAS_CONFIG_FILE"
+            
+            log "SUCCESS" "Конфигурация MAS восстановлена"
+            
+            # Перезапускаем сервис
+            log "INFO" "Перезапуск MAS для применения изменений..."
+            
+            if systemctl restart matrix-auth-service; then
+                log "SUCCESS" "MAS успешно перезапущен с восстановленной конфигурацией"
+                
+                # Проверяем работоспособность
+                sleep 3
+                if systemctl is-active --quiet matrix-auth-service; then
+                    log "SUCCESS" "MAS работает корректно"
+                    
+                    # Проверяем API
+                    local health_url="http://localhost:$mas_port/health"
+                    if curl -s -f --connect-timeout 5 "$health_url" >/dev/null 2>&1; then
+                        log "SUCCESS" "MAS API доступен"
+                    else
+                        log "WARN" "MAS API пока недоступен (возможно, еще инициализируется)"
+                    fi
+                else
+                    log "ERROR" "MAS не запустился после восстановления конфигурации"
+                    log "INFO" "Проверьте логи: journalctl -u matrix-auth-service -n 20"
+                    return 1
+                fi
+            else
+                log "ERROR" "Ошибка перезапуска MAS"
+                return 1
+            fi
+        else
+            log "INFO" "Восстановление конфигурации отменено"
+            return 0
+        fi
+    fi
+    
+    return 0
+}
+
 # Диагностика MAS
 diagnose_mas() {
     print_header "ДИАГНОСТИКА MATRIX AUTHENTICATION SERVICE" "$BLUE"
@@ -190,6 +383,20 @@ diagnose_mas() {
     # Проверка конфигурационных файлов MAS
     if [ -f "$MAS_CONFIG_FILE" ]; then
         log "INFO" "Проверка конфигурации MAS..."
+        
+        # Проверяем секцию database
+        if ! grep -q "^database:" "$MAS_CONFIG_FILE"; then
+            log "ERROR" "КРИТИЧЕСКАЯ ОШИБКА: Секция database отсутствует в конфигурации MAS!"
+            log "ERROR" "Это может быть причиной ошибки подключения к базе данных"
+            
+            if ask_confirmation "Попытаться исправить поврежденную конфигурацию?"; then
+                fix_mas_config_corruption
+                return
+            fi
+        else
+            log "SUCCESS" "Секция database найдена в конфигурации"
+        fi
+        
         if command -v mas >/dev/null 2>&1; then
             if mas doctor --config "$MAS_CONFIG_FILE"; then
                 log "SUCCESS" "Конфигурация MAS корректна"
@@ -1170,14 +1377,15 @@ show_main_menu() {
         safe_echo "${GREEN}1.${NC} 📊 Проверить статус MAS"
         safe_echo "${GREEN}2.${NC} 🗑️  Удалить MAS"
         safe_echo "${GREEN}3.${NC} 🔍 Диагностика MAS"
-        safe_echo "${GREEN}4.${NC} 👥 Управление регистрацией MAS"
-        safe_echo "${GREEN}5.${NC} 🔐 Управление SSO-провайдерами"
-        safe_echo "${GREEN}6.${NC} 🤖 Настройки CAPTCHA"
-        safe_echo "${GREEN}7.${NC} 🚫 Заблокированные имена пользователей"
-        safe_echo "${GREEN}8.${NC} 🎫 Токены регистрации"
-        safe_echo "${GREEN}9.${NC} ↩️  Назад в главное меню"
+        safe_echo "${GREEN}4.${NC} 🔧 Исправить поврежденную конфигурацию"
+        safe_echo "${GREEN}5.${NC} 👥 Управление регистрацией MAS"
+        safe_echo "${GREEN}6.${NC} 🔐 Управление SSO-провайдерами"
+        safe_echo "${GREEN}7.${NC} 🤖 Настройки CAPTCHA"
+        safe_echo "${GREEN}8.${NC} 🚫 Заблокированные имена пользователей"
+        safe_echo "${GREEN}9.${NC} 🎫 Токены регистрации"
+        safe_echo "${GREEN}10.${NC} ↩️  Назад в главное меню"
 
-        read -p "$(safe_echo "${YELLOW}Выберите действие [1-9]: ${NC}")" action
+        read -p "$(safe_echo "${YELLOW}Выберите действие [1-10]: ${NC}")" action
 
         case $action in
             1)
@@ -1190,21 +1398,24 @@ show_main_menu() {
                 diagnose_mas
                 ;;
             4)
-                manage_mas_registration
+                fix_mas_config_corruption
                 ;;
             5)
-                manage_sso_providers
+                manage_mas_registration
                 ;;
             6)
-                manage_captcha_settings
+                manage_sso_providers
                 ;;
             7)
-                manage_banned_usernames
+                manage_captcha_settings
                 ;;
             8)
-                manage_mas_registration_tokens
+                manage_banned_usernames
                 ;;
             9)
+                manage_mas_registration_tokens
+                ;;
+            10)
                 return 0
                 ;;
             *)
@@ -1213,7 +1424,7 @@ show_main_menu() {
                 ;;
         esac
         
-        if [ $action -ne 9 ]; then
+        if [ $action -ne 10 ]; then
             echo
             read -p "Нажмите Enter для продолжения..."
         fi
