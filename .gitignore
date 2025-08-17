@@ -454,3 +454,5 @@ test_mas_fix.sh
 fix_mas_database_issue.sh
 docs/mas-database-fix-guide.md
 MAS_DATABASE_FIX_SUMMARY.md
+docs/mas-problems-analysis.md
+fix_mas_complete.sh

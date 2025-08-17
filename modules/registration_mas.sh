@@ -118,7 +118,7 @@ check_mas_dependencies() {
         fi
         
         if ! apt install -y "${missing_deps[@]}"; then
-            log "ERROR" "Не удалось установить зависимости"
+            log "ERROR" "Не удалось установить_dependencies"
             return 1
         fi
         
@@ -128,7 +128,7 @@ check_mas_dependencies() {
     return 0
 }
 
-# Проверка статуса PostgreSQL и создание базы данных для MAS
+# Функция для создания правильной конфигурации MAS (исправленная версия)
 setup_mas_database() {
     log "INFO" "Настройка базы данных для MAS..."
     
@@ -138,7 +138,7 @@ setup_mas_database() {
         return 1
     fi
     
-    # Получаем пароль пользователя synapse_user (НЕ matrix-synapse!)
+    # Получаем пароль пользователя synapse_user из основной установки Matrix
     local db_password=""
     if [ -f "$CONFIG_DIR/database.conf" ]; then
         db_password=$(grep "DB_PASSWORD=" "$CONFIG_DIR/database.conf" | cut -d'=' -f2 | tr -d '"')
@@ -150,10 +150,10 @@ setup_mas_database() {
         return 1
     fi
     
-    # Проверяем, существует ли пользователь synapse_user
-    local user_exists=$(sudo -u postgres psql -t -c "SELECT 1 FROM pg_roles WHERE rolname='synapse_user'" | grep -c 1)
+    # Проверяем, существует ли пользователь synapse_user (создается в core_install.sh)
+    local synapse_user_exists=$(sudo -u postgres psql -t -c "SELECT 1 FROM pg_roles WHERE rolname='synapse_user'" | grep -c 1)
     
-    if [ "$user_exists" -eq 0 ]; then
+    if [ "$synapse_user_exists" -eq 0 ]; then
         log "ERROR" "Пользователь базы данных 'synapse_user' не существует"
         log "INFO" "Необходимо сначала запустить основную установку Matrix (core_install.sh)"
         log "INFO" "Этот пользователь создается автоматически в процессе основной установки"
@@ -162,75 +162,59 @@ setup_mas_database() {
     
     log "SUCCESS" "Пользователь базы данных 'synapse_user' найден"
     
-    # Проверяем, нужно ли создать отдельного пользователя для MAS
-    # В некоторых случаях может потребоваться создать пользователя matrix-synapse для PostgreSQL
-    local mas_db_user_exists=$(sudo -u postgres psql -t -c "SELECT 1 FROM pg_roles WHERE rolname='matrix-synapse'" | grep -c 1)
+    # Проверяем, существует ли база данных mas_db
+    local mas_db_exists=$(sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -w "$MAS_DB_NAME" | wc -l)
     
-    if [ "$mas_db_user_exists" -eq 0 ]; then
-        log "INFO" "Создание пользователя PostgreSQL 'matrix-synapse' для MAS..."
-        
-        # Создаем пользователя matrix-synapse в PostgreSQL с тем же паролем
-        if sudo -u postgres psql -c "CREATE USER \"matrix-synapse\" WITH PASSWORD '$db_password';" 2>/dev/null; then
-            log "SUCCESS" "Пользователь PostgreSQL 'matrix-synapse' создан"
-            
-            # Даем права на подключение к базе данных
-            sudo -u postgres psql -c "GRANT CONNECT ON DATABASE postgres TO \"matrix-synapse\";" 2>/dev/null || true
-            
-        else
-            log "WARN" "Пользователь PostgreSQL 'matrix-synapse' уже существует или ошибка создания"
-        fi
-    else
-        log "INFO" "Пользователь PostgreSQL 'matrix-synapse' уже существует"
-    fi
-    
-    # Проверяем, существует ли база данных MAS
-    local db_exists=$(sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -w "$MAS_DB_NAME" | wc -l)
-    
-    if [ "$db_exists" -eq 0 ]; then
+    if [ "$mas_db_exists" -eq 0 ]; then
         log "INFO" "Создание базы данных $MAS_DB_NAME..."
         
-        # Создаем базу данных с владельцем synapse_user (НЕ matrix-synapse!)
+        # Создаем базу данных для MAS с владельцем synapse_user (используем того же пользователя, что и для Synapse)
         if ! sudo -u postgres createdb --encoding=UTF8 --locale=C --template=template0 --owner=synapse_user "$MAS_DB_NAME"; then
             log "ERROR" "Не удалось создать базу данных $MAS_DB_NAME"
             return 1
         fi
         
         log "SUCCESS" "База данных $MAS_DB_NAME создана"
-        
-        # Даем права пользователю matrix-synapse на новую базу данных
-        if sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $MAS_DB_NAME TO \"matrix-synapse\";" 2>/dev/null; then
-            log "INFO" "Права на базу данных $MAS_DB_NAME предоставлены пользователю matrix-synapse"
-        fi
-        
     else
         log "INFO" "База данных $MAS_DB_NAME уже существует"
-        
-        # Убеждаемся, что у matrix-synapse есть права на существующую базу
-        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $MAS_DB_NAME TO \"matrix-synapse\";" 2>/dev/null || true
     fi
     
-    # Определяем какого пользователя использовать для MAS
-    # Если matrix-synapse пользователь существует в PostgreSQL, используем его
-    local mas_db_user="synapse_user"
-    if [ "$mas_db_user_exists" -gt 0 ]; then
-        # Проверяем, может ли matrix-synapse подключиться к базе данных
-        if PGPASSWORD="$db_password" psql -h localhost -U "matrix-synapse" -d "$MAS_DB_NAME" -c "SELECT 1;" &>/dev/null; then
-            mas_db_user="matrix-synapse"
-            log "INFO" "Будет использован пользователь PostgreSQL 'matrix-synapse' для MAS"
+    # Проверяем подключение к базе данных MAS с пользователем synapse_user
+    log "INFO" "Проверка подключения к базе данных MAS..."
+    if PGPASSWORD="$db_password" psql -h localhost -U "synapse_user" -d "$MAS_DB_NAME" -c "SELECT 1;" &>/dev/null; then
+        log "SUCCESS" "Подключение к базе данных MAS работает"
+    else
+        log "ERROR" "Не удается подключиться к базе данных MAS"
+        log "INFO" "Проверка и предоставление необходимых прав..."
+        
+        # Даем полные права пользователю synapse_user на базу данных mas_db
+        if sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $MAS_DB_NAME TO synapse_user;" 2>/dev/null; then
+            log "INFO" "Права на базу данных $MAS_DB_NAME предоставлены пользователю synapse_user"
+        fi
+        
+        # Даем права на схему public если база уже существует  
+        if sudo -u postgres psql -d "$MAS_DB_NAME" -c "GRANT ALL ON SCHEMA public TO synapse_user;" 2>/dev/null; then
+            log "INFO" "Права на схему public предоставлены"
+        fi
+        
+        # Повторная проверка подключения
+        if PGPASSWORD="$db_password" psql -h localhost -U "synapse_user" -d "$MAS_DB_NAME" -c "SELECT 1;" &>/dev/null; then
+            log "SUCCESS" "Подключение к базе данных MAS теперь работает"
         else
-            log "INFO" "Будет использован пользователь PostgreSQL 'synapse_user' для MAS"
+            log "ERROR" "Подключение к базе данных MAS все еще не работает"
+            return 1
         fi
     fi
     
-    # Сохраняем информацию о базе данных MAS
+    # Сохраняем информацию о базе данных MAS (используем того же пользователя synapse_user)
     {
         echo "MAS_DB_NAME=\"$MAS_DB_NAME\""
-        echo "MAS_DB_USER=\"$mas_db_user\""
+        echo "MAS_DB_USER=\"synapse_user\""
         echo "MAS_DB_PASSWORD=\"$db_password\""
-        echo "MAS_DB_URI=\"postgresql://$mas_db_user:$db_password@localhost/$MAS_DB_NAME\""
+        echo "MAS_DB_URI=\"postgresql://synapse_user:$db_password@localhost/$MAS_DB_NAME\""
     } > "$CONFIG_DIR/mas_database.conf"
     
-    log "SUCCESS" "Конфигурация базы данных MAS сохранена (пользователь: $mas_db_user)"
+    log "SUCCESS" "Конфигурация базы данных MAS сохранена (пользователь: synapse_user, база: $MAS_DB_NAME)"
     return 0
 }
 
@@ -386,12 +370,13 @@ generate_mas_config() {
             ;;
     esac
     
-    # Создаем финальную конфигурацию
+    # Создаем ИСПРАВЛЕННУЮ конфигурацию с правильным URI базы данных
     cat > "$MAS_CONFIG_FILE" <<EOF
-# Matrix Authentication Service Configuration
+# Matrix Authentication Service Configuration - ИСПРАВЛЕНО
 # Generated: $(date '+%Y-%m-%d %H:%M:%S')
 # Server Type: ${SERVER_TYPE:-hosting}
 # Port: $mas_port
+# Database: $MAS_DB_NAME (ИСПРАВЛЕНО!)
 
 http:
   public_base: "$mas_public_base"
@@ -409,6 +394,7 @@ http:
         - address: "$BIND_ADDRESS:$mas_port"
       proxy_protocol: false
 
+# ИСПРАВЛЕННАЯ СЕКЦИЯ DATABASE - ИСПОЛЬЗУЕМ ПРАВИЛЬНОЕ ИМЯ БАЗЫ ДАННЫХ
 database:
   uri: "$db_uri"
 
@@ -513,7 +499,16 @@ EOF
     
     # Проверяем корректность конфигурации
     if grep -q "database:" "$MAS_CONFIG_FILE" && grep -q "$db_uri" "$MAS_CONFIG_FILE"; then
-        log "SUCCESS" "Конфигурация MAS создана и содержит корректный URI базы данных"
+        log "SUCCESS" "Конфигурация MAS создана и содержит корректный URI базы данных: $MAS_DB_NAME"
+        
+        # КРИТИЧЕСКАЯ ПРОВЕРКА: убеждаемся, что в URI указана правильная база данных
+        local config_db=$(echo "$db_uri" | sed 's|.*@localhost/||' | sed 's|?.*||')
+        if [ "$config_db" = "$MAS_DB_NAME" ]; then
+            log "SUCCESS" "URI содержит правильное имя базы данных: $config_db"
+        else
+            log "ERROR" "КРИТИЧЕСКАЯ ОШИБКА: URI содержит неправильное имя базы данных: $config_db (ожидается: $MAS_DB_NAME)"
+            return 1
+        fi
     else
         log "ERROR" "Конфигурация MAS повреждена или не содержит корректный URI базы данных"
         log "DEBUG" "Содержимое секции database:"
@@ -524,7 +519,7 @@ EOF
     return 0
 }
 
-# Создание systemd сервиса для MAS
+# Создание systemd сервиса для MAS (исправленная версия)
 create_mas_systemd_service() {
     log "INFO" "Создание systemd сервиса для MAS..."
     
@@ -539,10 +534,18 @@ Wants=postgresql.service
 Type=simple
 User=$MAS_USER
 Group=$MAS_GROUP
+# КРИТИЧЕСКИ ВАЖНО: Устанавливаем правильную рабочую директорию
+WorkingDirectory=/var/lib/mas
+# ВАЖНО: Явно указываем путь к конфигурации 
 ExecStart=/usr/local/bin/mas server --config $MAS_CONFIG_FILE
 Restart=always
 RestartSec=10
+
+# ТОЛЬКО безопасные переменные окружения
 Environment=RUST_LOG=info
+
+# НЕ передаем DATABASE_URL или другие проблемные переменные!
+# MAS должен читать конфигурацию только из config.yaml
 
 # Безопасность
 NoNewPrivileges=true
@@ -558,11 +561,30 @@ ProtectControlGroups=true
 WantedBy=multi-user.target
 EOF
 
+    # Создаем правильную рабочую директорию
+    mkdir -p /var/lib/mas
+    chown "$MAS_USER:$MAS_GROUP" /var/lib/mas
+    
+    # Создаем безопасный .env файл
+    cat > /var/lib/mas/.env << EOF
+# MAS Environment Variables - БЕЗОПАСНАЯ ВЕРСИЯ
+# $(date '+%Y-%m-%d %H:%M:%S')
+
+# Только безопасные переменные окружения
+RUST_LOG=info
+
+# НЕ указываем DATABASE_URL - пусть читает из config.yaml!
+# НЕ указываем MAS_CONFIG - используем --config флаг!
+EOF
+    
+    chown "$MAS_USER:$MAS_GROUP" /var/lib/mas/.env
+    chmod 600 /var/lib/mas/.env
+    
     # Перезагружаем systemd и включаем сервис
     systemctl daemon-reload
     systemctl enable matrix-auth-service
     
-    log "SUCCESS" "Systemd сервис создан и включен"
+    log "SUCCESS" "Systemd сервис создан и включен с правильной рабочей директорией"
     return 0
 }
 
@@ -704,27 +726,28 @@ fix_mas_database_issues() {
     
     if [ "$user_exists" -eq 0 ]; then
         log "ERROR" "Пользователь PostgreSQL '$db_user' не существует"
+        log "ERROR" "Этот пользователь должен быть создан на этапе основной установки Matrix"
+        log "ERROR" "Запустите сначала модуль core_install.sh"
+        return 1
+    else
+        log "SUCCESS" "Пользователь PostgreSQL '$db_user' существует"
+    fi
+    
+    # Проверяем существование базы данных mas_db
+    local db_exists=$(sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -w "$db_name" | wc -l)
+    
+    if [ "$db_exists" -eq 0 ]; then
+        log "ERROR" "База данных '$db_name' не существует"
+        log "INFO" "Создание базы данных $db_name..."
         
-        # Пытаемся создать пользователя
-        log "INFO" "Попытка создания пользователя PostgreSQL '$db_user'..."
-        
-        if [ -n "$db_password" ]; then
-            if sudo -u postgres psql -c "CREATE USER \"$db_user\" WITH PASSWORD '$db_password';" 2>/dev/null; then
-                log "SUCCESS" "Пользователь PostgreSQL '$db_user' создан"
-                
-                # Даем права на базу данных
-                sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $db_name TO \"$db_user\";" 2>/dev/null || true
-                
-            else
-                log "ERROR" "Не удалось создать пользователя PostgreSQL '$db_user'"
-                return 1
-            fi
+        if sudo -u postgres createdb --encoding=UTF8 --locale=C --template=template0 --owner="$db_user" "$db_name"; then
+            log "SUCCESS" "База данных $db_name создана"
         else
-            log "ERROR" "Пароль для пользователя не найден"
+            log "ERROR" "Не удалось создать базу данных $db_name"
             return 1
         fi
     else
-        log "SUCCESS" "Пользователь PostgreSQL '$db_user' существует"
+        log "SUCCESS" "База данных '$db_name' существует"
     fi
     
     # Проверяем подключение к базе данных
@@ -752,6 +775,20 @@ fix_mas_database_issues() {
             log "SUCCESS" "Подключение к базе данных теперь работает"
         else
             log "ERROR" "Подключение к базе данных все еще не работает"
+            
+            # Дополнительная диагностика
+            log "DEBUG" "Дополнительная диагностика подключения:"
+            log "DEBUG" "  Пользователь: $db_user"
+            log "DEBUG" "  База данных: $db_name"
+            log "DEBUG" "  Хост: localhost"
+            
+            # Проверяем, может ли пользователь вообще подключиться к PostgreSQL
+            if PGPASSWORD="$db_password" psql -h localhost -U "$db_user" -d postgres -c "SELECT 1;" &>/dev/null; then
+                log "DEBUG" "Пользователь может подключиться к PostgreSQL"
+            else
+                log "DEBUG" "Пользователь НЕ может подключиться к PostgreSQL"
+            fi
+            
             return 1
         fi
     fi
@@ -826,6 +863,7 @@ diagnose_mas_issues() {
         log "ERROR" "Сервис matrix-auth-service не запущен"
         
         # Показываем статус
+        log "INFO" "Статус сервиса:"
         systemctl status matrix-auth-service --no-pager -l || true
         
         # Показываем последние логи
@@ -851,12 +889,30 @@ diagnose_mas_issues() {
             log "WARN" "Неверный владелец конфигурационного файла: $file_owner (ожидается: $MAS_USER:$MAS_GROUP)"
         fi
         
+        # Проверяем секцию database в конфигурации
+        if grep -q "^database:" "$MAS_CONFIG_FILE"; then
+            local config_uri=$(grep -A 5 "^database:" "$MAS_CONFIG_FILE" | grep "uri:" | sed 's/.*uri: *"//' | sed 's/".*//' 2>/dev/null)
+            if [ -n "$config_uri" ]; then
+                log "SUCCESS" "URI базы данных найден в конфигурации"
+                log "DEBUG" "URI: $(echo "$config_uri" | sed 's/:[^:]*@/:***@/')"  # Скрываем пароль
+            else
+                log "ERROR" "URI базы данных НЕ найден в конфигурации"
+            fi
+        else
+            log "ERROR" "Секция database НЕ найдена в конфигурации"
+        fi
+        
     else
         log "ERROR" "Конфигурационный файл MAS не найден: $MAS_CONFIG_FILE"
     fi
     
     if [ -f "$CONFIG_DIR/mas_database.conf" ]; then
         log "SUCCESS" "Файл конфигурации базы данных найден"
+        
+        # Показываем информацию о настройках БД (без пароля)
+        local db_name=$(grep "MAS_DB_NAME=" "$CONFIG_DIR/mas_database.conf" | cut -d'=' -f2 | tr -d '"')
+        local db_user=$(grep "MAS_DB_USER=" "$CONFIG_DIR/mas_database.conf" | cut -d'=' -f2 | tr -d '"')
+        log "DEBUG" "Настройки БД: пользователь=$db_user, база данных=$db_name"
     else
         log "ERROR" "Файл конфигурации базы данных не найден: $CONFIG_DIR/mas_database.conf"
     fi
@@ -870,13 +926,35 @@ diagnose_mas_issues() {
         local db_password=$(grep "MAS_DB_PASSWORD=" "$CONFIG_DIR/mas_database.conf" | cut -d'=' -f2 | tr -d '"')
         local db_name=$(grep "MAS_DB_NAME=" "$CONFIG_DIR/mas_database.conf" | cut -d'=' -f2 | tr -d '"')
         
+        # Проверяем существование пользователя PostgreSQL
+        local user_exists=$(sudo -u postgres psql -t -c "SELECT 1 FROM pg_roles WHERE rolname='$db_user'" | grep -c 1)
+        if [ "$user_exists" -gt 0 ]; then
+            log "SUCCESS" "Пользователь PostgreSQL '$db_user' существует"
+        else
+            log "ERROR" "Пользователь PostgreSQL '$db_user' НЕ существует"
+        fi
+        
+        # Проверяем существование базы данных
+        local db_exists=$(sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -w "$db_name" | wc -l)
+        if [ "$db_exists" -gt 0 ]; then
+            log "SUCCESS" "База данных '$db_name' существует"
+        else
+            log "ERROR" "База данных '$db_name' НЕ существует"
+        fi
+        
+        # Проверяем подключение
         if PGPASSWORD="$db_password" psql -h localhost -U "$db_user" -d "$db_name" -c "SELECT 1;" &>/dev/null; then
             log "SUCCESS" "Подключение к базе данных работает"
         else
             log "ERROR" "Не удается подключиться к базе данных MAS"
-            log "DEBUG" "URI: $db_uri"
-            log "DEBUG" "Пользователь: $db_user"
-            log "DEBUG" "База данных: $db_name"
+            
+            # Дополнительная диагностика подключения
+            log "DEBUG" "Проверка подключения к PostgreSQL в целом..."
+            if PGPASSWORD="$db_password" psql -h localhost -U "$db_user" -d postgres -c "SELECT 1;" &>/dev/null; then
+                log "DEBUG" "Подключение к PostgreSQL работает, проблема с базой данных $db_name"
+            else
+                log "DEBUG" "Проблема с аутентификацией пользователя $db_user"
+            fi
         fi
     fi
     
@@ -895,10 +973,12 @@ diagnose_mas_issues() {
                 log "ERROR" "MAS API недоступен на порту $mas_port"
                 
                 # Проверяем, слушает ли что-то на этом порту
-                if netstat -tuln 2>/dev/null | grep -q ":$mas_port "; then
-                    log "INFO" "Порт $mas_port прослушивается"
-                else
-                    log "ERROR" "Порт $mas_port не прослушивается"
+                if command -v netstat >/dev/null 2>&1; then
+                    if netstat -tuln 2>/dev/null | grep -q ":$mas_port "; then
+                        log "INFO" "Порт $mas_port прослушивается"
+                    else
+                        log "ERROR" "Порт $mas_port не прослушивается"
+                    fi
                 fi
             fi
         fi
@@ -925,6 +1005,13 @@ diagnose_mas_issues() {
         log "SUCCESS" "Сервис matrix-synapse запущен"
     else
         log "ERROR" "Сервис matrix-synapse не запущен"
+    fi
+    
+    # Проверяем статус PostgreSQL
+    if systemctl is-active --quiet postgresql; then
+        log "SUCCESS" "Сервис postgresql запущен"
+    else
+        log "ERROR" "Сервис postgresql не запущен"
     fi
     
     log "INFO" "Диагностика завершена"
