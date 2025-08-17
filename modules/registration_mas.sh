@@ -421,7 +421,7 @@ secrets:
   keys:
     - kid: "$(date +%s | sha256sum | cut -c1-8)"
       key: |
-$(openssl genpkey -algorithm RSA -bits 2048 -pkcs8 | sed 's/^/        /')
+$(openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 | sed 's/^/        /')
 
 clients:
   - client_id: "0000000000000000000SYNAPSE"
@@ -1085,7 +1085,7 @@ install_matrix_authentication_service() {
                 log "WARN" "MAS API пока недоступен (возможно, еще инициализируется)"
             fi
             
-            # Перезапускаем Synapse для применения конфигурации MAS
+            # Перезагружаем Synapse для применения конфигурации MAS
             log "INFO" "Перезапуск Synapse для применения конфигурации MAS..."
             if systemctl restart matrix-synapse; then
                 log "SUCCESS" "Synapse перезапущен с поддержкой MAS"
