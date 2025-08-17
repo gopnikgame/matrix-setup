@@ -460,3 +460,6 @@ docs/mas-registration-fixes.md
 fix_mas_config_issues.sh
 docs/mas-yaml-fix-guide.md
 fix_mas_yaml_issues.sh
+docs/mas-opa-policy-fix.md
+fix_mas_opa_policy.sh
+quick_fix_mas_opa.sh

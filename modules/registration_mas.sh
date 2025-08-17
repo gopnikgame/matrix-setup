@@ -441,6 +441,27 @@ matrix:
   secret: "$mas_secret"
   endpoint: "http://localhost:8008"
 
+# КРИТИЧЕСКИ ВАЖНО: Конфигурация политики OPA для предотвращения ошибок запуска
+policy:
+  # Использование встроенной (embedded) политики по умолчанию
+  # Это предотвращает ошибку "failed to open OPA WASM policy file"
+  wasm_module: ~  # null/пустое значение означает использование встроенной политики
+  
+  # Данные для политики - базовые правила регистрации и управления
+  data:
+    registration:
+      # Базовые настройки регистрации
+      enabled: true
+      require_registration_token: false
+      
+      # Заблокированные имена пользователей (базовый набор)
+      banned_usernames:
+        literals: ["admin", "root", "administrator", "system", "support", "help", "info"]
+        substrings: ["admin", "root"]
+        prefixes: ["admin-", "root-", "system-"]
+        suffixes: ["-admin", "-root"]
+        regexes: ["^admin.*", "^root.*", ".*admin$"]
+
 EOF
 
             # Добавляем секцию secrets из сгенерированной конфигурации
@@ -527,6 +548,27 @@ matrix:
   secret: "$mas_secret"
   endpoint: "http://localhost:8008"
 
+# КРИТИЧЕСКИ ВАЖНО: Конфигурация политики OPA для предотвращения ошибок запуска
+policy:
+  # Использование встроенной (embedded) политики по умолчанию
+  # Это предотвращает ошибку "failed to open OPA WASM policy file"
+  wasm_module: ~  # null/пустое значение означает использование встроенной политики
+  
+  # Данные для политики - базовые правила регистрации и управления
+  data:
+    registration:
+      # Базовые настройки регистрации
+      enabled: true
+      require_registration_token: false
+      
+      # Заблокированные имена пользователей (базовый набор)
+      banned_usernames:
+        literals: ["admin", "root", "administrator", "system", "support", "help", "info"]
+        substrings: ["admin", "root"]
+        prefixes: ["admin-", "root-", "system-"]
+        suffixes: ["-admin", "-root"]
+        regexes: ["^admin.*", "^root.*", ".*admin$"]
+
 secrets:
   encryption: "$encryption_secret"
   keys:
@@ -584,6 +626,12 @@ EOF
         return 1
     fi
     
+    # НОВАЯ ПРОВЕРКА: убеждаемся, что секция policy добавлена
+    if ! grep -q "^policy:" "$MAS_CONFIG_FILE"; then
+        log "ERROR" "Конфигурация MAS повреждена: секция policy отсутствует!"
+        return 1
+    fi
+    
     # Проверяем YAML синтаксис если доступен python
     if command -v python3 >/dev/null 2>&1; then
         if python3 -c "import yaml; yaml.safe_load(open('$MAS_CONFIG_FILE'))" 2>/dev/null; then
@@ -614,6 +662,7 @@ EOF
         log "INFO" "  - Домен: $matrix_domain" 
         log "INFO" "  - База данных: $final_config_db"
         log "INFO" "  - Bind адрес: $BIND_ADDRESS:$mas_port"
+        log "INFO" "  - OPA Policy: встроенная (embedded)"
     else
         log "ERROR" "КРИТИЧЕСКАЯ ОШИБКА: Финальная проверка не прошла!"
         log "ERROR" "Ожидается база данных: $expected_db"
