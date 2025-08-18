@@ -468,3 +468,5 @@ modules/fix_mas_policy_config.sh
 docs/mas-policy-missing-files-fix.md
 modules/fix_mas_policy_missing_files.sh
 fix_mas_issues.sh
+docs/mas-fixes-summary.md
+test_mas_fixes.sh
