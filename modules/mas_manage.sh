@@ -493,6 +493,86 @@ get_mas_captcha_status() {
     fi
 }
 
+# Просмотр секции account конфигурации MAS
+view_mas_account_config() {
+    print_header "КОНФИГУРАЦИЯ СЕКЦИИ ACCOUNT В MAS" "$CYAN"
+    
+    if [ ! -f "$MAS_CONFIG_FILE" ]; then
+        log "ERROR" "Файл конфигурации MAS не найден: $MAS_CONFIG_FILE"
+        return 1
+    fi
+    
+    if ! check_yq_dependency; then
+        return 1
+    fi
+    
+    safe_echo "${BOLD}Текущая конфигурация секции account:${NC}"
+    echo
+    
+    # Проверяем наличие секции account
+    if ! yq eval '.account' "$MAS_CONFIG_FILE" >/dev/null 2>&1; then
+        safe_echo "${RED}Секция account отсутствует в конфигурации MAS${NC}"
+        return 1
+    fi
+    
+    # Показываем основные параметры регистрации
+    safe_echo "${CYAN}🔐 Настройки регистрации:${NC}"
+    
+    local password_reg=$(yq eval '.account.password_registration_enabled' "$MAS_CONFIG_FILE" 2>/dev/null)
+    if [ "$password_reg" = "true" ]; then
+        safe_echo "  • password_registration_enabled: ${GREEN}true${NC} (открытая регистрация включена)"
+    elif [ "$password_reg" = "false" ]; then
+        safe_echo "  • password_registration_enabled: ${RED}false${NC} (открытая регистрация отключена)"
+    else
+        safe_echo "  • password_registration_enabled: ${YELLOW}$password_reg${NC}"
+    fi
+    
+    local token_req=$(yq eval '.account.registration_token_required' "$MAS_CONFIG_FILE" 2>/dev/null)
+    if [ "$token_req" = "true" ]; then
+        safe_echo "  • registration_token_required: ${GREEN}true${NC} (требуется токен регистрации)"
+    elif [ "$token_req" = "false" ]; then
+        safe_echo "  • registration_token_required: ${RED}false${NC} (токен регистрации не требуется)"
+    else
+        safe_echo "  • registration_token_required: ${YELLOW}$token_req${NC}"
+    fi
+    
+    echo
+    safe_echo "${CYAN}👤 Настройки управления аккаунтами:${NC}"
+    
+    # Остальные параметры account
+    local email_change=$(yq eval '.account.email_change_allowed' "$MAS_CONFIG_FILE" 2>/dev/null)
+    safe_echo "  • email_change_allowed: ${BLUE}$email_change${NC}"
+    
+    local display_change=$(yq eval '.account.displayname_change_allowed' "$MAS_CONFIG_FILE" 2>/dev/null)
+    safe_echo "  • displayname_change_allowed: ${BLUE}$display_change${NC}"
+    
+    local password_change=$(yq eval '.account.password_change_allowed' "$MAS_CONFIG_FILE" 2>/dev/null)
+    safe_echo "  • password_change_allowed: ${BLUE}$password_change${NC}"
+    
+    local password_recovery=$(yq eval '.account.password_recovery_enabled' "$MAS_CONFIG_FILE" 2>/dev/null)
+    safe_echo "  • password_recovery_enabled: ${BLUE}$password_recovery${NC}"
+    
+    local account_deactivation=$(yq eval '.account.account_deactivation_allowed' "$MAS_CONFIG_FILE" 2>/dev/null)
+    safe_echo "  • account_deactivation_allowed: ${BLUE}$account_deactivation${NC}"
+    
+    echo
+    safe_echo "${CYAN}📄 Полная секция account (YAML):${NC}"
+    echo "────────────────────────────────────────────────────────────"
+    
+    # Показываем полную секцию account в YAML формате
+    if yq eval '.account' "$MAS_CONFIG_FILE" >/dev/null 2>/dev/null; then
+        echo "────────────────────────────────────────────────────────────"
+    else
+        safe_echo "${RED}Ошибка чтения секции account${NC}"
+    fi
+    
+    echo
+    safe_echo "${YELLOW}📝 Примечание:${NC}"
+    safe_echo "• Изменения этих параметров требуют перезапуска MAS"
+    safe_echo "• Файл конфигурации: $MAS_CONFIG_FILE"
+    safe_echo "• Для изменения используйте пункты меню выше"
+}
+
 # Изменение параметра в YAML файле
 set_mas_config_value() {
     local key="$1"
@@ -1587,9 +1667,10 @@ manage_mas_registration() {
         safe_echo "2. Выключить открытую регистрацию"
         safe_echo "3. Включить требование токенов регистрации"
         safe_echo "4. Отключить требование токенов регистрации"
-        safe_echo "5. Назад"
+        safe_echo "5. 📄 Просмотреть конфигурацию account"
+        safe_echo "6. Назад"
 
-        read -p "Выберите действие [1-5]: " action
+        read -p "Выберите действие [1-6]: " action
 
         case $action in
             1)
@@ -1605,6 +1686,9 @@ manage_mas_registration() {
                 set_mas_config_value "registration_token_required" "false"
                 ;;
             5)
+                view_mas_account_config
+                ;;
+            6)
                 return 0
                 ;;
             *)
@@ -1612,6 +1696,11 @@ manage_mas_registration() {
                 sleep 1
                 ;;
         esac
+        
+        if [ $action -ne 6 ]; then
+            echo
+            read -p "Нажмите Enter для продолжения..."
+        fi
     done
 }
 
@@ -1734,7 +1823,7 @@ repair_mas() {
         log "SUCCESS" "Структура конфигурации корректна"
     fi
     
-    # Проверяем состояние службы
+    # Проверка состояния службы
     if ! systemctl is-active --quiet matrix-auth-service; then
         log "INFO" "Служба MAS не запущена, попытка запуска..."
         if systemctl start matrix-auth-service; then
@@ -1759,7 +1848,7 @@ repair_mas() {
             log "WARN" "MAS запущен, но API пока недоступен"
         fi
     else
-        log "ERROR" "MAS не запущен после восстановления"
+        log "ERROR" "MAS не запустен после восстановления"
         return 1
     fi
     
