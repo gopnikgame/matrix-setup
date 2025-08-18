@@ -32,6 +32,18 @@ check_root
 # Загружаем тип сервера
 load_server_type
 
+# Функция определения порта MAS в зависимости от типа сервера
+determine_mas_port() {
+    case "${SERVER_TYPE:-hosting}" in
+        "proxmox"|"home_server"|"openvz"|"docker")
+            echo "$MAS_PORT_PROXMOX"
+            ;;
+        *)
+            echo "$MAS_PORT_HOSTING"
+            ;;
+    esac
+}
+
 # --- Управляющие функции MAS ---
 
 # Проверка статуса MAS
@@ -129,6 +141,12 @@ uninstall_mas() {
         rm -f /usr/local/bin/mas
     fi
 
+    # Удаление файлов MAS share
+    if [ -d "/usr/local/share/mas-cli" ]; then
+        log "INFO" "Удаление файлов MAS share..."
+        rm -rf /usr/local/share/mas-cli
+    fi
+
     # Удаление конфигурационных файлов MAS
     if [ -d "$MAS_CONFIG_DIR" ]; then
         log "INFO" "Удаление конфигурации MAS..."
@@ -170,7 +188,60 @@ uninstall_mas() {
         fi
     fi
 
+    # Опционально удаляем пользователя matrix-synapse
+    if ask_confirmation "Удалить также системного пользователя matrix-synapse?"; then
+        if id "$MAS_USER" &>/dev/null; then
+            userdel "$MAS_USER" 2>/dev/null
+            log "INFO" "Пользователь $MAS_USER удален"
+        fi
+    fi
+
     log "SUCCESS" "MAS успешно удалён"
+}
+
+# Проверка критически важных файлов MAS
+check_mas_files() {
+    local mas_share_dir="/usr/local/share/mas-cli"
+    local policy_path="$mas_share_dir/policy.wasm"
+    local assets_path="$mas_share_dir/assets"
+    local templates_path="$mas_share_dir/templates"
+    local translations_path="$mas_share_dir/translations"
+    local manifest_path="$mas_share_dir/manifest.json"
+    
+    log "INFO" "Проверка файлов MAS share..."
+    
+    if [ ! -f "$policy_path" ]; then
+        log "ERROR" "❌ Критический файл policy.wasm отсутствует: $policy_path"
+        return 1
+    else
+        log "SUCCESS" "✅ Файл политики найден: $policy_path"
+    fi
+    
+    if [ ! -d "$assets_path" ]; then
+        log "WARN" "⚠️  Assets отсутствуют: $assets_path"
+    else
+        log "SUCCESS" "✅ Assets найдены: $assets_path"
+    fi
+    
+    if [ ! -d "$templates_path" ]; then
+        log "WARN" "⚠️  Templates отсутствуют: $templates_path"
+    else
+        log "SUCCESS" "✅ Templates найдены: $templates_path"
+    fi
+    
+    if [ ! -d "$translations_path" ]; then
+        log "WARN" "⚠️  Translations отсутствуют: $translations_path"
+    else
+        log "SUCCESS" "✅ Translations найдены: $translations_path"
+    fi
+    
+    if [ ! -f "$manifest_path" ]; then
+        log "WARN" "⚠️  Manifest отсутствует: $manifest_path"
+    else
+        log "SUCCESS" "✅ Manifest найден: $manifest_path"
+    fi
+    
+    return 0
 }
 
 # Диагностика MAS
@@ -178,6 +249,12 @@ diagnose_mas() {
     print_header "ДИАГНОСТИКА MATRIX AUTHENTICATION SERVICE" "$BLUE"
 
     log "INFO" "Диагностика MAS..."
+
+    # Проверка критических файлов MAS
+    log "INFO" "Проверка файлов MAS..."
+    if ! check_mas_files; then
+        log "ERROR" "Обнаружены проблемы с файлами MAS"
+    fi
 
     # Проверка состояния службы MAS
     log "INFO" "Проверка службы matrix-auth-service..."
@@ -190,14 +267,91 @@ diagnose_mas() {
     # Проверка конфигурационных файлов MAS
     if [ -f "$MAS_CONFIG_FILE" ]; then
         log "INFO" "Проверка конфигурации MAS..."
-        if command -v mas >/dev/null 2>&1; then
-            if mas doctor --config "$MAS_CONFIG_FILE"; then
-                log "SUCCESS" "Конфигурация MAS корректна"
+        
+        # Проверка ключевых секций конфигурации
+        log "INFO" "Проверка секций конфигурации..."
+        local required_sections=("http" "database" "matrix" "secrets")
+        for section in "${required_sections[@]}"; do
+            if yq eval ".$section" "$MAS_CONFIG_FILE" >/dev/null 2>&1; then
+                log "SUCCESS" "Секция $section: ✅"
             else
-                log "ERROR" "Обнаружены проблемы в конфигурации MAS"
+                log "ERROR" "Секция $section: ❌ ОТСУТСТВУЕТ"
+            fi
+        done
+        
+        # Проверка секции policy (может отсутствовать, если используется встроенная политика)
+        if yq eval ".policy" "$MAS_CONFIG_FILE" >/dev/null 2>&1; then
+            log "SUCCESS" "Секция policy: ✅"
+            
+            # Проверяем правильность путей в policy секции
+            local policy_wasm=$(yq eval '.policy.wasm_module' "$MAS_CONFIG_FILE" 2>/dev/null)
+            if [ -n "$policy_wasm" ] && [ "$policy_wasm" != "null" ]; then
+                if [ -f "$policy_wasm" ]; then
+                    log "SUCCESS" "Policy файл найден: $policy_wasm"
+                else
+                    log "ERROR" "Policy файл отсутствует: $policy_wasm"
+                fi
             fi
         else
-            log "WARN" "Команда 'mas' не найдена, пропускаем проверку конфигурации"
+            log "INFO" "Секция policy отсутствует (используется встроенная политика)"
+        fi
+        
+        # Проверка секции templates
+        if yq eval ".templates" "$MAS_CONFIG_FILE" >/dev/null 2>&1; then
+            log "SUCCESS" "Секция templates: ✅"
+            
+            # Проверяем правильность путей в templates секции
+            local templates_path=$(yq eval '.templates.path' "$MAS_CONFIG_FILE" 2>/dev/null)
+            if [ -n "$templates_path" ] && [ "$templates_path" != "null" ]; then
+                if [ -d "$templates_path" ]; then
+                    log "SUCCESS" "Templates директория найдена: $templates_path"
+                else
+                    log "ERROR" "Templates директория отсутствует: $templates_path"
+                fi
+            fi
+            
+            local manifest_path=$(yq eval '.templates.assets_manifest' "$MAS_CONFIG_FILE" 2>/dev/null)
+            if [ -n "$manifest_path" ] && [ "$manifest_path" != "null" ]; then
+                if [ -f "$manifest_path" ]; then
+                    log "SUCCESS" "Assets manifest найден: $manifest_path"
+                else
+                    log "ERROR" "Assets manifest отсутствует: $manifest_path"
+                fi
+            fi
+        else
+            log "WARN" "Секция templates отсутствует"
+        fi
+        
+        # Проверка подключения к базе данных mas_db
+        log "INFO" "Проверка подключения к базе данных MAS..."
+        if [ -f "$CONFIG_DIR/mas_database.conf" ]; then
+            local db_user=$(grep "MAS_DB_USER=" "$CONFIG_DIR/mas_database.conf" | cut -d'=' -f2 | tr -d '"' 2>/dev/null)
+            local db_password=$(grep "MAS_DB_PASSWORD=" "$CONFIG_DIR/mas_database.conf" | cut -d'=' -f2 | tr -d '"' 2>/dev/null)
+            local db_name=$(grep "MAS_DB_NAME=" "$CONFIG_DIR/mas_database.conf" | cut -d'=' -f2 | tr -d '"' 2>/dev/null)
+            
+            if [ -n "$db_user" ] && [ -n "$db_password" ] && [ -n "$db_name" ]; then
+                if PGPASSWORD="$db_password" psql -h localhost -U "$db_user" -d "$db_name" -c "SELECT 1;" >/dev/null 2>&1; then
+                    log "SUCCESS" "Подключение к базе данных MAS работает"
+                else
+                    log "ERROR" "Не удается подключиться к базе данных MAS"
+                fi
+            else
+                log "WARN" "Неполная информация о базе данных в mas_database.conf"
+            fi
+        else
+            log "WARN" "Файл mas_database.conf не найден"
+        fi
+        
+        # Проверка MAS doctor если команда доступна
+        if command -v mas >/dev/null 2>&1; then
+            log "INFO" "Запуск mas doctor для проверки конфигурации..."
+            if mas doctor --config "$MAS_CONFIG_FILE"; then
+                log "SUCCESS" "Конфигурация MAS прошла проверку mas doctor"
+            else
+                log "ERROR" "Конфигурация MAS имеет проблемы согласно mas doctor"
+            fi
+        else
+            log "WARN" "Команда 'mas' не найдена, пропускаем проверку mas doctor"
         fi
     else
         log "ERROR" "Конфигурационный файл MAS не найден: $MAS_CONFIG_FILE"
@@ -227,6 +381,14 @@ diagnose_mas() {
             
             if curl -s -f --connect-timeout 3 "$health_url" >/dev/null 2>&1; then
                 log "SUCCESS" "MAS API доступен"
+                
+                # Дополнительная проверка OIDC discovery
+                local discovery_url="http://localhost:$mas_port/.well-known/openid-configuration"
+                if curl -s -f --connect-timeout 3 "$discovery_url" >/dev/null 2>&1; then
+                    log "SUCCESS" "OIDC discovery endpoint доступен"
+                else
+                    log "WARN" "OIDC discovery endpoint недоступен"
+                fi
             else
                 log "ERROR" "MAS API недоступен"
             fi
@@ -908,21 +1070,157 @@ manage_sso_providers() {
         return 1
     fi
 
+    # Функция для инициализации структуры upstream_oauth2
+    init_upstream_oauth2_structure() {
+        log "INFO" "Инициализация структуры upstream_oauth2..."
+        
+        # Создаем резервную копию
+        cp "$MAS_CONFIG_FILE" "$MAS_CONFIG_FILE.backup.$(date +%s)"
+        
+        # Инициализируем структуру upstream_oauth2 если не существует
+        if ! yq eval -i '.upstream_oauth2 //= {}' "$MAS_CONFIG_FILE"; then
+            log "ERROR" "Не удалось инициализировать секцию upstream_oauth2"
+            return 1
+        fi
+        
+        if ! yq eval -i '.upstream_oauth2.providers //= []' "$MAS_CONFIG_FILE"; then
+            log "ERROR" "Не удалось инициализировать массив providers"
+            return 1
+        fi
+        
+        # Устанавливаем права
+        chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE"
+        chmod 600 "$MAS_CONFIG_FILE"
+        
+        log "SUCCESS" "Структура upstream_oauth2 инициализирована"
+        return 0
+    }
+
+    # Функция для проверки существования секции upstream_oauth2
+    check_upstream_oauth2_structure() {
+        local upstream_section=$(yq eval '.upstream_oauth2' "$MAS_CONFIG_FILE" 2>/dev/null)
+        local providers_section=$(yq eval '.upstream_oauth2.providers' "$MAS_CONFIG_FILE" 2>/dev/null)
+        
+        if [ "$upstream_section" = "null" ] || [ "$providers_section" = "null" ]; then
+            log "WARN" "Секция upstream_oauth2 отсутствует или неполная, инициализирую..."
+            if ! init_upstream_oauth2_structure; then
+                return 1
+            fi
+        fi
+        return 0
+    }
+
+    # Функция для валидации JSON провайдера
+    validate_provider_json() {
+        local provider_json="$1"
+        
+        # Проверяем базовый JSON синтаксис
+        if ! echo "$provider_json" | jq . >/dev/null 2>&1; then
+            log "ERROR" "Неверный JSON синтаксис провайдера"
+            return 1
+        fi
+        
+        # Проверяем обязательные поля
+        local required_fields=("id" "client_id" "client_secret" "scope")
+        for field in "${required_fields[@]}"; do
+            local value=$(echo "$provider_json" | jq -r ".$field" 2>/dev/null)
+            if [ -z "$value" ] || [ "$value" = "null" ]; then
+                log "ERROR" "Отсутствует обязательное поле: $field"
+                return 1
+            fi
+        done
+        
+        # Проверяем формат ULID для ID
+        local provider_id=$(echo "$provider_json" | jq -r '.id')
+        if ! echo "$provider_id" | grep -qE '^[0-9A-Z]{26}$'; then
+            log "ERROR" "ID провайдера должен быть валидным ULID (26 символов A-Z0-9)"
+            return 1
+        fi
+        
+        log "SUCCESS" "JSON провайдера прошел валидацию"
+        return 0
+    }
+
+    # Функция для проверки существования провайдера
+    check_provider_exists() {
+        local provider_id="$1"
+        
+        local existing_provider=$(yq eval ".upstream_oauth2.providers[] | select(.id == \"$provider_id\")" "$MAS_CONFIG_FILE" 2>/dev/null)
+        if [ -n "$existing_provider" ] && [ "$existing_provider" != "null" ]; then
+            return 0  # Провайдер существует
+        else
+            return 1  # Провайдер не существует
+        fi
+    }
+
     # Функция для синхронизации и перезапуска MAS
     sync_and_restart_mas() {
         log "INFO" "Синхронизация конфигурации MAS с базой данных..."
-        if ! sudo -u "$MAS_USER" mas config sync --config "$MAS_CONFIG_FILE" --prune; then
-            log "ERROR" "Ошибка синхронизации конфигурации MAS"
-            return 1
+        
+        # Проверяем YAML синтаксис перед синхронизацией
+        if command -v python3 >/dev/null 2>&1; then
+            if ! python3 -c "import yaml; yaml.safe_load(open('$MAS_CONFIG_FILE'))" 2>/dev/null; then
+                log "ERROR" "Ошибка в YAML синтаксе конфигурации после изменений!"
+                log "ERROR" "Восстанавливаю резервную копию..."
+                local latest_backup=$(ls -t "$MAS_CONFIG_FILE.backup"* 2>/dev/null | head -1)
+                if [ -n "$latest_backup" ]; then
+                    cp "$latest_backup" "$MAS_CONFIG_FILE"
+                    chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE"
+                    chmod 600 "$MAS_CONFIG_FILE"
+                    log "INFO" "Резервная копия восстановлена"
+                fi
+                return 1
+            fi
         fi
+        
+        # Выполняем синхронизацию с базой данных
+        if ! sudo -u "$MAS_USER" mas config sync --config "$MAS_CONFIG_FILE" --prune 2>/dev/null; then
+            log "ERROR" "Ошибка синхронизации конфигурации MAS с базой данных"
+            log "INFO" "Возможные причины: MAS не запущен, проблемы с БД, неверная конфигурация"
+            
+            # Пытаемся синхронизацию без --prune
+            log "INFO" "Попытка синхронизации без --prune..."
+            if ! sudo -u "$MAS_USER" mas config sync --config "$MAS_CONFIG_FILE" 2>/dev/null; then
+                log "ERROR" "Синхронизация не удалась даже без --prune"
+                return 1
+            else
+                log "WARN" "Синхронизация выполнена без --prune (старые провайдеры не удалены)"
+            fi
+        fi
+        
         log "INFO" "Перезапуск MAS для применения изменений..."
         if systemctl restart matrix-auth-service; then
-            log "SUCCESS" "Настройки SSO успешно обновлены"
+            # Ждем запуска службы
             sleep 3
+            if systemctl is_active --quiet matrix-auth-service; then
+                log "SUCCESS" "MAS успешно перезапущен"
+                
+                # Проверяем API
+                local mas_port=""
+                if [ -f "$CONFIG_DIR/mas.conf" ]; then
+                    mas_port=$(grep "MAS_PORT=" "$CONFIG_DIR/mas.conf" | cut -d'=' -f2 | tr -d '"')
+                fi
+                
+                if [ -n "$mas_port" ]; then
+                    local health_url="http://localhost:$mas_port/health"
+                    if curl -s -f --connect-timeout 5 "$health_url" >/dev/null 2>&1; then
+                        log "SUCCESS" "MAS API доступен - настройки SSO применены успешно"
+                    else
+                        log "WARN" "MAS запущен, но API пока недоступен (может требовать время на инициализацию)"
+                    fi
+                fi
+                
+                sleep 2
+            else
+                log "ERROR" "MAS не запустился после изменений"
+                return 1
+            fi
         else
             log "ERROR" "Ошибка перезапуска matrix-auth-service"
             return 1
         fi
+        
+        return 0
     }
 
     # Функция для генерации ULID
@@ -941,58 +1239,96 @@ manage_sso_providers() {
         local scope="$5"
         local extra_config="$6"
 
-        print_header "NAСТРОЙКА $human_name SSO" "$CYAN"
+        print_header "НАСТРОЙКА $human_name SSO" "$CYAN"
+        
+        # Проверяем и инициализируем структуру upstream_oauth2
+        if ! check_upstream_oauth2_structure; then
+            log "ERROR" "Не удалось инициализировать структуру upstream_oauth2"
+            read -p "Нажмите Enter для продолжения..."
+            return 1
+        fi
+        
+        # Показываем инструкции для настройки провайдера
         case $provider_name in
             "google")
+                safe_echo "Для настройки Google OAuth 2.0:"
                 safe_echo "1. Перейдите в Google API Console: https://console.developers.google.com/apis/credentials"
-                safe_echo "2. Нажмите 'CREATE CREDENTIALS' -> 'OAuth client ID'. "
-                safe_echo "3. Выберите 'Web application'."
-                safe_echo "4. В 'Authorized redirect URIs' добавьте URI вашего MAS. Он будет показан после ввода данных."
-                safe_echo "   Пример: https://auth.your-domain.com/upstream/callback/YOUR_ULID"
-                safe_echo "5. Скопируйте 'Client ID' и 'Client Secret'."
+                safe_echo "2. Нажмите 'CREATE CREDENTIALS' → 'OAuth client ID'"
+                safe_echo "3. Выберите 'Web application'"
+                safe_echo "4. В 'Authorized redirect URIs' добавьте URI вашего MAS (будет показан ниже)"
+                safe_echo "5. Скопируйте 'Client ID' и 'Client Secret'"
                 ;;
             "github")
-                safe_echo "1. Перейдите в 'Developer settings' вашего GitHub профиля: https://github.com/settings/developers"
-                safe_echo "2. Выберите 'OAuth Apps' -> 'New OAuth App'."
-                safe_echo "3. 'Homepage URL': URL вашего MAS (например, https://auth.your-domain.com)."
-                safe_echo "4. 'Authorization callback URL': URL для коллбэка. Будет показан после ввода данных."
-                safe_echo "   Пример: https://auth.your-domain.com/upstream/callback/YOUR_ULID"
-                safe_echo "5. Скопируйте 'Client ID' и сгенерируйте 'Client Secret'."
+                safe_echo "Для настройки GitHub OAuth:"
+                safe_echo "1. Перейдите в Developer settings: https://github.com/settings/developers"
+                safe_echo "2. Выберите 'OAuth Apps' → 'New OAuth App'"
+                safe_echo "3. 'Homepage URL': URL вашего MAS"
+                safe_echo "4. 'Authorization callback URL': URL для коллбэка (будет показан ниже)"
+                safe_echo "5. Скопируйте 'Client ID' и сгенерируйте 'Client Secret'"
                 ;;
             "gitlab")
-                safe_echo "1. Перейдите в 'Applications' в настройках вашего профиля GitLab: https://gitlab.com/-/profile/applications"
-                safe_echo "2. Создайте новое приложение."
-                safe_echo "3. В 'Redirect URI' укажите URL для коллбэка. Будет показан после ввода данных."
-                safe_echo "   Пример: https://auth.your-domain.com/upstream/callback/YOUR_ULID"
-                safe_echo "4. Включите скоупы: 'openid', 'profile', 'email'."
-                safe_echo "5. Сохраните и скопируйте 'Application ID' (это Client ID) и 'Secret'."
+                safe_echo "Для настройки GitLab OAuth:"
+                safe_echo "1. Перейдите в Applications: https://gitlab.com/-/profile/applications"
+                safe_echo "2. Создайте новое приложение"
+                safe_echo "3. В 'Redirect URI' укажите URL для коллбэка (будет показан ниже)"
+                safe_echo "4. Включите скоупы: 'openid', 'profile', 'email'"
+                safe_echo "5. Сохраните и скопируйте 'Application ID' и 'Secret'"
                 ;;
             "discord")
+                safe_echo "Для настройки Discord OAuth:"
                 safe_echo "1. Перейдите на Discord Developer Portal: https://discord.com/developers/applications"
-                safe_echo "2. Создайте новое приложение."
-                safe_echo "3. Перейдите во вкладку 'OAuth2'."
-                safe_echo "4. В 'Redirects' добавьте URL для коллбэка. Будет показан после ввода данных."
-                safe_echo "   Пример: https://auth.your-domain.com/upstream/callback/YOUR_ULID"
-                safe_echo "5. Сохраните изменения и скопируйте 'Client ID' и 'Client Secret'."
+                safe_echo "2. Создайте новое приложение"
+                safe_echo "3. Перейдите во вкладку 'OAuth2'"
+                safe_echo "4. В 'Redirects' добавьте URL для коллбэка (будет показан ниже)"
+                safe_echo "5. Скопируйте 'Client ID' и 'Client Secret'"
                 ;;
         esac
+        
         echo
         read -p "Введите Client ID: " client_id
         read -p "Введите Client Secret: " client_secret
+        
+        # Валидация введенных данных
         if [ -z "$client_id" ] || [ -z "$client_secret" ]; then
-            log "ERROR" "Client ID и Client Secret не могут быть пустыми."
+            log "ERROR" "Client ID и Client Secret не могут быть пустыми"
             read -p "Нажмите Enter для продолжения..."
-            return
+            return 1
         fi
+        
+        # Генерируем уникальный ULID для провайдера
         local ulid=$(generate_ulid)
-        local mas_public_base=$(yq eval '.http.public_base' "$MAS_CONFIG_FILE")
-        local redirect_uri="${mas_public_base}/upstream/callback/${ulid}"
-        safe_echo "Ваш Redirect URI для настройки в $human_name: $redirect_uri"
-        echo
-        if ! ask_confirmation "Продолжить добавление провайдера?"; then
-            return
+        
+        # Проверяем, что такой ID еще не используется
+        while check_provider_exists "$ulid"; do
+            log "WARN" "ID $ulid уже используется, генерирую новый..."
+            ulid=$(generate_ulid)
+        done
+        
+        # Получаем public_base из конфигурации MAS
+        local mas_public_base=$(yq eval '.http.public_base' "$MAS_CONFIG_FILE" 2>/dev/null)
+        if [ -z "$mas_public_base" ] || [ "$mas_public_base" = "null" ]; then
+            log "ERROR" "Не удается получить http.public_base из конфигурации MAS"
+            read -p "Нажмите Enter для продолжения..."
+            return 1
         fi
-        local provider_yaml=$(cat <<EOF
+        
+        # Формируем redirect URI
+        local redirect_uri="${mas_public_base}/upstream/callback/${ulid}"
+        
+        safe_echo
+        safe_echo "${BOLD}${GREEN}Ваш Redirect URI для настройки в $human_name:${NC}"
+        safe_echo "${CYAN}$redirect_uri${NC}"
+        safe_echo
+        safe_echo "Скопируйте этот URI и добавьте его в настройки вашего OAuth приложения."
+        echo
+        
+        if ! ask_confirmation "Вы добавили Redirect URI в настройки провайдера и готовы продолжить?"; then
+            log "INFO" "Настройка провайдера отменена"
+            return 0
+        fi
+        
+        # Создаем JSON объект провайдера
+        local provider_json=$(cat <<EOF
 {
   "id": "$ulid",
   "human_name": "$human_name",
@@ -1003,66 +1339,203 @@ manage_sso_providers() {
 }
 EOF
 )
+        
+        # Добавляем дополнительную конфигурацию если есть
         if [ -n "$extra_config" ]; then
-            provider_yaml=$(echo "$provider_yaml" | yq eval '. as $item | '"$extra_config"' | $item * .' -)
+            log "INFO" "Применение дополнительной конфигурации для $provider_name..."
+            provider_json=$(echo "$provider_json" | yq eval '. as $item | '"$extra_config"' | $item * .' - 2>/dev/null)
+            if [ $? -ne 0 ]; then
+                log "ERROR" "Ошибка применения дополнительной конфигурации"
+                read -p "Нажмите Enter для продолжения..."
+                return 1
+            fi
         fi
-        yq eval -i '.upstream_oauth2.providers += ['"$provider_yaml"']' "$MAS_CONFIG_FILE"
-        sync_and_restart_mas
+        
+        # Валидируем JSON провайдера
+        if ! validate_provider_json "$provider_json"; then
+            log "ERROR" "Провайдер не прошел валидацию"
+            read -p "Нажмите Enter для продолжения..."
+            return 1
+        fi
+        
+        log "INFO" "Добавление провайдера $human_name в конфигурацию..."
+        
+        # Добавляем провайдера в конфигурацию
+        if ! yq eval -i '.upstream_oauth2.providers += ['"$provider_json"']' "$MAS_CONFIG_FILE"; then
+            log "ERROR" "Не удалось добавить провайдера в конфигурацию"
+            read -p "Нажмите Enter для продолжения..."
+            return 1
+        fi
+        
+        # Устанавливаем права
+        chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE"
+        chmod 600 "$MAS_CONFIG_FILE"
+        
+        # Синхронизируем и перезапускаем MAS
+        if sync_and_restart_mas; then
+            log "SUCCESS" "Провайдер $human_name успешно добавлен!"
+            safe_echo
+            safe_echo "${BOLD}${GREEN}Настройка завершена:${NC}"
+            safe_echo "• ID провайдера: ${CYAN}$ulid${NC}"
+            safe_echo "• Redirect URI: ${CYAN}$redirect_uri${NC}"
+            safe_echo "• Провайдер доступен для аутентификации пользователей"
+        else
+            log "ERROR" "Ошибка при применении настроек провайдера"
+        fi
+        
         read -p "Нажмите Enter для продолжения..."
     }
 
     # Функция удаления провайдера
     remove_sso_provider() {
         print_header "УДАЛЕНИЕ SSO-ПРОВАЙДЕРА" "$RED"
-        local providers=$(yq eval '.upstream_oauth2.providers[] | .id + " " + .human_name' "$MAS_CONFIG_FILE" 2>/dev/null)
-        if [ -z "$providers" ] || [ "$providers" = "null null" ]; then
+        
+        # Проверяем существование структуры upstream_oauth2
+        if ! check_upstream_oauth2_structure; then
+            safe_echo "Секция upstream_oauth2 отсутствует или повреждена."
+            read -p "Нажмите Enter для продолжения..."
+            return 1
+        fi
+        
+        # Получаем список провайдеров
+        local providers_list=$(yq eval '.upstream_oauth2.providers[]' "$MAS_CONFIG_FILE" 2>/dev/null)
+        
+        if [ -z "$providers_list" ] || [ "$providers_list" = "null" ]; then
             safe_echo "Нет настроенных SSO-провайдеров для удаления."
             read -p "Нажмите Enter для продолжения..."
-            return
+            return 0
         fi
+        
+        # Показываем список провайдеров в удобном формате
         safe_echo "Список настроенных провайдеров:"
-        echo "$providers"
+        echo
+        
+        local counter=1
+        yq eval '.upstream_oauth2.providers[]' "$MAS_CONFIG_FILE" 2>/dev/null | while IFS= read -r provider; do
+            if [ -n "$provider" ] && [ "$provider" != "null" ]; then
+                local id=$(echo "$provider" | yq eval '.id' -)
+                local name=$(echo "$provider" | yq eval '.human_name' -)
+                local brand=$(echo "$provider" | yq eval '.brand_name' -)
+                
+                if [ -n "$id" ] && [ "$id" != "null" ]; then
+                    printf "%d. %s (%s) - ID: %s\n" "$counter" "$name" "$brand" "$id"
+                    counter=$((counter + 1))
+                fi
+            fi
+        done
+        
         echo
         read -p "Введите ID провайдера для удаления: " id_to_remove
+        
         if [ -z "$id_to_remove" ]; then
-            log "WARN" "ID не указан."
-            return
+            log "WARN" "ID не указан"
+            return 0
         fi
-        if ask_confirmation "Вы уверены, что хотите удалить провайдера с ID $id_to_remove?"; then
-            yq eval -i 'del(.upstream_oauth2.providers[] | select(.id == "'"$id_to_remove"'"))' "$MAS_CONFIG_FILE"
-            sync_and_restart_mas
+        
+        # Проверяем, что провайдер существует
+        if ! check_provider_exists "$id_to_remove"; then
+            log "ERROR" "Провайдер с ID '$id_to_remove' не найден"
+            read -p "Нажмите Enter для продолжения..."
+            return 1
         fi
+        
+        # Получаем информацию о провайдере для подтверждения
+        local provider_info=$(yq eval ".upstream_oauth2.providers[] | select(.id == \"$id_to_remove\")" "$MAS_CONFIG_FILE" 2>/dev/null)
+        local provider_name=$(echo "$provider_info" | yq eval '.human_name' -)
+        
+        safe_echo
+        safe_echo "Информация о провайдере для удаления:"
+        safe_echo "• ID: ${CYAN}$id_to_remove${NC}"
+        safe_echo "• Название: ${CYAN}$provider_name${NC}"
+        echo
+        
+        if ask_confirmation "Вы уверены, что хотите удалить этого провайдера?"; then
+            log "INFO" "Удаление провайдера $provider_name (ID: $id_to_remove)..."
+            
+            # Создаем резервную копию
+            cp "$MAS_CONFIG_FILE" "$MAS_CONFIG_FILE.backup.$(date +%s)"
+            
+            # Удаляем провайдера
+            if ! yq eval -i 'del(.upstream_oauth2.providers[] | select(.id == "'"$id_to_remove"'"))' "$MAS_CONFIG_FILE"; then
+                log "ERROR" "Не удалось удалить провайдера из конфигурации"
+                read -p "Нажмите Enter для продолжения..."
+                return 1
+            fi
+            
+            # Устанавливаем права
+            chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE"
+            chmod 600 "$MAS_CONFIG_FILE"
+            
+            # Синхронизируем и перезапускаем MAS
+            if sync_and_restart_mas; then
+                log "SUCCESS" "Провайдер $provider_name успешно удален"
+            else
+                log "ERROR" "Ошибка при применении изменений"
+            fi
+        else
+            log "INFO" "Удаление провайдера отменено"
+        fi
+        
         read -p "Нажмите Enter для продолжения..."
     }
 
+    # Главное меню управления SSO
     while true; do
         print_header "УПРАВЛЕНИЕ SSO" "$BLUE"
-        safe_echo "Текущие SSO-провайдеры:"
-        local current_providers=$(yq eval -o=json '.upstream_oauth2.providers' "$MAS_CONFIG_FILE" 2>/dev/null)
-        if [ -z "$current_providers" ] || [ "$current_providers" = "null" ] || [ "$current_providers" = "[]" ]; then
-            safe_echo "SSO-провайдеры не настроены."
-        else
-            echo "$current_providers" | yq eval -P '.[] | .human_name + " (ID: " + .id + ")"' - 2>/dev/null || safe_echo "Ошибка отображения провайдеров"
+        
+        # Проверяем и инициализируем структуру при каждом входе в меню
+        if ! check_upstream_oauth2_structure; then
+            log "ERROR" "Не удалось инициализировать структуру upstream_oauth2"
+            read -p "Нажмите Enter для возврата..."
+            return 1
         fi
+        
+        safe_echo "Текущие SSO-провайдеры:"
+        
+        # Показываем текущие провайдеры
+        local current_providers=$(yq eval '.upstream_oauth2.providers' "$MAS_CONFIG_FILE" 2>/dev/null)
+        if [ -z "$current_providers" ] || [ "$current_providers" = "null" ] || [ "$current_providers" = "[]" ]; then
+            safe_echo "${YELLOW}SSO-провайдеры не настроены.${NC}"
+        else
+            local provider_count=$(yq eval '.upstream_oauth2.providers | length' "$MAS_CONFIG_FILE" 2>/dev/null)
+            safe_echo "${GREEN}Настроено провайдеров: $provider_count${NC}"
+            echo
+            
+            # Показываем список провайдеров
+            yq eval '.upstream_oauth2.providers[]' "$MAS_CONFIG_FILE" 2>/dev/null | while IFS= read -r provider; do
+                if [ -n "$provider" ] && [ "$provider" != "null" ]; then
+                    local name=$(echo "$provider" | yq eval '.human_name' - 2>/dev/null)
+                    local id=$(echo "$provider" | yq eval '.id' - 2>/dev/null)
+                    local brand=$(echo "$provider" | yq eval '.brand_name' - 2>/dev/null)
+                    
+                    if [ -n "$name" ] && [ "$name" != "null" ]; then
+                        safe_echo "• ${CYAN}$name${NC} ($brand) - ID: $id"
+                    fi
+                fi
+            done
+        fi
+        
         echo
         safe_echo "Доступные опции:"
         safe_echo "1. ➕ Добавить Google"
-        safe_echo "2. ➕ Добавить GitHub"
+        safe_echo "2. ➕ Добавить GitHub"  
         safe_echo "3. ➕ Добавить GitLab"
         safe_echo "4. ➕ Добавить Discord"
         safe_echo "5. 🗑️  Удалить провайдера"
         safe_echo "6. ↩️  Вернуться в главное меню"
         echo
+        
         read -p "Выберите опцию [1-6]: " choice
+        
         case $choice in
             1)
-                add_sso_provider "google" "Google" "google" "" "openid profile email" '.issuer = "https://accounts.google.com" | .token_endpoint_auth_method = "client_secret_post"'
+                add_sso_provider "google" "Google" "google" "https://accounts.google.com" "openid profile email" '.issuer = "https://accounts.google.com" | .token_endpoint_auth_method = "client_secret_post"'
                 ;;
             2)
-                add_sso_provider "github" "GitHub" "github" "" "read:user" '.discovery_mode = "disabled" | .fetch_userinfo = true | .token_endpoint_auth_method = "client_secret_post" | .authorization_endpoint = "https://github.com/login/oauth/authorize" | .token_endpoint = "https://github.com/login/oauth/access_token" | .userinfo_endpoint = "https://api.github.com/user" | .claims_imports.subject.template = "{{ userinfo_claims.id }}"'
+                add_sso_provider "github" "GitHub" "github" "" "read:user user:email" '.discovery_mode = "disabled" | .fetch_userinfo = true | .token_endpoint_auth_method = "client_secret_post" | .authorization_endpoint = "https://github.com/login/oauth/authorize" | .token_endpoint = "https://github.com/login/oauth/access_token" | .userinfo_endpoint = "https://api.github.com/user" | .claims_imports.subject.template = "{{ userinfo_claims.id }}"'
                 ;;
             3)
-                add_sso_provider "gitlab" "GitLab" "gitlab" "" "openid profile email" '.issuer = "https://gitlab.com" | .token_endpoint_auth_method = "client_secret_post"'
+                add_sso_provider "gitlab" "GitLab" "gitlab" "https://gitlab.com" "openid profile email" '.issuer = "https://gitlab.com" | .token_endpoint_auth_method = "client_secret_post"'
                 ;;
             4)
                 add_sso_provider "discord" "Discord" "discord" "" "identify email" '.discovery_mode = "disabled" | .fetch_userinfo = true | .token_endpoint_auth_method = "client_secret_post" | .authorization_endpoint = "https://discord.com/oauth2/authorize" | .token_endpoint = "https://discord.com/api/oauth2/token" | .userinfo_endpoint = "https://discord.com/api/users/@me"'
@@ -1142,6 +1615,158 @@ manage_mas_registration() {
     done
 }
 
+# Функция восстановления MAS
+repair_mas() {
+    print_header "ВОССТАНОВЛЕНИЕ MATRIX AUTHENTICATION SERVICE" "$YELLOW"
+    
+    log "INFO" "Диагностика и восстановление MAS..."
+    
+    # Проверяем и восстанавливаем файлы share
+    if ! check_mas_files; then
+        log "WARN" "Файлы MAS повреждены или отсутствуют"
+        if ask_confirmation "Переустановить файлы MAS?"; then
+            # Определяем архитектуру
+            local arch=$(uname -m)
+            local mas_binary=""
+            
+            case "$arch" in
+                x86_64)
+                    mas_binary="mas-cli-x86_64-linux.tar.gz"
+                    ;;
+                aarch64|arm64)
+                    mas_binary="mas-cli-aarch64-linux.tar.gz"
+                    ;;
+                *)
+                    log "ERROR" "Неподдерживаемая архитектура: $arch"
+                    return 1
+                    ;;
+            esac
+            
+            # URL для скачивания MAS из репозитория element-hq
+            local download_url="https://github.com/element-hq/matrix-authentication-service/releases/latest/download/$mas_binary"
+            
+            # Проверяем подключение к интернету
+            if ! check_internet; then
+                log "ERROR" "Отсутствует подключение к интернету"
+                return 1
+            fi
+            
+            log "INFO" "Скачивание и установка файлов MAS..."
+            
+            # Скачиваем MAS
+            if ! download_file "$download_url" "/tmp/$mas_binary"; then
+                log "ERROR" "Ошибка скачивания MAS"
+                return 1
+            fi
+            
+            # Создаем временную директорию для извлечения
+            local temp_dir=$(mktemp -d)
+            
+            # Извлекаем архив
+            if ! tar -xzf "/tmp/$mas_binary" -C "$temp_dir"; then
+                log "ERROR" "Ошибка извлечения архива MAS"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+            
+            # Устанавливаем бинарный файл если отсутствует
+            if [ -f "$temp_dir/mas-cli" ] && [ ! -f "/usr/local/bin/mas" ]; then
+                chmod +x "$temp_dir/mas-cli"
+                mv "$temp_dir/mas-cli" /usr/local/bin/mas
+                log "SUCCESS" "Бинарный файл MAS восстановлен"
+            fi
+            
+            # Создаем директорию установки MAS
+            local mas_install_dir="/usr/local/share/mas-cli"
+            mkdir -p "$mas_install_dir"
+            
+            # Устанавливаем ВСЕ файлы share
+            if [ -d "$temp_dir/share" ]; then
+                log "INFO" "Восстановление файлов MAS (assets, policy, templates, translations)..."
+                
+                # Копируем все содержимое share в правильное место
+                cp -r "$temp_dir/share"/* "$mas_install_dir/"
+                
+                # Устанавливаем правильные права доступа
+                chown -R root:root "$mas_install_dir"
+                find "$mas_install_dir" -type f -exec chmod 644 {} \;
+                find "$mas_install_dir" -type d -exec chmod 755 {} \;
+                
+                log "SUCCESS" "Файлы MAS восстановлены"
+            else
+                log "ERROR" "Директория share отсутствует в архиве MAS"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+            
+            # Удаляем временные файлы
+            rm -f "/tmp/$mas_binary"
+            rm -rf "$temp_dir"
+            
+            log "SUCCESS" "Файлы MAS успешно восстановлены"
+        fi
+    fi
+    
+    # Проверяем и восстанавливаем конфигурацию
+    if [ ! -f "$MAS_CONFIG_FILE" ]; then
+        log "ERROR" "Конфигурация MAS отсутствует"
+        log "INFO" "Для восстановления конфигурации используйте переустановку через install_mas.sh"
+        log "INFO" "Запустите: sudo ./modules/install_mas.sh"
+        return 1
+    fi
+    
+    # Проверяем структуру конфигурации
+    log "INFO" "Проверка структуры конфигурации..."
+    local required_sections=("http" "database" "matrix" "secrets")
+    local missing_sections=()
+    
+    for section in "${required_sections[@]}"; do
+        if ! yq eval ".$section" "$MAS_CONFIG_FILE" >/dev/null 2>&1; then
+            missing_sections+=("$section")
+        fi
+    done
+    
+    if [ ${#missing_sections[@]} -gt 0 ]; then
+        log "ERROR" "Отсутствуют критические секции конфигурации: ${missing_sections[*]}"
+        log "INFO" "Для полного восстановления конфигурации используйте переустановку"
+        return 1
+    else
+        log "SUCCESS" "Структура конфигурации корректна"
+    fi
+    
+    # Проверяем состояние службы
+    if ! systemctl is-active --quiet matrix-auth-service; then
+        log "INFO" "Служба MAS не запущена, попытка запуска..."
+        if systemctl start matrix-auth-service; then
+            log "SUCCESS" "Служба MAS запущена"
+        else
+            log "ERROR" "Не удалось запустить службу MAS"
+            log "INFO" "Проверьте логи: journalctl -u matrix-auth-service -n 20"
+            return 1
+        fi
+    fi
+    
+    # Финальная проверка
+    sleep 3
+    if systemctl is-active --quiet matrix-auth-service; then
+        # Проверяем API
+        local mas_port=$(determine_mas_port)
+        local health_url="http://localhost:$mas_port/health"
+        
+        if curl -s -f --connect-timeout 5 "$health_url" >/dev/null 2>&1; then
+            log "SUCCESS" "MAS API доступен - восстановление завершено успешно"
+        else
+            log "WARN" "MAS запущен, но API пока недоступен"
+        fi
+    else
+        log "ERROR" "MAS не запущен после восстановления"
+        return 1
+    fi
+    
+    log "SUCCESS" "Восстановление MAS завершено"
+    return 0
+}
+
 # Главное меню модуля
 show_main_menu() {
     while true; do
@@ -1171,13 +1796,14 @@ show_main_menu() {
         safe_echo "${GREEN}2.${NC} 🗑️  Удалить MAS"
         safe_echo "${GREEN}3.${NC} 🔍 Диагностика MAS"
         safe_echo "${GREEN}4.${NC} 👥 Управление регистрацией MAS"
-        safe_echo "${GREEN}5.${NC} 🔐 Управление SSO-провайдерами"
+        safe_echo "${GREEN}5.${NC} 🔐 Управление SSO-провайдителями"
         safe_echo "${GREEN}6.${NC} 🤖 Настройки CAPTCHA"
         safe_echo "${GREEN}7.${NC} 🚫 Заблокированные имена пользователей"
         safe_echo "${GREEN}8.${NC} 🎫 Токены регистрации"
-        safe_echo "${GREEN}9.${NC} ↩️  Назад в главное меню"
+        safe_echo "${GREEN}9.${NC} 🔧 Восстановить MAS"
+        safe_echo "${GREEN}10.${NC} ↩️  Назад в главное меню"
 
-        read -p "$(safe_echo "${YELLOW}Выберите действие [1-9]: ${NC}")" action
+        read -p "$(safe_echo "${YELLOW}Выберите действие [1-10]: ${NC}")" action
 
         case $action in
             1)
@@ -1205,6 +1831,9 @@ show_main_menu() {
                 manage_mas_registration_tokens
                 ;;
             9)
+                repair_mas
+                ;;
+            10)
                 return 0
                 ;;
             *)
@@ -1213,7 +1842,7 @@ show_main_menu() {
                 ;;
         esac
         
-        if [ $action -ne 9 ]; then
+        if [ $action -ne 10 ]; then
             echo
             read -p "Нажмите Enter для продолжения..."
         fi
