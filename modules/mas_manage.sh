@@ -695,7 +695,7 @@ initialize_mas_account_section() {
                 local py_error=""
                 if ! py_error=$(python3 -c "import yaml; yaml.safe_load(open('${temp_file}.new'))" 2>&1); then
                     log "ERROR" "YAML поврежден после добавления секции account альтернативным методом"
-                    log "DEBUG" "Ошибка Python: $py_error"
+                    log "DEBUG" "Ошибка Python: $py_final_error"
                     config_success=false
                 else
                     # Заменяем оригинальный файл
@@ -934,7 +934,7 @@ set_mas_config_value() {
                 local py_error=""
                 if ! py_error=$(python3 -c "import yaml; yaml.safe_load(open('${temp_file}.new'))" 2>&1); then
                     log "ERROR" "YAML поврежден после изменений альтернативным методом"
-                    log "DEBUG" "Ошибка Python: $py_error"
+                    log "DEBUG" "Ошибка Python: $py_final_error"
                     config_success=false
                 else
                     # Заменяем оригинальный файл
@@ -952,6 +952,7 @@ set_mas_config_value() {
                         fi
                     else
                         log "ERROR" "Не удалось заменить оригинальный файл"
+                        log "DEBUG" "Текущий пользователь: $(whoami), права на файл: $(ls -la "$MAS_CONFIG_FILE")"
                         config_success=false
                     fi
                 fi
@@ -1030,7 +1031,7 @@ set_mas_config_value() {
             else
                 log "SUCCESS" "MAS API доступен - настройки применены успешно"
             fi
-        }
+        fi
     else
         log "ERROR" "MAS не запустился после изменения конфигурации"
         log "DEBUG" "Проверка логов systemd для matrix-auth-service..."
