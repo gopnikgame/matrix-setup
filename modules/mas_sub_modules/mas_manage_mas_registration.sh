@@ -193,37 +193,93 @@ check_yq_dependency() {
 # Инициализация секции account
 initialize_mas_account_section() {
     log "INFO" "Инициализация секции account в конфигурации MAS..."
+    log "DEBUG" "Путь к конфигурационному файлу: $MAS_CONFIG_FILE"
     
+    # Проверка существования файла конфигурации
     if [ ! -f "$MAS_CONFIG_FILE" ]; then
         log "ERROR" "Файл конфигурации MAS не найден: $MAS_CONFIG_FILE"
+        log "DEBUG" "Проверка существования директории: $(ls -la "$(dirname "$MAS_CONFIG_FILE")" 2>/dev/null || echo "Директория недоступна")"
         return 1
     fi
     
+    log "DEBUG" "Файл конфигурации существует, размер: $(stat -c %s "$MAS_CONFIG_FILE" 2>/dev/null || echo "неизвестно") байт"
+    
     # Проверяем, есть ли уже секция account
+    log "DEBUG" "Проверка наличия секции account в файле конфигурации"
     if sudo -u "$MAS_USER" yq eval '.account' "$MAS_CONFIG_FILE" >/dev/null 2>&1; then
+        log "DEBUG" "Секция account обнаружена в конфигурации"
         local account_content=$(sudo -u "$MAS_USER" yq eval '.account' "$MAS_CONFIG_FILE" 2>/dev/null)
+        
         if [ "$account_content" != "null" ] && [ -n "$account_content" ]; then
-            log "INFO" "Секция account уже существует"
+            log "INFO" "Секция account уже существует и содержит данные"
+            log "DEBUG" "Содержимое секции account: $(echo "$account_content" | head -c 100)..."
             return 0
+        else
+            log "DEBUG" "Секция account существует, но пуста или содержит null"
         fi
+    else
+        log "DEBUG" "Секция account отсутствует в конфигурации, требуется создание"
     fi
     
-    # Сохраняем текущие права
+    # Сохраняем текущие права доступа
+    log "DEBUG" "Сохранение текущих прав доступа к файлу конфигурации"
     local original_owner=$(stat -c "%U:%G" "$MAS_CONFIG_FILE" 2>/dev/null)
     local original_perms=$(stat -c "%a" "$MAS_CONFIG_FILE" 2>/dev/null)
+    log "DEBUG" "Текущий владелец: ${original_owner:-неизвестно}, права: ${original_perms:-неизвестно}"
     
-    # Временно даем права на запись
+    # Проверяем права на запись и временно изменяем их при необходимости
+    log "DEBUG" "Проверка прав на запись для пользователя $MAS_USER"
     if ! sudo -u "$MAS_USER" test -w "$MAS_CONFIG_FILE"; then
-        chown root:root "$MAS_CONFIG_FILE"
-        chmod 644 "$MAS_CONFIG_FILE"
+        log "WARN" "Пользователь $MAS_USER не имеет прав на запись в файл конфигурации"
+        log "DEBUG" "Временное изменение прав доступа для редактирования"
+        
+        if chown root:root "$MAS_CONFIG_FILE"; then
+            log "DEBUG" "Владелец временно изменен на root:root"
+        else
+            log "ERROR" "Не удалось изменить владельца файла"
+            return 1
+        fi
+        
+        if chmod 644 "$MAS_CONFIG_FILE"; then
+            log "DEBUG" "Права доступа временно изменены на 644"
+        else
+            log "ERROR" "Не удалось изменить права доступа файла"
+            # Пытаемся восстановить оригинального владельца
+            [ -n "$original_owner" ] && chown "$original_owner" "$MAS_CONFIG_FILE" 2>/dev/null
+            return 1
+        fi
+    else
+        log "DEBUG" "Пользователь $MAS_USER имеет права на запись в файл конфигурации"
     fi
     
     # Создаем резервную копию
+    log "DEBUG" "Создание резервной копии конфигурационного файла"
     backup_file "$MAS_CONFIG_FILE" "mas_config_account_init"
+    local backup_result=$?
+    local latest_backup=$(ls -t "$BACKUP_DIR"/mas_config_account_init_* 2>/dev/null | head -1)
+    
+    if [ $backup_result -eq 0 ] && [ -f "$latest_backup" ]; then
+        log "SUCCESS" "Резервная копия создана: $latest_backup"
+        log "DEBUG" "Размер резервной копии: $(stat -c %s "$latest_backup" 2>/dev/null || echo "неизвестно") байт"
+    else
+        log "WARN" "Проблема при создании резервной копии (код: $backup_result)"
+    fi
     
     log "INFO" "Добавление секции account в конфигурацию MAS..."
     
+    # Сохраняем контрольную сумму файла перед изменением
+    log "DEBUG" "Сохранение контрольной суммы файла перед изменением"
+    local checksum_before=""
+    if command -v md5sum >/dev/null 2>&1; then
+        checksum_before=$(md5sum "$MAS_CONFIG_FILE" 2>/dev/null | awk '{print $1}')
+        log "DEBUG" "MD5 до изменения: $checksum_before"
+    elif command -v sha1sum >/dev/null 2>&1; then
+        checksum_before=$(sha1sum "$MAS_CONFIG_FILE" 2>/dev/null | awk '{print $1}')
+        log "DEBUG" "SHA1 до изменения: $checksum_before"
+    fi
+    
     # Используем yq для добавления секции account
+    log "DEBUG" "Выполнение команды yq для добавления секции account"
     local yq_output=""
     local yq_exit_code=0
     
@@ -237,56 +293,150 @@ initialize_mas_account_section() {
         "account_deactivation_allowed": false
     }' "$MAS_CONFIG_FILE" 2>&1); then
         yq_exit_code=$?
-        log "ERROR" "Ошибка при выполнении yq: $yq_output"
+        log "ERROR" "Ошибка при выполнении yq (код: $yq_exit_code): $yq_output"
+        log "DEBUG" "Размер файла после ошибки: $(stat -c %s "$MAS_CONFIG_FILE" 2>/dev/null || echo "неизвестно") байт"
+    else
+        log "DEBUG" "Команда yq выполнена успешно"
+        log "DEBUG" "Размер файла после изменения: $(stat -c %s "$MAS_CONFIG_FILE" 2>/dev/null || echo "неизвестно") байт"
     fi
     
-    # Восстанавливаем права если нужно
+    # Проверяем контрольную сумму после изменения
+    if [ -n "$checksum_before" ]; then
+        log "DEBUG" "Проверка изменения контрольной суммы файла"
+        local checksum_after=""
+        if command -v md5sum >/dev/null 2>&1; then
+            checksum_after=$(md5sum "$MAS_CONFIG_FILE" 2>/dev/null | awk '{print $1}')
+            log "DEBUG" "MD5 после изменения: $checksum_after"
+        elif command -v sha1sum >/dev/null 2>&1; then
+            checksum_after=$(sha1sum "$MAS_CONFIG_FILE" 2>/dev/null | awk '{print $1}')
+            log "DEBUG" "SHA1 после изменения: $checksum_after"
+        fi
+        
+        if [ "$checksum_before" = "$checksum_after" ]; then
+            log "WARN" "Файл не изменился после выполнения yq (контрольные суммы совпадают)"
+        else
+            log "DEBUG" "Файл успешно изменен (контрольные суммы отличаются)"
+        fi
+    fi
+    
+    # Восстанавливаем оригинальные права доступа
+    log "DEBUG" "Восстановление оригинальных прав доступа"
     if [ -n "$original_owner" ]; then
-        chown "$original_owner" "$MAS_CONFIG_FILE"
-        chmod "$original_perms" "$MAS_CONFIG_FILE"
+        if chown "$original_owner" "$MAS_CONFIG_FILE"; then
+            log "DEBUG" "Оригинальный владелец восстановлен: $original_owner"
+        else
+            log "ERROR" "Не удалось восстановить оригинального владельца"
+        fi
     fi
     
+    if [ -n "$original_perms" ]; then
+        if chmod "$original_perms" "$MAS_CONFIG_FILE"; then
+            log "DEBUG" "Оригинальные права доступа восстановлены: $original_perms"
+        else
+            log "ERROR" "Не удалось восстановить оригинальные права доступа"
+        fi
+    fi
+    
+    # Проверяем результат выполнения yq
     if [ $yq_exit_code -eq 0 ]; then
-        log "SUCCESS" "Секция account добавлена"
+        log "SUCCESS" "Секция account успешно добавлена в конфигурацию"
         
         # Проверяем валидность YAML
+        log "DEBUG" "Проверка валидности YAML после модификации"
         if command -v python3 >/dev/null 2>&1; then
             if ! python3 -c "import yaml; yaml.safe_load(open('$MAS_CONFIG_FILE'))" 2>/dev/null; then
-                log "ERROR" "YAML поврежден после добавления секции account"
+                log "ERROR" "YAML файл поврежден после добавления секции account"
+                
                 # Восстанавливаем из резервной копии
-                local latest_backup=$(ls -t "$BACKUP_DIR"/mas_config_account_init_* 2>/dev/null | head -1)
                 if [ -n "$latest_backup" ] && [ -f "$latest_backup" ]; then
+                    log "INFO" "Восстановление конфигурации из резервной копии: $latest_backup"
                     if restore_file "$latest_backup" "$MAS_CONFIG_FILE"; then
-                        log "SUCCESS" "Конфигурация восстановлена из резервной копии"
+                        log "SUCCESS" "Конфигурация успешно восстановлена из резервной копии"
+                    else
+                        log "ERROR" "Не удалось восстановить конфигурацию из резервной копии"
                     fi
+                else
+                    log "ERROR" "Резервная копия не найдена для восстановления"
                 fi
                 return 1
+            else
+                log "DEBUG" "YAML файл валиден после модификации"
             fi
+        else
+            log "WARN" "Python3 не найден, пропуск проверки валидности YAML"
         fi
     else
-        log "ERROR" "Не удалось добавить секцию account"
+        log "ERROR" "Не удалось добавить секцию account (код ошибки: $yq_exit_code)"
+        
+        # Проверяем, не поврежден ли файл после неудачной попытки
+        if command -v python3 >/dev/null 2>&1; then
+            if ! python3 -c "import yaml; yaml.safe_load(open('$MAS_CONFIG_FILE'))" 2>/dev/null; then
+                log "ERROR" "YAML файл поврежден после неудачной попытки модификации"
+                if [ -n "$latest_backup" ] && [ -f "$latest_backup" ]; then
+                    log "INFO" "Восстановление из резервной копии после ошибки yq"
+                    if restore_file "$latest_backup" "$MAS_CONFIG_FILE"; then
+                        log "SUCCESS" "Конфигурация восстановлена после ошибки"
+                    fi
+                fi
+            else
+                log "DEBUG" "YAML файл остался валидным несмотря на ошибку yq"
+            fi
+        fi
         return 1
     fi
     
-    # Устанавливаем права
-    chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE" 2>/dev/null
-    chmod 600 "$MAS_CONFIG_FILE" 2>/dev/null
+    # Устанавливаем окончательные права доступа
+    log "DEBUG" "Установка окончательных прав доступа: владелец=$MAS_USER:$MAS_GROUP, права=600"
+    if chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE"; then
+        log "DEBUG" "Владелец файла установлен: $MAS_USER:$MAS_GROUP"
+    else
+        log "ERROR" "Не удалось установить владельца файла"
+    fi
     
-    # Перезапускаем MAS
-    log "INFO" "Перезапуск MAS для применения изменений..."
+    if chmod 600 "$MAS_CONFIG_FILE"; then
+        log "DEBUG" "Права доступа установлены: 600"
+    else
+        log "ERROR" "Не удалось установить права доступа"
+    fi
+    
+    # Финальная проверка прав доступа
+    local final_perms=$(stat -c "%a" "$MAS_CONFIG_FILE" 2>/dev/null)
+    local final_owner=$(stat -c "%U:%G" "$MAS_CONFIG_FILE" 2>/dev/null)
+    log "DEBUG" "Финальные права доступа: $final_perms, владелец: $final_owner"
+    
+    # Перезапускаем MAS для применения изменений
+    log "INFO" "Перезапуск Matrix Authentication Service для применения изменений..."
+    local restart_output=""
+    
     if restart_output=$(restart_service "matrix-auth-service" 2>&1); then
+        log "DEBUG" "Команда перезапуска выполнена успешно"
+        log "DEBUG" "Ожидание запуска службы (2 секунды)..."
         sleep 2
+        
         if systemctl is-active --quiet matrix-auth-service; then
-            log "SUCCESS" "MAS успешно перезапущен"
+            log "SUCCESS" "Matrix Authentication Service успешно запущен после перезапуска"
+            
+            # Дополнительная проверка доступности службы
+            log "DEBUG" "Проверка статуса службы..."
+            local service_status=$(systemctl status matrix-auth-service --no-pager 2>&1 | head -5)
+            log "DEBUG" "Статус службы: $service_status"
         else
-            log "ERROR" "MAS не запустился после изменения конфигурации"
+            log "ERROR" "Matrix Authentication Service не запустился после изменения конфигурации"
+            log "DEBUG" "Вывод systemctl status: $(systemctl status matrix-auth-service --no-pager -n 10 2>&1)"
+            
+            # Проверяем журнал systemd для диагностики
+            log "DEBUG" "Последние записи в журнале:"
+            journalctl -u matrix-auth-service -n 5 --no-pager 2>&1 | while read -r line; do
+                log "DEBUG" "  $line"
+            done
             return 1
         fi
     else
-        log "ERROR" "Ошибка перезапуска MAS: $restart_output"
+        log "ERROR" "Ошибка выполнения команды перезапуска: $restart_output"
         return 1
     fi
     
+    log "SUCCESS" "Инициализация секции account завершена успешно"
     return 0
 }
 
