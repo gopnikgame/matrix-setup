@@ -381,7 +381,7 @@ view_mas_account_config() {
         safe_echo "• Используйте пункты меню выше для включения настроек регистрации"
         safe_echo "• Секция account будет создана автоматически при первом изменении"
         return 1
-    }
+    fi
     
     log "DEBUG" "Получение содержимого секции account"
     local account_content=$(yq eval '.account' "$MAS_CONFIG_FILE" 2>/dev/null)
