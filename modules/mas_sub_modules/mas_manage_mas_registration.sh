@@ -1081,6 +1081,12 @@ manage_mas_registration_tokens() {
 manage_mas_registration() {
     print_header "УПРАВЛЕНИЕ РЕГИСТРАЦИЕЙ MAS" "$BLUE"
     
+        # Проверяем и исправляем установку yq
+    if ! check_and_fix_yq_installation; then
+        log "ERROR" "Не удалось обеспечить корректную установку yq"
+        return 1
+    fi
+
     if ! check_yq_dependency; then
         log "ERROR" "Невозможно продолжить без yq"
         read -p "Нажмите Enter для возврата..."
