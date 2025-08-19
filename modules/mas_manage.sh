@@ -528,6 +528,10 @@ initialize_mas_account_section() {
         return 1
     fi
     
+    # Проверяем версию yq
+    local yq_version=$(yq --version 2>/dev/null || echo "Unknown")
+    log "DEBUG" "Версия yq: $yq_version"
+    
     # Проверяем, есть ли уже секция account
     if yq eval '.account' "$MAS_CONFIG_FILE" >/dev/null 2>&1; then
         local account_content=$(yq eval '.account' "$MAS_CONFIG_FILE" 2>/dev/null)
@@ -536,6 +540,16 @@ initialize_mas_account_section() {
             return 0
         fi
     fi
+    
+    # Проверяем структуру текущего YAML файла до изменений
+    log "DEBUG" "Проверка структуры исходного YAML файла:"
+    local initial_sections=$(yq eval 'keys' "$MAS_CONFIG_FILE" 2>/dev/null)
+    log "DEBUG" "Существующие секции: $initial_sections"
+    
+    # Проверяем права доступа к файлу конфигурации
+    local file_perms=$(stat -c "%a" "$MAS_CONFIG_FILE" 2>/dev/null || ls -la "$MAS_CONFIG_FILE" | awk '{print $1}')
+    local file_owner=$(stat -c "%U:%G" "$MAS_CONFIG_FILE" 2>/dev/null || ls -la "$MAS_CONFIG_FILE" | awk '{print $3":"$4}')
+    log "DEBUG" "Права на файл конфигурации: $file_perms, владелец: $file_owner"
     
     # Подготавливаем безопасное редактирование
     if ! safe_config_edit "$MAS_CONFIG_FILE" "start"; then
@@ -552,8 +566,14 @@ initialize_mas_account_section() {
     log "INFO" "Попытка добавления секции account с помощью yq eval -i..."
     
     local config_success=false
+    local yq_error_output=""
     
-    if yq eval -i '.account = {
+    # Сохраняем текущее содержимое файла для диагностики
+    local original_content=$(cat "$MAS_CONFIG_FILE" 2>/dev/null)
+    log "DEBUG" "Размер исходного файла: $(echo "$original_content" | wc -l) строк"
+    
+    # Запускаем yq с перехватом ошибок
+    if ! yq_error_output=$(yq eval -i '.account = {
         "password_registration_enabled": false,
         "registration_token_required": false,
         "email_change_allowed": true,
@@ -561,9 +581,16 @@ initialize_mas_account_section() {
         "password_change_allowed": true,
         "password_recovery_enabled": false,
         "account_deactivation_allowed": false
-    }' "$MAS_CONFIG_FILE" 2>/dev/null; then
-        
+    }' "$MAS_CONFIG_FILE" 2>&1); then
+        log "ERROR" "yq вернул ошибку: $yq_error_output"
+    fi
+    
+    if [ -z "$yq_error_output" ]; then
         log "SUCCESS" "Секция account добавлена с помощью yq eval -i"
+        
+        # Проверяем содержимое файла после модификации
+        local modified_content=$(cat "$MAS_CONFIG_FILE" 2>/dev/null)
+        log "DEBUG" "Размер измененного файла: $(echo "$modified_content" | wc -l) строк"
         
         # Проверяем, что остальные секции остались на месте
         local required_sections=("http" "database" "matrix" "secrets")
@@ -572,6 +599,9 @@ initialize_mas_account_section() {
         for section in "${required_sections[@]}"; do
             if ! yq eval ".$section" "$MAS_CONFIG_FILE" >/dev/null 2>&1; then
                 missing_sections+=("$section")
+                log "DEBUG" "Отсутствует секция: $section"
+            else
+                log "DEBUG" "Секция $section сохранена"
             fi
         done
         
@@ -591,6 +621,19 @@ initialize_mas_account_section() {
     else
         # Метод 2: Альтернативный способ - создание нового файла
         log "WARN" "yq eval -i не сработал, используем альтернативный метод..."
+        log "DEBUG" "Ошибка yq: $yq_error_output"
+        
+        # Проверяем, поврежден ли файл после попытки использовать yq eval -i
+        if command -v python3 >/dev/null 2>&1; then
+            if ! python3 -c "import yaml; yaml.safe_load(open('$MAS_CONFIG_FILE'))" 2>/dev/null; then
+                log "ERROR" "YAML файл был поврежден после попытки yq eval -i, восстанавливаем из резервной копии"
+                local latest_backup=$(ls -t "$BACKUP_DIR"/mas_config_account_init_* 2>/dev/null | head -1)
+                if [ -n "$latest_backup" ] && [ -f "$latest_backup" ]; then
+                    cp "$latest_backup" "$MAS_CONFIG_FILE"
+                    log "INFO" "Конфигурация восстановлена из резервной копии"
+                fi
+            fi
+        fi
         
         # Создаем временную директорию с учетом возможных проблем с правами
         local temp_dir=""
@@ -600,6 +643,7 @@ initialize_mas_account_section() {
             if [ -w "$base_dir" ]; then
                 temp_dir=$(mktemp -d "${base_dir}/mas_config_XXXXXX" 2>/dev/null)
                 if [ -d "$temp_dir" ]; then
+                    log "DEBUG" "Создана временная директория: $temp_dir"
                     break
                 fi
             fi
@@ -607,6 +651,7 @@ initialize_mas_account_section() {
         
         if [ ! -d "$temp_dir" ]; then
             log "ERROR" "Не удалось создать временную директорию"
+            log "DEBUG" "Попытки создания в директориях: ${temp_base_dirs[*]}"
             safe_config_edit "$MAS_CONFIG_FILE" "end"
             return 1
         fi
@@ -614,15 +659,20 @@ initialize_mas_account_section() {
         local temp_file="$temp_dir/config.yaml"
         
         # Копируем оригинальный файл
+        log "DEBUG" "Копирование оригинального файла во временный файл: $temp_file"
         if ! cp "$MAS_CONFIG_FILE" "$temp_file"; then
             log "ERROR" "Не удалось скопировать конфигурацию во временный файл"
+            log "DEBUG" "Содержимое директории $temp_dir: $(ls -la $temp_dir 2>/dev/null)"
             rm -rf "$temp_dir"
             safe_config_edit "$MAS_CONFIG_FILE" "end"
             return 1
         fi
         
-        # Используем yq для создания нового файла с добавленной секцией
-        if yq eval '.account = {
+        log "DEBUG" "Размер временного файла: $(stat -c %s "$temp_file" 2>/dev/null || echo "unknown") байт"
+        
+        # Создаем файл с аккаунт-секцией
+        log "DEBUG" "Создаем файл с новой секцией account..."
+        local account_config='{
             "password_registration_enabled": false,
             "registration_token_required": false,
             "email_change_allowed": true,
@@ -630,12 +680,26 @@ initialize_mas_account_section() {
             "password_change_allowed": true,
             "password_recovery_enabled": false,
             "account_deactivation_allowed": false
-        }' "$temp_file" > "${temp_file}.new" 2>/dev/null; then
-            
+        }'
+        
+        # Используем yq для создания нового файла с добавленной секцией
+        local yq_alt_error=""
+        if ! yq_alt_error=$(yq eval ".account = $account_config" "$temp_file" > "${temp_file}.new" 2>&1); then
+            log "ERROR" "Альтернативный метод создания конфигурации не сработал"
+            log "DEBUG" "Ошибка: $yq_alt_error"
+            config_success=false
+        else
+            log "DEBUG" "Проверка созданного файла..."
             # Проверяем валидность YAML
             if command -v python3 >/dev/null 2>&1; then
-                if python3 -c "import yaml; yaml.safe_load(open('${temp_file}.new'))" 2>/dev/null; then
+                local py_error=""
+                if ! py_error=$(python3 -c "import yaml; yaml.safe_load(open('${temp_file}.new'))" 2>&1); then
+                    log "ERROR" "YAML поврежден после добавления секции account альтернативным методом"
+                    log "DEBUG" "Ошибка Python: $py_error"
+                    config_success=false
+                else
                     # Заменяем оригинальный файл
+                    log "DEBUG" "Замена оригинального файла..."
                     if mv "${temp_file}.new" "$MAS_CONFIG_FILE"; then
                         log "SUCCESS" "Секция account добавлена альтернативным методом"
                         config_success=true
@@ -643,12 +707,10 @@ initialize_mas_account_section() {
                         log "ERROR" "Не удалось заменить оригинальный файл"
                         config_success=false
                     fi
-                else
-                    log "ERROR" "YAML поврежден после добавления секции account альтернативным методом"
-                    config_success=false
                 fi
             else
                 # Если Python недоступен, просто заменяем файл
+                log "WARN" "Python не найден, пропускаем проверку YAML"
                 if mv "${temp_file}.new" "$MAS_CONFIG_FILE"; then
                     log "SUCCESS" "Секция account добавлена альтернативным методом (без проверки YAML)"
                     config_success=true
@@ -657,12 +719,9 @@ initialize_mas_account_section() {
                     config_success=false
                 fi
             fi
-        else
-            log "ERROR" "Альтернативный метод создания конфигурации не сработал"
-            config_success=false
         fi
         
-        # Удаляем временную директорию
+        # Очищаем временную директорию
         rm -rf "$temp_dir"
     fi
     
@@ -680,8 +739,10 @@ initialize_mas_account_section() {
     
     # Финальная проверка целостности конфигурации
     if command -v python3 >/dev/null 2>&1; then
-        if ! python3 -c "import yaml; yaml.safe_load(open('$MAS_CONFIG_FILE'))" 2>/dev/null; then
+        local py_final_error=""
+        if ! py_final_error=$(python3 -c "import yaml; yaml.safe_load(open('$MAS_CONFIG_FILE'))" 2>&1); then
             log "ERROR" "YAML поврежден после добавления секции account!"
+            log "DEBUG" "Ошибка Python: $py_final_error"
             log "ERROR" "Восстанавливаю из резервной копии..."
             local latest_backup=$(ls -t "$BACKUP_DIR"/mas_config_account_init_* 2>/dev/null | head -1)
             if [ -n "$latest_backup" ] && [ -f "$latest_backup" ]; then
@@ -690,6 +751,8 @@ initialize_mas_account_section() {
             fi
             safe_config_edit "$MAS_CONFIG_FILE" "end"
             return 1
+        else
+            log "DEBUG" "Финальная проверка YAML успешна"
         fi
     fi
     
@@ -699,10 +762,11 @@ initialize_mas_account_section() {
         if [ "$account_check" = "false" ]; then
             log "SUCCESS" "Секция account успешно добавлена и проверена"
         else
-            log "WARN" "Секция account добавлена, но содержимое неожиданное"
+            log "WARN" "Секция account добавлена, но содержимое неожиданное: $account_check"
         fi
     else
         log "ERROR" "Секция account не была добавлена"
+        log "DEBUG" "Текущая структура файла: $(yq eval 'keys' "$MAS_CONFIG_FILE" 2>/dev/null || echo "не удалось прочитать")"
         safe_config_edit "$MAS_CONFIG_FILE" "end"
         return 1
     fi
@@ -728,6 +792,11 @@ set_mas_config_value() {
     fi
     
     log "INFO" "Изменение настройки $key на $value..."
+    
+    # Проверяем версию yq
+    local yq_version=$(yq --version 2>/dev/null || echo "Unknown")
+    log "DEBUG" "Версия yq: $yq_version"
+    
     local full_path=""
     case "$key" in
         "password_registration_enabled"|"registration_token_required"|"email_change_allowed"|"displayname_change_allowed"|"password_change_allowed"|"password_recovery_enabled"|"account_deactivation_allowed")
@@ -757,28 +826,68 @@ set_mas_config_value() {
             ;;
     esac
     
+    # Проверяем права доступа к файлу конфигурации до изменений
+    local file_perms=$(stat -c "%a" "$MAS_CONFIG_FILE" 2>/dev/null || ls -la "$MAS_CONFIG_FILE" | awk '{print $1}')
+    local file_owner=$(stat -c "%U:%G" "$MAS_CONFIG_FILE" 2>/dev/null || ls -la "$MAS_CONFIG_FILE" | awk '{print $3":"$4}')
+    log "DEBUG" "Права на файл конфигурации до изменений: $file_perms, владелец: $file_owner"
+    
     # Подготавливаем безопасное редактирование
     if ! safe_config_edit "$MAS_CONFIG_FILE" "start"; then
         log "ERROR" "Не удалось подготовить файл для редактирования"
         return 1
     fi
     
-    # 创建备份
+    # Создаем резервную копию
     backup_file "$MAS_CONFIG_FILE" "mas_config_change"
     
     local config_success=false
+    local yq_error_output=""
     
     # Применяем изменение с помощью yq eval -i
     log "INFO" "Применение изменения $full_path = $value..."
     
-    if yq eval -i "$full_path = $value" "$MAS_CONFIG_FILE" 2>/dev/null; then
+    # Сохраняем текущее содержимое файла для диагностики
+    local original_content=$(cat "$MAS_CONFIG_FILE" 2>/dev/null)
+    log "DEBUG" "Размер исходного файла: $(echo "$original_content" | wc -l) строк"
+    
+    # Запускаем yq с перехватом ошибок
+    if ! yq_error_output=$(yq eval -i "$full_path = $value" "$MAS_CONFIG_FILE" 2>&1); then
+        log "ERROR" "yq вернул ошибку при применении изменений: $yq_error_output"
+    fi
+    
+    if [ -z "$yq_error_output" ]; then
         log "SUCCESS" "Изменение применено с помощью yq eval -i"
-        config_success=true
-    else
-        log "ERROR" "Не удалось изменить $key в $MAS_CONFIG_FILE с помощью yq eval -i"
         
+        # Проверяем содержимое файла после модификации
+        local modified_content=$(cat "$MAS_CONFIG_FILE" 2>/dev/null)
+        log "DEBUG" "Размер измененного файла: $(echo "$modified_content" | wc -l) строк"
+        
+        # Проверяем, что изменение действительно применилось
+        local check_value=$(yq eval "$full_path" "$MAS_CONFIG_FILE" 2>/dev/null)
+        if [ "$check_value" = "$value" ]; then
+            log "DEBUG" "Значение $key успешно изменено на $value"
+            config_success=true
+        else
+            log "WARN" "Ожидалось значение '$value', но получено '$check_value'"
+            config_success=false
+        fi
+        
+    else
         # Альтернативный метод: создаем новый файл с изменениями
         log "WARN" "Пробуем альтернативный метод изменения конфигурации..."
+        log "DEBUG" "Ошибка yq: $yq_error_output"
+        
+        # Проверяем, поврежден ли файл после попытки использовать yq eval -i
+        if command -v python3 >/dev/null 2>&1; then
+            if ! python3 -c "import yaml; yaml.safe_load(open('$MAS_CONFIG_FILE'))" 2>/dev/null; then
+                log "ERROR" "YAML файл был поврежден после попытки yq eval -i, восстанавливаем из резервной копии"
+                local latest_backup=$(ls -t "$BACKUP_DIR"/mas_config_change_* 2>/dev/null | head -1)
+                if [ -n "$latest_backup" ] && [ -f "$latest_backup" ]; then
+                    cp "$latest_backup" "$MAS_CONFIG_FILE"
+                    log "INFO" "Конфигурация восстановлена из резервной копии"
+                fi
+            fi
+        fi
         
         # Создаем временную директорию с учетом возможных проблем с правами
         local temp_dir=""
@@ -788,6 +897,7 @@ set_mas_config_value() {
             if [ -w "$base_dir" ]; then
                 temp_dir=$(mktemp -d "${base_dir}/mas_config_update_XXXXXX" 2>/dev/null)
                 if [ -d "$temp_dir" ]; then
+                    log "DEBUG" "Создана временная директория: $temp_dir"
                     break
                 fi
             fi
@@ -795,32 +905,60 @@ set_mas_config_value() {
         
         if [ ! -d "$temp_dir" ]; then
             log "ERROR" "Не удалось создать временную директорию"
+            log "DEBUG" "Попытки создания в директориях: ${temp_base_dirs[*]}"
             safe_config_edit "$MAS_CONFIG_FILE" "end"
             return 1
         fi
         
         local temp_file="$temp_dir/config.yaml"
         
+        # Копируем оригинальный файл
+        log "DEBUG" "Копирование оригинального файла во временный файл: $temp_file"
+        if ! cp "$MAS_CONFIG_FILE" "$temp_file"; then
+            log "ERROR" "Не удалось скопировать конфигурацию во временный файл"
+            log "DEBUG" "Содержимое директории $temp_dir: $(ls -la $temp_dir 2>/dev/null)"
+            rm -rf "$temp_dir"
+            safe_config_edit "$MAS_CONFIG_FILE" "end"
+            return 1
+        fi
+        
         # Используем yq для создания нового файла с изменениями
-        if yq eval "$full_path = $value" "$MAS_CONFIG_FILE" > "$temp_file" 2>/dev/null; then
+        local yq_alt_error=""
+        if ! yq_alt_error=$(yq eval "$full_path = $value" "$temp_file" > "${temp_file}.new" 2>&1); then
+            log "ERROR" "Альтернативный метод также не сработал"
+            log "DEBUG" "Ошибка: $yq_alt_error"
+            config_success=false
+        else
             # Проверяем валидность YAML
             if command -v python3 >/dev/null 2>&1; then
-                if python3 -c "import yaml; yaml.safe_load(open('$temp_file'))" 2>/dev/null; then
+                local py_error=""
+                if ! py_error=$(python3 -c "import yaml; yaml.safe_load(open('${temp_file}.new'))" 2>&1); then
+                    log "ERROR" "YAML поврежден после изменений альтернативным методом"
+                    log "DEBUG" "Ошибка Python: $py_error"
+                    config_success=false
+                else
                     # Заменяем оригинальный файл
-                    if mv "$temp_file" "$MAS_CONFIG_FILE"; then
+                    log "DEBUG" "Замена оригинального файла..."
+                    if mv "${temp_file}.new" "$MAS_CONFIG_FILE"; then
                         log "SUCCESS" "Изменение применено альтернативным методом"
-                        config_success=true
+                        # Проверяем, что изменение действительно применилось
+                        local alt_check_value=$(yq eval "$full_path" "$MAS_CONFIG_FILE" 2>/dev/null)
+                        if [ "$alt_check_value" = "$value" ]; then
+                            log "DEBUG" "Значение $key успешно изменено на $value альтернативным методом"
+                            config_success=true
+                        else
+                            log "WARN" "Альтернативный метод: ожидалось значение '$value', но получено '$alt_check_value'"
+                            config_success=false
+                        fi
                     else
                         log "ERROR" "Не удалось заменить оригинальный файл"
                         config_success=false
                     fi
-                else
-                    log "ERROR" "YAML поврежден после изменений альтернативным методом"
-                    config_success=false
                 fi
             else
                 # Если Python недоступен, просто заменяем файл
-                if mv "$temp_file" "$MAS_CONFIG_FILE"; then
+                log "WARN" "Python не найден, пропускаем проверку YAML"
+                if mv "${temp_file}.new" "$MAS_CONFIG_FILE"; then
                     log "SUCCESS" "Изменение применено альтернативным методом (без проверки YAML)"
                     config_success=true
                 else
@@ -828,9 +966,6 @@ set_mas_config_value() {
                     config_success=false
                 fi
             fi
-        else
-            log "ERROR" "Альтернативный метод также не сработал"
-            config_success=false
         fi
         
         # Очищаем временную директорию
@@ -886,15 +1021,23 @@ set_mas_config_value() {
         
         if [ -n "$mas_port" ]; then
             local health_url="http://localhost:$mas_port/health"
-            if curl -s -f --connect-timeout 5 "$health_url" >/dev/null 2>&1; then
-                log "SUCCESS" "MAS API доступен - настройки применены успешно"
+            log "DEBUG" "Проверка доступности API по URL: $health_url"
+            local curl_output=""
+            local curl_status=""
+            if ! curl_output=$(curl -s -f --connect-timeout 5 "$health_url" 2>&1); then
+                curl_status=$?
+                log "WARN" "MAS API недоступен (код ошибки: $curl_status): $curl_output"
             else
-                log "WARN" "MAS запущен, но API пока недоступен"
+                log "SUCCESS" "MAS API доступен - настройки применены успешно"
             fi
-        fi
+        }
     else
         log "ERROR" "MAS не запустился после изменения конфигурации"
-        log "INFO" "Проверьте логи: journalctl -u matrix-auth-service -n 20"
+        log "DEBUG" "Проверка логов systemd для matrix-auth-service..."
+        systemctl status matrix-auth-service --no-pager -l 2>&1 | head -20 | while IFS= read -r line; do
+            log "DEBUG" "  $line"
+        done
+        log "INFO" "Проверьте полные логи: journalctl -u matrix-auth-service -n 20"
         return 1
     fi
     
