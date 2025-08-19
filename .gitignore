@@ -470,3 +470,10 @@ modules/fix_mas_policy_missing_files.sh
 fix_mas_issues.sh
 docs/mas-fixes-summary.md
 test_mas_fixes.sh
+MAS_FIXES_IMPLEMENTATION_SUMMARY.md
+MAS_INTEGRATION_COMPLETE.md
+fix_mas_config_editing.sh
+docs/mas-config-editing-fix-complete.md
+test_mas_config_fixes.sh
+test_mas_fixes_simple.sh
+test_mas_integration.sh
