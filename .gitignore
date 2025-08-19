@@ -477,3 +477,5 @@ docs/mas-config-editing-fix-complete.md
 test_mas_config_fixes.sh
 test_mas_fixes_simple.sh
 test_mas_integration.sh
+MAS_SUBMODULES_FIX_REPORT.md
+quick_mas_diagnostic.sh
