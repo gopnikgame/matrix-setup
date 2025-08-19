@@ -499,40 +499,88 @@ view_mas_account_config() {
 
 # Получение статуса открытой регистрации MAS
 get_mas_registration_status() {
+    log "DEBUG" "Запуск get_mas_registration_status"
+    
     if [ ! -f "$MAS_CONFIG_FILE" ]; then
+        log "ERROR" "Файл конфигурации MAS не найден: $MAS_CONFIG_FILE"
+        log "DEBUG" "Возвращаем статус: unknown"
         echo "unknown"
         return 1
     fi
+    
     if ! check_yq_dependency; then
+        log "ERROR" "Невозможно продолжить без yq"
+        log "DEBUG" "Возвращаем статус: unknown"
         echo "unknown"
         return 1
     fi
-    local status=$(yq eval '.account.password_registration_enabled' "$MAS_CONFIG_FILE" 2>/dev/null)
+    
+    log "DEBUG" "Получение значения параметра password_registration_enabled"
+    local status=""
+    local status_error=0
+    
+    if ! status=$(yq eval '.account.password_registration_enabled' "$MAS_CONFIG_FILE" 2>&1); then
+        status_error=$?
+        log "DEBUG" "Ошибка при получении password_registration_enabled (код: $status_error): $status"
+        log "DEBUG" "Возвращаем статус: unknown"
+        echo "unknown"
+        return 1
+    fi
+    
+    log "DEBUG" "Полученное значение: $status"
+    
     if [ "$status" = "true" ]; then
+        log "DEBUG" "Возвращаем статус: enabled"
         echo "enabled"
     elif [ "$status" = "false" ]; then
+        log "DEBUG" "Возвращаем статус: disabled"
         echo "disabled" 
     else
+        log "DEBUG" "Возвращаем статус: unknown (неожиданное значение: $status)"
         echo "unknown"
     fi
 }
 
 # Получение статуса регистрации по токенам
 get_mas_token_registration_status() {
+    log "DEBUG" "Запуск get_mas_token_registration_status"
+    
     if [ ! -f "$MAS_CONFIG_FILE" ]; then
+        log "ERROR" "Файл конфигурации MAS не найден: $MAS_CONFIG_FILE"
+        log "DEBUG" "Возвращаем статус: unknown"
         echo "unknown"
         return 1
     fi
+    
     if ! check_yq_dependency; then
+        log "ERROR" "Невозможно продолжить без yq"
+        log "DEBUG" "Возвращаем статус: unknown"
         echo "unknown"
         return 1
     fi
-    local status=$(yq eval '.account.registration_token_required' "$MAS_CONFIG_FILE" 2>/dev/null)
+    
+    log "DEBUG" "Получение значения параметра registration_token_required"
+    local status=""
+    local status_error=0
+    
+    if ! status=$(yq eval '.account.registration_token_required' "$MAS_CONFIG_FILE" 2>&1); then
+        status_error=$?
+        log "DEBUG" "Ошибка при получении registration_token_required (код: $status_error): $status"
+        log "DEBUG" "Возвращаем статус: unknown"
+        echo "unknown"
+        return 1
+    fi
+    
+    log "DEBUG" "Полученное значение: $status"
+    
     if [ "$status" = "true" ]; then
+        log "DEBUG" "Возвращаем статус: enabled"
         echo "enabled"
     elif [ "$status" = "false" ]; then
+        log "DEBUG" "Возвращаем статус: disabled"
         echo "disabled"
     else
+        log "DEBUG" "Возвращаем статус: unknown (неожиданное значение: $status)"
         echo "unknown"
     fi
 }
@@ -549,16 +597,33 @@ generate_ulid() {
 create_registration_token() {
     print_header "СОЗДАНИЕ ТОКЕНА РЕГИСТРАЦИИ" "$CYAN"
     
+    log "DEBUG" "Запуск create_registration_token"
+    
     safe_echo "${BOLD}Параметры токена регистрации:${NC}"
     safe_echo "• ${BLUE}Кастомный токен${NC} - используйте свою строку или оставьте пустым для автогенерации"
     safe_echo "• ${BLUE}Лимит использований${NC} - количество раз, которое можно использовать токен"
     safe_echo "• ${BLUE}Срок действия${NC} - время жизни токена в секундах"
     echo
     
+    # Проверяем, что MAS запущен
+    if ! systemctl is-active --quiet matrix-auth-service; then
+        log "ERROR" "MAS не запущен, невозможно создать токен"
+        safe_echo "${RED}❌ Matrix Authentication Service не запущен!${NC}"
+        safe_echo "${YELLOW}Для создания токенов MAS должен быть запущен.${NC}"
+        return 1
+    else
+        log "DEBUG" "MAS запущен, продолжаем создание токена"
+    fi
+    
     # Параметры токена
     read -p "Введите кастомный токен (или оставьте пустым для автогенерации): " custom_token
+    log "DEBUG" "Введен кастомный токен: '${custom_token:-пусто}'"
+    
     read -p "Лимит использований (или оставьте пустым для неограниченного): " usage_limit
+    log "DEBUG" "Введен лимит использований: '${usage_limit:-пусто}'"
+    
     read -p "Срок действия в секундах (или оставьте пустым для бессрочного): " expires_in
+    log "DEBUG" "Введен срок действия: '${expires_in:-пусто}' секунд"
     
     # Формируем команду
     local cmd="mas manage issue-user-registration-token --config $MAS_CONFIG_FILE"
@@ -569,7 +634,8 @@ create_registration_token() {
     
     if [ -n "$usage_limit" ]; then
         if [[ ! "$usage_limit" =~ ^[0-9]+$ ]]; then
-            log "ERROR" "Лимит использований должен быть числом"
+            log "ERROR" "Лимит использований должен быть числом: '$usage_limit'"
+            safe_echo "${RED}❌ Ошибка: Лимит использований должен быть числом${NC}"
             return 1
         fi
         cmd="$cmd --usage-limit $usage_limit"
@@ -577,7 +643,8 @@ create_registration_token() {
     
     if [ -n "$expires_in" ]; then
         if [[ ! "$expires_in" =~ ^[0-9]+$ ]]; then
-            log "ERROR" "Срок действия должен быть числом в секундах"
+            log "ERROR" "Срок действия должен быть числом в секундах: '$expires_in'"
+            safe_echo "${RED}❌ Ошибка: Срок действия должен быть числом в секундах${NC}"
             return 1
         fi
         cmd="$cmd --expires-in $expires_in"
@@ -586,32 +653,86 @@ create_registration_token() {
     log "INFO" "Создание токена регистрации..."
     log "DEBUG" "Команда: $cmd"
     
+    # Проверяем наличие пользователя MAS
+    if ! id -u "$MAS_USER" >/dev/null 2>&1; then
+        log "ERROR" "Пользователь $MAS_USER не существует"
+        safe_echo "${RED}❌ Ошибка: Пользователь $MAS_USER не существует${NC}"
+        return 1
+    fi
+    
+    # Проверяем доступность утилиты mas
+    if ! command -v mas >/dev/null 2>&1; then
+        log "ERROR" "Утилита 'mas' не найдена"
+        safe_echo "${RED}❌ Ошибка: Утилита 'mas' не найдена${NC}"
+        safe_echo "${YELLOW}Убедитесь, что MAS установлен корректно${NC}"
+        return 1
+    fi
+    
     # Выполняем команду как пользователь MAS
     local output
-    if output=$(sudo -u "$MAS_USER" eval "$cmd" 2>&1); then
-        log "SUCCESS" "Токен регистрации создан"
-        echo
-        safe_echo "${BOLD}${GREEN}Созданный токен:${NC}"
-        safe_echo "${CYAN}$output${NC}"
-        echo
-        safe_echo "${YELLOW}📝 Сохраните этот токен - он больше не будет показан!${NC}"
-        safe_echo "${BLUE}Передайте токен пользователю для регистрации${NC}"
-    else
-        log "ERROR" "Ошибка создания токена регистрации"
+    local exit_code=0
+    
+    log "DEBUG" "Выполнение команды от имени пользователя $MAS_USER"
+    if ! output=$(sudo -u "$MAS_USER" eval "$cmd" 2>&1); then
+        exit_code=$?
+        log "ERROR" "Ошибка создания токена регистрации (код: $exit_code)"
         log "ERROR" "Вывод: $output"
+        
+        safe_echo "${RED}❌ Ошибка создания токена регистрации${NC}"
+        safe_echo "${YELLOW}Вывод команды:${NC}"
+        safe_echo "$output"
         echo
         safe_echo "${YELLOW}Возможные причины ошибки:${NC}"
         safe_echo "• MAS не запущен (проверьте: systemctl status matrix-auth-service)"
         safe_echo "• Проблемы с базой данных"
         safe_echo "• Недостаточные права пользователя $MAS_USER"
         safe_echo "• Проблемы с конфигурацией MAS"
+        
+        log "DEBUG" "Дополнительная диагностика:"
+        log "DEBUG" "Статус сервиса: $(systemctl is-active matrix-auth-service 2>&1)"
+        log "DEBUG" "Права на конфигурационный файл: $(ls -la "$MAS_CONFIG_FILE" 2>&1)"
+        log "DEBUG" "Последние логи сервиса:"
+        journalctl -u matrix-auth-service -n 5 --no-pager 2>&1 | while read -r line; do
+            log "DEBUG" "  $line"
+        done
+        
         return 1
     fi
+    
+    log "SUCCESS" "Токен регистрации создан"
+    log "DEBUG" "Созданный токен: $output"
+    
+    echo
+    safe_echo "${BOLD}${GREEN}Созданный токен:${NC}"
+    safe_echo "${CYAN}$output${NC}"
+    echo
+    safe_echo "${YELLOW}📝 Сохраните этот токен - он больше не будет показан!${NC}"
+    safe_echo "${BLUE}Передайте токен пользователю для регистрации${NC}"
+    
+    # Создаем запись в журнале (без токена по соображениям безопасности)
+    if [ -n "$custom_token" ]; then
+        log "INFO" "Создан пользовательский токен регистрации: [СКРЫТО]"
+    else
+        log "INFO" "Создан автоматически сгенерированный токен регистрации: [СКРЫТО]"
+    fi
+    
+    if [ -n "$usage_limit" ]; then
+        log "INFO" "Лимит использований токена: $usage_limit"
+    fi
+    
+    if [ -n "$expires_in" ]; then
+        log "INFO" "Срок действия токена: $expires_in секунд"
+    fi
+    
+    log "DEBUG" "Завершение create_registration_token"
+    return 0
 }
 
 # Показ информации о токенах
 show_registration_tokens_info() {
     print_header "ИНФОРМАЦИЯ О ТОКЕНАХ РЕГИСТРАЦИИ" "$CYAN"
+    
+    log "DEBUG" "Запуск show_registration_tokens_info"
     
     safe_echo "${BOLD}Что такое токены регистрации?${NC}"
     safe_echo "Токены регистрации позволяют контролировать регистрацию пользователей."
@@ -652,89 +773,151 @@ show_registration_tokens_info() {
     safe_echo "• ${YELLOW}Используйте токены с ограниченным сроком действия${NC}"
     safe_echo "• ${YELLOW}Отслеживайте использование токенов${NC}"
     safe_echo "• ${YELLOW}Удаляйте неиспользованные токены${NC}"
+    
+    # Проверяем текущее состояние регистрации по токенам
+    log "DEBUG" "Проверка текущего статуса регистрации по токенам"
+    local token_status=$(get_mas_token_registration_status)
+    log "DEBUG" "Текущий статус регистрации по токенам: $token_status"
+    
+    if [ "$token_status" = "enabled" ]; then
+        echo
+        safe_echo "${GREEN}ℹ️  Требование токенов регистрации сейчас: ВКЛЮЧЕНО${NC}"
+    elif [ "$token_status" = "disabled" ]; then
+        echo
+        safe_echo "${RED}⚠️  Требование токенов регистрации сейчас: ОТКЛЮЧЕНО${NC}"
+        safe_echo "${YELLOW}Для использования токенов включите регистрацию по токенам в меню управления.${NC}"
+    fi
+    
+    log "DEBUG" "Завершение show_registration_tokens_info"
 }
 
 # Управление токенами регистрации MAS
 manage_mas_registration_tokens() {
     print_header "УПРАВЛЕНИЕ ТОКЕНАМИ РЕГИСТРАЦИИ MAS" "$BLUE"
     
+    log "DEBUG" "Запуск manage_mas_registration_tokens"
+    
     # Проверка наличия yq
     if ! check_yq_dependency; then
+        log "ERROR" "Невозможно продолжить без yq"
         read -p "Нажмите Enter для возврата..."
         return 1
     fi
     
     # Проверяем, что MAS запущен
+    log "DEBUG" "Проверка статуса службы matrix-auth-service"
     if ! systemctl is-active --quiet matrix-auth-service; then
         log "WARN" "Matrix Authentication Service не запущен"
         log "INFO" "Для создания токенов MAS должен быть запущен"
+        
+        safe_echo "${RED}❌ Matrix Authentication Service не запущен!${NC}"
+        safe_echo "${YELLOW}Для создания токенов MAS должен быть запущен.${NC}"
+        
         if ask_confirmation "Попробовать запустить MAS?"; then
-            if restart_service "matrix-auth-service"; then
+            log "INFO" "Попытка запуска MAS"
+            
+            local restart_output=""
+            if restart_output=$(restart_service "matrix-auth-service" 2>&1); then
+                log "DEBUG" "Команда перезапуска выполнена: $restart_output"
+                log "INFO" "Ожидание запуска службы (2 секунды)..."
                 sleep 2
+                
                 if systemctl is-active --quiet matrix-auth-service; then
                     log "SUCCESS" "MAS успешно запущен"
+                    safe_echo "${GREEN}✅ MAS успешно запущен${NC}"
                 else
                     log "ERROR" "Не удалось запустить MAS"
+                    log "DEBUG" "Вывод systemctl status: $(systemctl status matrix-auth-service --no-pager -n 5 2>&1)"
+                    
+                    safe_echo "${RED}❌ Не удалось запустить MAS${NC}"
+                    safe_echo "${YELLOW}Проверьте логи: journalctl -u matrix-auth-service -n 20${NC}"
                     read -p "Нажмите Enter для возврата..."
                     return 1
                 fi
             else
-                log "ERROR" "Ошибка запуска MAS"
+                log "ERROR" "Ошибка запуска MAS: $restart_output"
+                safe_echo "${RED}❌ Ошибка запуска MAS${NC}"
+                safe_echo "${YELLOW}Ошибка: $restart_output${NC}"
                 read -p "Нажмите Enter для возврата..."
                 return 1
             fi
         else
+            log "INFO" "Пользователь отказался от запуска MAS"
             read -p "Нажмите Enter для возврата..."
             return 1
         fi
+    else
+        log "DEBUG" "MAS запущен, продолжаем"
     fi
 
     while true; do
         # Показываем текущий статус токенов
+        log "DEBUG" "Получение текущего статуса токенов"
         local token_status=$(get_mas_token_registration_status)
+        log "DEBUG" "Текущий статус токенов: $token_status"
         
         safe_echo "Текущий статус:"
         case "$token_status" in
-            "enabled") safe_echo "• Токены регистрации: ${GREEN}ТРЕБУЮТСЯ${NC}" ;;
-            "disabled") safe_echo "• Токены регистрации: ${RED}НЕ ТРЕБУЮТСЯ${NC}" ;;
-            *) safe_echo "• Токены регистрации: ${YELLOW}НЕИЗВЕСТНО${NC}" ;;
+            "enabled") 
+                safe_echo "• Токены регистрации: ${GREEN}ТРЕБУЮТСЯ${NC}"
+                log "DEBUG" "Токены регистрации требуются"
+                ;;
+            "disabled") 
+                safe_echo "• Токены регистрации: ${RED}НЕ ТРЕБУЮТСЯ${NC}"
+                log "DEBUG" "Токены регистрации не требуются"
+                ;;
+            *) 
+                safe_echo "• Токены регистрации: ${YELLOW}НЕИЗВЕСТНО${NC}"
+                log "WARN" "Неизвестный статус токенов: $token_status"
+                ;;
         esac
         
         # Показываем статус MAS
+        log "DEBUG" "Проверка статуса службы matrix-auth-service"
         if systemctl is-active --quiet matrix-auth-service; then
             safe_echo "• MAS служба: ${GREEN}АКТИВНА${NC}"
+            log "DEBUG" "MAS служба активна"
         else
             safe_echo "• MAS служба: ${RED}НЕ АКТИВНА${NC}"
+            log "WARN" "MAS служба не активна"
         fi
         
         echo
         safe_echo "${BOLD}Управление токенами регистрации:${NC}"
         safe_echo "1. ${GREEN}✅ Включить требование токенов регистрации${NC}"
         safe_echo "2. ${RED}❌ Отключить требование токенов регистрации${NC}"
-        safe_echo "3. ${BLUE}🎫 Создать новый токен регистрации${NC}"
+        safe_echo "3. ${BLUE}Создать новый токен регистрации${NC}"
         safe_echo "4. ${CYAN}ℹ️  Показать информацию о токенах${NC}"
         safe_echo "5. ${WHITE}↩️  Назад${NC}"
 
         read -p "Выберите действие [1-5]: " action
+        log "DEBUG" "Выбрано действие: $action"
 
         case $action in
             1)
+                log "INFO" "Включение требования токенов регистрации"
                 set_mas_config_value "registration_token_required" "true"
                 ;;
             2)
+                log "INFO" "Отключение требования токенов регистрации"
                 set_mas_config_value "registration_token_required" "false"
                 ;;
             3)
+                log "INFO" "Создание нового токена регистрации"
                 create_registration_token
                 ;;
             4)
+                log "INFO" "Отображение информации о токенах"
                 show_registration_tokens_info
                 ;;
             5)
+                log "INFO" "Возврат в предыдущее меню"
+                log "DEBUG" "Завершение manage_mas_registration_tokens"
                 return 0
                 ;;
             *)
-                log "ERROR" "Некорректный ввод. Попробуйте ещё раз."
+                log "ERROR" "Некорректный ввод: $action"
+                safe_echo "${RED}❌ Некорректный ввод. Попробуйте ещё раз.${NC}"
                 sleep 1
                 ;;
         esac
@@ -742,6 +925,7 @@ manage_mas_registration_tokens() {
         if [ $action -ne 5 ]; then
             echo
             read -p "Нажмите Enter для продолжения..."
+            log "DEBUG" "Пользователь нажал Enter для продолжения"
         fi
     done
 }
@@ -749,8 +933,11 @@ manage_mas_registration_tokens() {
 # Меню управления регистрацией MAS
 manage_mas_registration() {
     print_header "УПРАВЛЕНИЕ РЕГИСТРАЦИЕЙ MATRIX AUTHENTICATION SERVICE" "$BLUE"
+    
+    log "DEBUG" "Запуск manage_mas_registration"
 
     if ! check_yq_dependency; then
+        log "ERROR" "Невозможно продолжить без yq"
         read -p "Нажмите Enter для возврата..."
         return 1
     fi
@@ -758,34 +945,74 @@ manage_mas_registration() {
     # Проверяем существование конфигурационного файла
     if [ ! -f "$MAS_CONFIG_FILE" ]; then
         log "ERROR" "Файл конфигурации MAS не найден: $MAS_CONFIG_FILE"
-        log "INFO" "Убедитесь, что MAS установлен и настроен"
+        log "DEBUG" "Проверка директории: $(ls -la "$(dirname "$MAS_CONFIG_FILE")" 2>/dev/null || echo "Директория недоступна")"
+        
+        safe_echo "${RED}❌ Файл конфигурации MAS не найден: $MAS_CONFIG_FILE${NC}"
+        safe_echo "${YELLOW}Убедитесь, что MAS установлен и настроен${NC}"
         read -p "Нажмите Enter для возврата..."
         return 1
     fi
 
+    log "DEBUG" "Проверка прав доступа к файлу $MAS_CONFIG_FILE"
+    local file_perms=$(stat -c "%a" "$MAS_CONFIG_FILE" 2>/dev/null || ls -la "$MAS_CONFIG_FILE" | awk '{print $1}')
+    local file_owner=$(stat -c "%U:%G" "$MAS_CONFIG_FILE" 2>/dev/null || ls -la "$MAS_CONFIG_FILE" | awk '{print $3":"$4}')
+    log "DEBUG" "Права на файл: $file_perms, владелец: $file_owner"
+
     while true; do
         # Показываем текущий статус
+        log "DEBUG" "Получение текущего статуса регистрации"
         local current_status=$(get_mas_registration_status)
         local token_status=$(get_mas_token_registration_status)
+        log "DEBUG" "Текущий статус открытой регистрации: $current_status, статус токенов: $token_status"
         
         safe_echo "${BOLD}Текущий статус регистрации:${NC}"
         case "$current_status" in
-            "enabled") safe_echo "• Открытая регистрация: ${GREEN}ВКЛЮЧЕНА${NC}" ;;
-            "disabled") safe_echo "• Открытая регистрация: ${RED}ОТКЛЮЧЕНА${NC}" ;;
-            *) safe_echo "• Открытая регистрация: ${YELLOW}НЕИЗВЕСТНО${NC}" ;;
+            "enabled") 
+                safe_echo "• Открытая регистрация: ${GREEN}ВКЛЮЧЕНА${NC}"
+                log "DEBUG" "Открытая регистрация включена"
+                ;;
+            "disabled") 
+                safe_echo "• Открытая регистрация: ${RED}ОТКЛЮЧЕНА${NC}"
+                log "DEBUG" "Открытая регистрация отключена"
+                ;;
+            *) 
+                safe_echo "• Открытая регистрация: ${YELLOW}НЕИЗВЕСТНО${NC}"
+                log "WARN" "Неизвестный статус открытой регистрации: $current_status"
+                ;;
         esac
         
         case "$token_status" in
-            "enabled") safe_echo "• Регистрация по токенам: ${GREEN}ТРЕБУЕТСЯ${NC}" ;;
-            "disabled") safe_echo "• Регистрация по токенам: ${RED}НЕ ТРЕБУЕТСЯ${NC}" ;;
-            *) safe_echo "• Регистрация по токенам: ${YELLOW}НЕИЗВЕСТНО${NC}" ;;
+            "enabled") 
+                safe_echo "• Регистрация по токенам: ${GREEN}ТРЕБУЕТСЯ${NC}"
+                log "DEBUG" "Регистрация по токенам требуется"
+                ;;
+            "disabled") 
+                safe_echo "• Регистрация по токенам: ${RED}НЕ ТРЕБУЕТСЯ${NC}"
+                log "DEBUG" "Регистрация по токенам не требуется"
+                ;;
+            *) 
+                safe_echo "• Регистрация по токенам: ${YELLOW}НЕИЗВЕСТНО${NC}"
+                log "WARN" "Неизвестный статус регистрации по токенам: $token_status"
+                ;;
         esac
         
         # Показываем статус MAS
+        log "DEBUG" "Проверка статуса службы matrix-auth-service"
         if systemctl is-active --quiet matrix-auth-service; then
             safe_echo "• MAS служба: ${GREEN}АКТИВНА${NC}"
+            log "DEBUG" "MAS служба активна"
         else
             safe_echo "• MAS служба: ${RED}НЕ АКТИВНА${NC}"
+            log "WARN" "MAS служба не активна"
+        fi
+        
+        # Вывод рекомендаций на основе текущего состояния
+        if [ "$current_status" = "enabled" ] && [ "$token_status" = "disabled" ]; then
+            echo
+            safe_echo "${YELLOW}⚠️ Предупреждение:${NC} Открытая регистрация включена без требования токенов."
+            safe_echo "${YELLOW}   Это означает, что любой может зарегистрироваться на вашем сервере.${NC}"
+            safe_echo "${CYAN}   Рекомендуется включить требование токенов или отключить открытую регистрацию.${NC}"
+            log "WARN" "Открытая регистрация включена без требования токенов - небезопасная конфигурация"
         fi
         
         echo
@@ -794,36 +1021,46 @@ manage_mas_registration() {
         safe_echo "2. ${RED}❌ Выключить открытую регистрацию${NC}"
         safe_echo "3. ${BLUE}🔐 Включить требование токенов регистрации${NC}"
         safe_echo "4. ${YELLOW}🔓 Отключить требование токенов регистрации${NC}"
-        safe_echo "5. ${CYAN}📄 Прос观看 конфигурацию account${NC}"
+        safe_echo "5. ${CYAN}📄 Просмотреть конфигурацию account${NC}"
         safe_echo "6. ${MAGENTA}🎫 Управление токенами регистрации${NC}"
         safe_echo "7. ${WHITE}↩️  Назад${NC}"
 
         read -p "Выберите действие [1-7]: " action
+        log "DEBUG" "Выбрано действие: $action"
 
         case $action in
             1)
+                log "INFO" "Включение открытой регистрации"
                 set_mas_config_value "password_registration_enabled" "true"
                 ;;
             2)
+                log "INFO" "Выключение открытой регистрации"
                 set_mas_config_value "password_registration_enabled" "false"
                 ;;
             3)
+                log "INFO" "Включение требования токенов регистрации"
                 set_mas_config_value "registration_token_required" "true"
                 ;;
             4)
+                log "INFO" "Отключение требования токенов регистрации"
                 set_mas_config_value "registration_token_required" "false"
                 ;;
             5)
+                log "INFO" "Просмотр конфигурации account"
                 view_mas_account_config
                 ;;
             6)
+                log "INFO" "Переход в меню управления токенами регистрации"
                 manage_mas_registration_tokens
                 ;;
             7)
+                log "INFO" "Возврат в предыдущее меню"
+                log "DEBUG" "Завершение manage_mas_registration"
                 return 0
                 ;;
             *)
-                log "ERROR" "Некорректный ввод. Попробуйте ещё раз."
+                log "ERROR" "Некорректный ввод: $action"
+                safe_echo "${RED}❌ Некорректный ввод. Попробуйте ещё раз.${NC}"
                 sleep 1
                 ;;
         esac
@@ -837,19 +1074,26 @@ manage_mas_registration() {
 
 # Главная функция модуля
 main() {
+    log "DEBUG" "Запуск главной функции модуля mas_manage_mas_registration.sh"
+    
     # Проверяем, что MAS установлен
     if ! command -v mas >/dev/null 2>&1 && [ ! -f "$MAS_CONFIG_FILE" ]; then
         print_header "MATRIX AUTHENTICATION SERVICE НЕ УСТАНОВЛЕН" "$RED"
         log "ERROR" "Matrix Authentication Service не установлен"
-        log "INFO" "Установите MAS через главное меню:"
-        log "INFO" "  Дополнительные компоненты → Matrix Authentication Service (MAS)"
+        log "INFO" "Установите MAS через главное меню"
+        
+        safe_echo "${RED}❌ Matrix Authentication Service не установлен!${NC}"
+        safe_echo "${YELLOW}Установите MAS через главное меню:${NC}"
+        safe_echo "${CYAN}  Дополнительные компоненты → Matrix Authentication Service (MAS)${NC}"
         return 1
+    else
+        log "DEBUG" "MAS установлен, запуск меню управления регистрацией"
+        manage_mas_registration
     fi
-    
-    manage_mas_registration
 }
 
 # Если скрипт запущен напрямую
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    log "DEBUG" "Скрипт mas_manage_mas_registration.sh запущен напрямую"
     main "$@"
 fi
