@@ -67,28 +67,74 @@ check_yq_dependency() {
 # Инициализация секции account
 initialize_mas_account_section() {
     log "INFO" "Инициализация секции account в конфигурации MAS..."
+    log "DEBUG" "Путь к конфигурационному файлу: $MAS_CONFIG_FILE"
     
     if [ ! -f "$MAS_CONFIG_FILE" ]; then
         log "ERROR" "Файл конфигурации MAS не найден: $MAS_CONFIG_FILE"
+        log "DEBUG" "Проверка директории: $(ls -la "$(dirname "$MAS_CONFIG_FILE")" 2>/dev/null || echo "Директория недоступна")"
         return 1
     fi
     
     # Проверяем, есть ли уже секция account
+    log "DEBUG" "Проверка наличия секции account в файле $MAS_CONFIG_FILE"
     if yq eval '.account' "$MAS_CONFIG_FILE" >/dev/null 2>&1; then
         local account_content=$(yq eval '.account' "$MAS_CONFIG_FILE" 2>/dev/null)
+        log "DEBUG" "Результат проверки секции account: $(echo "$account_content" | tr -d '\n' | head -c 100)..."
         if [ "$account_content" != "null" ] && [ -n "$account_content" ]; then
             log "INFO" "Секция account уже существует"
+            log "DEBUG" "Секция account содержит валидные данные, инициализация не требуется"
             return 0
+        else 
+            log "DEBUG" "Секция account существует, но пуста или содержит null"
         fi
+    else
+        log "DEBUG" "Секция account отсутствует в конфигурации, будет создана"
     fi
     
+    # Проверяем права доступа к файлу перед модификацией
+    local file_permissions=$(stat -c "%a" "$MAS_CONFIG_FILE" 2>/dev/null || ls -la "$MAS_CONFIG_FILE" | awk '{print $1}')
+    local file_owner=$(stat -c "%U:%G" "$MAS_CONFIG_FILE" 2>/dev/null || ls -la "$MAS_CONFIG_FILE" | awk '{print $3":"$4}')
+    log "DEBUG" "Текущие права на файл: $file_permissions, владелец: $file_owner"
+    
     # Создаем резервную копию
+    log "DEBUG" "Создание резервной копии файла $MAS_CONFIG_FILE перед модификацией"
     backup_file "$MAS_CONFIG_FILE" "mas_config_account_init"
+    local backup_result=$?
+    local latest_backup=$(ls -t "$BACKUP_DIR"/mas_config_account_init_* 2>/dev/null | head -1)
+    
+    if [ $backup_result -eq 0 ] && [ -f "$latest_backup" ]; then
+        log "DEBUG" "Резервная копия успешно создана: $latest_backup (размер: $(stat -c %s "$latest_backup" 2>/dev/null || echo "неизвестно") байт)"
+    else
+        log "WARN" "Проблема при создании резервной копии (код: $backup_result)"
+    fi
     
     log "INFO" "Добавление секции account в конфигурацию MAS..."
+    log "DEBUG" "Исходный размер файла: $(stat -c %s "$MAS_CONFIG_FILE" 2>/dev/null || echo "неизвестно") байт"
+    
+    # Сохраняем контрольную сумму файла перед изменением
+    local checksum_before=""
+    if command -v md5sum >/dev/null 2>&1; then
+        checksum_before=$(md5sum "$MAS_CONFIG_FILE" 2>/dev/null | awk '{print $1}')
+        log "DEBUG" "MD5 до изменения: $checksum_before"
+    elif command -v sha1sum >/dev/null 2>&1; then
+        checksum_before=$(sha1sum "$MAS_CONFIG_FILE" 2>/dev/null | awk '{print $1}')
+        log "DEBUG" "SHA1 до изменения: $checksum_before"
+    fi
+    
+    # Подробный лог содержимого файла перед изменением (только в debug режиме)
+    if [ "${DEBUG_MODE:-false}" = "true" ]; then
+        log "DEBUG" "Текущая структура файла перед модификацией:"
+        yq eval 'keys' "$MAS_CONFIG_FILE" 2>&1 | while read -r line; do
+            log "DEBUG" "  $line"
+        done
+    fi
     
     # Используем yq для добавления секции account
-    if yq eval -i '.account = {
+    local yq_output=""
+    local yq_exit_code=0
+    
+    log "DEBUG" "Выполнение команды yq для добавления секции account"
+    if ! yq_output=$(yq eval -i '.account = {
         "password_registration_enabled": false,
         "registration_token_required": false,
         "email_change_allowed": true,
@@ -96,130 +142,197 @@ initialize_mas_account_section() {
         "password_change_allowed": true,
         "password_recovery_enabled": false,
         "account_deactivation_allowed": false
-    }' "$MAS_CONFIG_FILE" 2>/dev/null; then
-        
+    }' "$MAS_CONFIG_FILE" 2>&1); then
+        yq_exit_code=$?
+        log "ERROR" "Ошибка при выполнении yq (код: $yq_exit_code): $yq_output"
+    else 
+        log "DEBUG" "Команда yq выполнена без ошибок"
+    fi
+    
+    # Проверяем, что файл изменился
+    local size_after=$(stat -c %s "$MAS_CONFIG_FILE" 2>/dev/null || echo "неизвестно")
+    log "DEBUG" "Размер файла после модификации: $size_after байт"
+    
+    # Проверяем контрольную сумму после изменения
+    local checksum_after=""
+    if command -v md5sum >/dev/null 2>&1 && [ -n "$checksum_before" ]; then
+        checksum_after=$(md5sum "$MAS_CONFIG_FILE" 2>/dev/null | awk '{print $1}')
+        log "DEBUG" "MD5 после изменения: $checksum_after"
+        if [ "$checksum_before" = "$checksum_after" ]; then
+            log "WARN" "Файл не изменился после выполнения yq (MD5 совпадает)"
+        else
+            log "DEBUG" "Файл успешно изменен (MD5 отличается)"
+        fi
+    elif command -v sha1sum >/dev/null 2>&1 && [ -n "$checksum_before" ]; then
+        checksum_after=$(sha1sum "$MAS_CONFIG_FILE" 2>/dev/null | awk '{print $1}')
+        log "DEBUG" "SHA1 после изменения: $checksum_after"
+        if [ "$checksum_before" = "$checksum_after" ]; then
+            log "WARN" "Файл не изменился после выполнения yq (SHA1 совпадает)"
+        else
+            log "DEBUG" "Файл успешно изменен (SHA1 отличается)"
+        fi
+    fi
+    
+    if [ $yq_exit_code -eq 0 ]; then
         log "SUCCESS" "Секция account добавлена"
         
-        # Проверяем валидность YAML
-        if command -v python3 >/dev/null 2>&1; then
-            if ! python3 -c "import yaml; yaml.safe_load(open('$MAS_CONFIG_FILE'))" 2>/dev/null; then
-                log "ERROR" "YAML поврежден после добавления секции account"
-                # Восстанавливаем из резервной копии
-                local latest_backup=$(ls -t "$BACKUP_DIR"/mas_config_account_init_* 2>/dev/null | head -1)
-                if [ -n "$latest_backup" ] && [ -f "$latest_backup" ]; then
-                    restore_file "$latest_backup" "$MAS_CONFIG_FILE"
-                    log "INFO" "Конфигурация восстановлена из резервной копии"
-                fi
-                return 1
-            fi
-        fi
-        
-    else
-        log "ERROR" "Не удалось добавить секцию account"
-        return 1
-    fi
-    
-    # Устанавливаем права
-    chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE"
-    chmod 600 "$MAS_CONFIG_FILE"
-    
-    log "SUCCESS" "Секция account успешно инициализирована"
-    return 0
-}
-
-# Изменение параметра в YAML файле
-set_mas_config_value() {
-    local key="$1"
-    local value="$2"
-    
-    if [ ! -f "$MAS_CONFIG_FILE" ]; then
-        log "ERROR" "Файл конфигурации MAS не найден: $MAS_CONFIG_FILE"
-        return 1
-    fi
-    
-    if ! check_yq_dependency; then
-        return 1
-    fi
-    
-    local full_path=""
-    case "$key" in
-        "password_registration_enabled"|"registration_token_required"|"email_change_allowed"|"displayname_change_allowed"|"password_change_allowed"|"password_recovery_enabled"|"account_deactivation_allowed")
-            full_path=".account.$key"
+        # Подробный лог содержимого файла после изменения (только в debug режиме)
+        if [ "${DEBUG_MODE:-false}" = "true" ]; then
+            log "DEBUG" "Структура файла после модификации:"
+            yq eval 'keys' "$MAS_CONFIG_FILE" 2>&1 | while read -r line; do
+                log "DEBUG" "  $line"
+            done
             
-            # Проверяем наличие секции account и инициализируем при необходимости
-            if ! yq eval '.account' "$MAS_CONFIG_FILE" >/dev/null 2>&1; then
-                log "WARN" "Секция account отсутствует, инициализирую..."
-                if ! initialize_mas_account_section; then
-                    log "ERROR" "Не удалось инициализировать секцию account"
-                    return 1
-                fi
-            fi
-            ;;
-        *)
-            log "ERROR" "Неизвестный параметр конфигурации: $key"
-            return 1
-            ;;
-    esac
-    
-    log "INFO" "Изменение настройки $key на $value..."
-    
-    # Создаем резервную копию
-    backup_file "$MAS_CONFIG_FILE" "mas_config_change"
-    
-    # Применяем изменение
-    if yq eval -i "$full_path = $value" "$MAS_CONFIG_FILE" 2>/dev/null; then
-        log "SUCCESS" "Изменение применено"
+            log "DEBUG" "Содержимое секции account:"
+            yq eval '.account' "$MAS_CONFIG_FILE" 2>&1 | while read -r line; do
+                log "DEBUG" "  $line"
+            done
+        fi
         
         # Проверяем валидность YAML
+        log "DEBUG" "Проверка валидности YAML после модификации"
         if command -v python3 >/dev/null 2>&1; then
-            if ! python3 -c "import yaml; yaml.safe_load(open('$MAS_CONFIG_FILE'))" 2>/dev/null; then
-                log "ERROR" "YAML поврежден после изменений"
+            local python_output=""
+            if ! python_output=$(python3 -c "import yaml; yaml.safe_load(open('$MAS_CONFIG_FILE'))" 2>&1); then
+                log "ERROR" "YAML поврежден после добавления секции account: $python_output"
+                log "DEBUG" "Начало содержимого файла:"
+                head -n 20 "$MAS_CONFIG_FILE" 2>&1 | while read -r line; do
+                    log "DEBUG" "  $line"
+                done
+                
                 # Восстанавливаем из резервной копии
-                local latest_backup=$(ls -t "$BACKUP_DIR"/mas_config_change_* 2>/dev/null | head -1)
                 if [ -n "$latest_backup" ] && [ -f "$latest_backup" ]; then
-                    restore_file "$latest_backup" "$MAS_CONFIG_FILE"
-                    log "INFO" "Конфигурация восстановлена из резервной копии"
+                    log "INFO" "Восстановление из резервной копии: $latest_backup"
+                    if restore_file "$latest_backup" "$MAS_CONFIG_FILE"; then
+                        log "SUCCESS" "Конфигурация восстановлена из резервной копии"
+                    else
+                        log "ERROR" "Не удалось восстановить из резервной копии"
+                        # Пробуем прямое копирование
+                        if cp "$latest_backup" "$MAS_CONFIG_FILE"; then
+                            log "SUCCESS" "Конфигурация восстановлена прямым копированием"
+                        else
+                            log "ERROR" "Не удалось восстановить конфигурацию. Файл может быть поврежден!"
+                        fi
+                    fi
+                else
+                    log "ERROR" "Резервная копия не найдена для восстановления: $latest_backup"
                 fi
                 return 1
+            else
+                log "DEBUG" "YAML валиден после модификации"
+            fi
+        else
+            log "WARN" "Python3 не найден, пропуск проверки валидности YAML"
+        fi
+        
+    else
+        log "ERROR" "Не удалось добавить секцию account (код: $yq_exit_code)"
+        log "DEBUG" "Проверка наличия изменений в файле после ошибки yq"
+        
+        # Проверяем, не поврежден ли файл после неудачной попытки
+        if command -v python3 >/dev/null 2>&1; then
+            if ! python3 -c "import yaml; yaml.safe_load(open('$MAS_CONFIG_FILE'))" 2>/dev/null; then
+                log "ERROR" "YAML файл поврежден после неудачной попытки модификации"
+                if [ -n "$latest_backup" ] && [ -f "$latest_backup" ]; then
+                    log "INFO" "Восстановление из резервной копии после ошибки yq: $latest_backup"
+                    restore_file "$latest_backup" "$MAS_CONFIG_FILE"
+                    log "INFO" "Восстановление выполнено"
+                fi
+            else
+                log "DEBUG" "YAML файл остался валидным несмотря на ошибку yq"
             fi
         fi
-    else
-        log "ERROR" "Не удалось изменить $key в $MAS_CONFIG_FILE"
+        
         return 1
     fi
     
     # Устанавливаем права
-    chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE"
-    chmod 600 "$MAS_CONFIG_FILE"
+    log "DEBUG" "Установка прав доступа на файл: владелец=$MAS_USER:$MAS_GROUP, права=600"
+    local chown_output=""
+    if ! chown_output=$(chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE" 2>&1); then
+        log "ERROR" "Ошибка при изменении владельца файла: $chown_output"
+    else
+        log "DEBUG" "Владелец файла успешно изменен"
+    fi
+    
+    local chmod_output=""
+    if ! chmod_output=$(chmod 600 "$MAS_CONFIG_FILE" 2>&1); then
+        log "ERROR" "Ошибка при изменении прав доступа: $chmod_output"
+    else
+        log "DEBUG" "Права доступа успешно изменены"
+    fi
+    
+    # Финальная проверка прав
+    local final_perms=$(stat -c "%a" "$MAS_CONFIG_FILE" 2>/dev/null || ls -la "$MAS_CONFIG_FILE" | awk '{print $1}')
+    local final_owner=$(stat -c "%U:%G" "$MAS_CONFIG_FILE" 2>/dev/null || ls -la "$MAS_CONFIG_FILE" | awk '{print $3":"$4}')
+    log "DEBUG" "Финальные права на файл: $final_perms, владелец: $final_owner"
     
     # Перезапускаем MAS
     log "INFO" "Перезапуск MAS для применения изменений..."
-    if restart_service "matrix-auth-service"; then
-        sleep 2
-        if systemctl is-active --quiet matrix-auth-service; then
-            log "SUCCESS" "Настройка $key успешно изменена на $value"
+    local restart_output=""
+    local restart_success=false
+    
+    if restart_output=$(restart_service "matrix-auth-service" 2>&1); then
+        log "DEBUG" "Команда перезапуска выполнена: $restart_output"
+        restart_success=true
+    else
+        log "ERROR" "Ошибка выполнения команды перезапуска: $restart_output"
+    fi
+    
+    # Проверяем статус службы после перезапуска
+    log "DEBUG" "Ожидание запуска службы (2 секунды)..."
+    sleep 2
+    
+    if systemctl is-active --quiet matrix-auth-service; then
+        log "SUCCESS" "Настройка $key успешно изменена на $value"
+        log "DEBUG" "Служба matrix-auth-service активна после перезапуска"
+        
+        # Проверяем API если доступен
+        local mas_port=""
+        if [ -f "$CONFIG_DIR/mas.conf" ]; then
+            mas_port=$(grep "MAS_PORT=" "$CONFIG_DIR/mas.conf" | cut -d'=' -f2 | tr -d '"')
+            log "DEBUG" "Обнаружен порт MAS в конфигурации: $mas_port"
+        else
+            log "DEBUG" "Файл конфигурации $CONFIG_DIR/mas.conf не найден, использую порт по умолчанию"
+        fi
+        
+        if [ -n "$mas_port" ]; then
+            local health_url="http://localhost:$mas_port/health"
+            log "DEBUG" "Проверка доступности API по URL: $health_url"
             
-            # Проверяем API если доступен
-            local mas_port=""
-            if [ -f "$CONFIG_DIR/mas.conf" ]; then
-                mas_port=$(grep "MAS_PORT=" "$CONFIG_DIR/mas.conf" | cut -d'=' -f2 | tr -d '"')
-            fi
-            
-            if [ -n "$mas_port" ]; then
-                local health_url="http://localhost:$mas_port/health"
-                if curl -s -f --connect-timeout 5 "$health_url" >/dev/null 2>&1; then
-                    log "SUCCESS" "MAS API доступен - настройки применены успешно"
-                else
-                    log "WARN" "MAS запущен, но API пока недоступен"
-                fi
+            local curl_output=""
+            local curl_status=0
+            if ! curl_output=$(curl -s -f --connect-timeout 5 "$health_url" 2>&1); then
+                curl_status=$?
+                log "WARN" "MAS запущен, но API недоступен (код: $curl_status): $curl_output"
+            else
+                log "SUCCESS" "MAS API доступен - настройки применены успешно"
+                log "DEBUG" "Ответ API: $curl_output"
             fi
         else
-            log "ERROR" "MAS не запустился после изменения конфигурации"
-            return 1
+            log "DEBUG" "Порт MAS не определен, пропуск проверки API"
         fi
     else
-        log "ERROR" "Ошибка перезапуска matrix-auth-service"
+        log "ERROR" "MAS не запустился после изменения конфигурации"
+        log "DEBUG" "Вывод systemctl status: $(systemctl status matrix-auth-service --no-pager -n 10 2>&1)"
+        
+        # Проверяем журнал systemd для диагностики
+        log "DEBUG" "Последние записи в журнале MAS:"
+        journalctl -u matrix-auth-service -n 5 --no-pager 2>&1 | while read -r line; do
+            log "DEBUG" "  $line"
+        done
+        
         return 1
+    fi
+    
+    # Проверяем, что изменение сохранилось после перезапуска
+    local final_value=$(yq eval "$full_path" "$MAS_CONFIG_FILE" 2>/dev/null)
+    log "DEBUG" "Финальное значение параметра $key после перезапуска: '$final_value'"
+    
+    if [ "$final_value" = "$value" ]; then
+        log "SUCCESS" "Параметр $key сохранил значение $value после перезапуска"
+    else
+        log "WARN" "Значение параметра $key изменилось после перезапуска: '$final_value' (было: '$value')"
     fi
     
     return 0
@@ -229,30 +342,53 @@ set_mas_config_value() {
 view_mas_account_config() {
     print_header "КОНФИГУРАЦИЯ СЕКЦИИ ACCOUNT В MAS" "$CYAN"
     
+    log "DEBUG" "Запуск view_mas_account_config"
+    
     if [ ! -f "$MAS_CONFIG_FILE" ]; then
         log "ERROR" "Файл конфигурации MAS не найден: $MAS_CONFIG_FILE"
+        log "DEBUG" "Проверка директории: $(ls -la "$(dirname "$MAS_CONFIG_FILE")" 2>/dev/null || echo "Директория недоступна")"
         return 1
     fi
     
     if ! check_yq_dependency; then
+        log "ERROR" "Невозможно продолжить без yq"
         return 1
     fi
+    
+    log "DEBUG" "Проверка прав доступа к файлу $MAS_CONFIG_FILE"
+    local file_perms=$(stat -c "%a" "$MAS_CONFIG_FILE" 2>/dev/null || ls -la "$MAS_CONFIG_FILE" | awk '{print $1}')
+    local file_owner=$(stat -c "%U:%G" "$MAS_CONFIG_FILE" 2>/dev/null || ls -la "$MAS_CONFIG_FILE" | awk '{print $3":"$4}')
+    log "DEBUG" "Права на файл: $file_perms, владелец: $file_owner"
     
     safe_echo "${BOLD}Текущая конфигурация секции account:${NC}"
     echo
     
     # Проверяем наличие секции account
-    if ! yq eval '.account' "$MAS_CONFIG_FILE" >/dev/null 2>&1; then
+    log "DEBUG" "Проверка наличия секции account в файле $MAS_CONFIG_FILE"
+    local yq_output=""
+    local yq_exit_code=0
+    
+    if ! yq_output=$(yq eval '.account' "$MAS_CONFIG_FILE" 2>&1); then
+        yq_exit_code=$?
+        log "DEBUG" "Ошибка при проверке секции account (код: $yq_exit_code): $yq_output"
         safe_echo "${RED}Секция account отсутствует в конфигурации MAS${NC}"
+        log "DEBUG" "Структура конфигурационного файла:"
+        yq eval 'keys' "$MAS_CONFIG_FILE" 2>&1 | while read -r line; do
+            log "DEBUG" "  $line"
+        done
         echo
         safe_echo "${YELLOW}📝 Рекомендация:${NC}"
         safe_echo "• Используйте пункты меню выше для включения настроек регистрации"
         safe_echo "• Секция account будет создана автоматически при первом изменении"
         return 1
-    fi
+    }
     
+    log "DEBUG" "Получение содержимого секции account"
     local account_content=$(yq eval '.account' "$MAS_CONFIG_FILE" 2>/dev/null)
+    log "DEBUG" "Содержимое секции account: $(echo "$account_content" | tr -d '\n' | head -c 100)..."
+    
     if [ "$account_content" = "null" ] || [ -z "$account_content" ]; then
+        log "WARN" "Секция account пуста или повреждена"
         safe_echo "${RED}Секция account пуста или повреждена${NC}"
         echo
         safe_echo "${YELLOW}📝 Рекомендация:${NC}"
@@ -260,10 +396,22 @@ view_mas_account_config() {
         return 1
     fi
     
+    log "DEBUG" "Секция account содержит данные, отображаю содержимое"
+    
     # Показываем основные параметры регистрации
     safe_echo "${CYAN}🔐 Настройки регистрации:${NC}"
     
-    local password_reg=$(yq eval '.account.password_registration_enabled' "$MAS_CONFIG_FILE" 2>/dev/null)
+    local password_reg=""
+    local password_reg_error=""
+    
+    if ! password_reg=$(yq eval '.account.password_registration_enabled' "$MAS_CONFIG_FILE" 2>&1); then
+        password_reg_error=$?
+        log "DEBUG" "Ошибка при получении password_registration_enabled (код: $password_reg_error): $password_reg"
+        password_reg="ошибка"
+    fi
+    
+    log "DEBUG" "password_registration_enabled=$password_reg"
+    
     if [ "$password_reg" = "true" ]; then
         safe_echo "  • password_registration_enabled: ${GREEN}true${NC} (открытая регистрация включена)"
     elif [ "$password_reg" = "false" ]; then
@@ -272,7 +420,17 @@ view_mas_account_config() {
         safe_echo "  • password_registration_enabled: ${YELLOW}$password_reg${NC}"
     fi
     
-    local token_req=$(yq eval '.account.registration_token_required' "$MAS_CONFIG_FILE" 2>/dev/null)
+    local token_req=""
+    local token_req_error=""
+    
+    if ! token_req=$(yq eval '.account.registration_token_required' "$MAS_CONFIG_FILE" 2>&1); then
+        token_req_error=$?
+        log "DEBUG" "Ошибка при получении registration_token_required (код: $token_req_error): $token_req"
+        token_req="ошибка"
+    fi
+    
+    log "DEBUG" "registration_token_required=$token_req"
+    
     if [ "$token_req" = "true" ]; then
         safe_echo "  • registration_token_required: ${GREEN}true${NC} (требуется токен регистрации)"
     elif [ "$token_req" = "false" ]; then
@@ -286,18 +444,23 @@ view_mas_account_config() {
     
     # Остальные параметры account
     local email_change=$(yq eval '.account.email_change_allowed' "$MAS_CONFIG_FILE" 2>/dev/null)
+    log "DEBUG" "email_change_allowed=$email_change"
     safe_echo "  • email_change_allowed: ${BLUE}$email_change${NC}"
     
     local display_change=$(yq eval '.account.displayname_change_allowed' "$MAS_CONFIG_FILE" 2>/dev/null)
+    log "DEBUG" "displayname_change_allowed=$display_change"
     safe_echo "  • displayname_change_allowed: ${BLUE}$display_change${NC}"
     
     local password_change=$(yq eval '.account.password_change_allowed' "$MAS_CONFIG_FILE" 2>/dev/null)
+    log "DEBUG" "password_change_allowed=$password_change"
     safe_echo "  • password_change_allowed: ${BLUE}$password_change${NC}"
     
     local password_recovery=$(yq eval '.account.password_recovery_enabled' "$MAS_CONFIG_FILE" 2>/dev/null)
+    log "DEBUG" "password_recovery_enabled=$password_recovery"
     safe_echo "  • password_recovery_enabled: ${BLUE}$password_recovery${NC}"
     
     local account_deactivation=$(yq eval '.account.account_deactivation_allowed' "$MAS_CONFIG_FILE" 2>/dev/null)
+    log "DEBUG" "account_deactivation_allowed=$account_deactivation"
     safe_echo "  • account_deactivation_allowed: ${BLUE}$account_deactivation${NC}"
     
     echo
@@ -305,10 +468,17 @@ view_mas_account_config() {
     echo "────────────────────────────────────────────────────────────"
     
     # Показываем полную секцию account в YAML формате
-    if yq eval '.account' "$MAS_CONFIG_FILE" 2>/dev/null; then
-        log "DEBUG" "Секция account успешно отображена"
-    else
+    log "DEBUG" "Вывод полной секции account в YAML формате"
+    local account_yaml_output=""
+    local account_yaml_error=0
+    
+    if ! account_yaml_output=$(yq eval '.account' "$MAS_CONFIG_FILE" 2>&1); then
+        account_yaml_error=$?
+        log "ERROR" "Ошибка при получении полной секции account (код: $account_yaml_error): $account_yaml_output"
         safe_echo "${RED}Ошибка чтения секции account${NC}"
+    else
+        echo "$account_yaml_output"
+        log "DEBUG" "Секция account успешно отображена"
     fi
     
     echo "────────────────────────────────────────────────────────────"
@@ -323,6 +493,8 @@ view_mas_account_config() {
     safe_echo "• Проверить статус MAS: systemctl status matrix-auth-service"
     safe_echo "• Логи MAS: journalctl -u matrix-auth-service -n 20"
     safe_echo "• Диагностика MAS: mas doctor --config $MAS_CONFIG_FILE"
+    
+    log "DEBUG" "view_mas_account_config завершен"
 }
 
 # Получение статуса открытой регистрации MAS
@@ -622,7 +794,7 @@ manage_mas_registration() {
         safe_echo "2. ${RED}❌ Выключить открытую регистрацию${NC}"
         safe_echo "3. ${BLUE}🔐 Включить требование токенов регистрации${NC}"
         safe_echo "4. ${YELLOW}🔓 Отключить требование токенов регистрации${NC}"
-        safe_echo "5. ${CYAN}📄 Просмотреть конфигурацию account${NC}"
+        safe_echo "5. ${CYAN}📄 Прос观看 конфигурацию account${NC}"
         safe_echo "6. ${MAGENTA}🎫 Управление токенами регистрации${NC}"
         safe_echo "7. ${WHITE}↩️  Назад${NC}"
 
