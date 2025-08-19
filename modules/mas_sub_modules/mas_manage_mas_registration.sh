@@ -31,28 +31,208 @@ load_server_type
 check_yq_dependency() {
     if ! command -v yq &>/dev/null; then
         log "WARN" "Утилита 'yq' не найдена. Она необходима для управления YAML конфигурацией MAS."
+        log "DEBUG" "Проверка альтернативных расположений yq"
+        
+        # Проверяем возможные альтернативные пути
+        local alt_paths=("/usr/local/bin/yq" "/usr/bin/yq" "/snap/bin/yq" "/opt/bin/yq")
+        for path in "${alt_paths[@]}"; do
+            if [ -x "$path" ]; then
+                log "INFO" "Найден yq в нестандартном расположении: $path"
+                log "DEBUG" "Добавление пути $(dirname "$path") в PATH"
+                export PATH="$PATH:$(dirname "$path")"
+                if command -v yq &>/dev/null; then
+                    log "SUCCESS" "Найден и добавлен в PATH yq из: $path"
+                    return 0
+                else
+                    log "WARN" "yq найден в $path, но не доступен после добавления в PATH"
+                fi
+            fi
+        done
+        
         if ask_confirmation "Установить yq автоматически?"; then
             log "INFO" "Установка yq..."
             if command -v snap &>/dev/null; then
-                if snap install yq; then
+                log "INFO" "Установка yq через snap..."
+                local snap_output=""
+                if ! snap_output=$(snap install yq 2>&1); then
+                    log "ERROR" "Не удалось установить yq через snap: $snap_output"
+                    log "DEBUG" "Пробуем альтернативный метод установки"
+                else
                     log "SUCCESS" "yq установлен через snap"
-                    return 0
+                    if command -v yq &>/dev/null; then
+                        log "DEBUG" "yq доступен в PATH после установки через snap"
+                        return 0
+                    else
+                        log "WARN" "yq установлен через snap, но не доступен в PATH"
+                        log "DEBUG" "Проверка пути: $(which yq 2>&1 || echo "не найден")"
+                        log "DEBUG" "PATH: $PATH"
+                        if [ -x "/snap/bin/yq" ]; then
+                            log "DEBUG" "Добавление /snap/bin в PATH"
+                            export PATH="$PATH:/snap/bin"
+                            if command -v yq &>/dev/null; then
+                                log "SUCCESS" "yq теперь доступен в PATH"
+                                return 0
+                            fi
+                        fi
+                    fi
                 fi
             fi
+            
             log "INFO" "Установка yq через GitHub releases..."
             local arch=$(uname -m)
             local yq_binary=""
             case "$arch" in
                 x86_64) yq_binary="yq_linux_amd64" ;;
                 aarch64|arm64) yq_binary="yq_linux_arm64" ;;
-                *) log "ERROR" "Неподдерживаемая архитектура для yq: $arch"; return 1 ;;
+                *) 
+                    log "ERROR" "Неподдерживаемая архитектура для yq: $arch"
+                    log "DEBUG" "Доступные архитектуры: x86_64, aarch64, arm64"
+                    return 1 
+                    ;;
             esac
+            
+            log "DEBUG" "Определена архитектура: $arch, используем бинарник: $yq_binary"
             local yq_url="https://github.com/mikefarah/yq/releases/latest/download/$yq_binary"
-            if download_file "$yq_url" "/tmp/yq" && chmod +x /tmp/yq && mv /tmp/yq /usr/local/bin/yq; then
-                log "SUCCESS" "yq установлен через GitHub releases"
+            log "DEBUG" "URL для загрузки: $yq_url"
+            
+            # Создаем временную директорию для загрузки
+            local temp_dir=""
+            if ! temp_dir=$(mktemp -d -t yq-install-XXXXXX 2>/dev/null); then
+                log "WARN" "Не удалось создать временную директорию через mktemp"
+                log "DEBUG" "Пробуем альтернативный путь"
+                temp_dir="/tmp/yq-install-$(date +%s)"
+                if ! mkdir -p "$temp_dir"; then
+                    log "ERROR" "Не удалось создать временную директорию $temp_dir"
+                    log "DEBUG" "Проверка прав доступа в /tmp: $(ls -la /tmp 2>&1)"
+                    return 1
+                fi
+            fi
+            
+            log "DEBUG" "Создана временная директория: $temp_dir"
+            local temp_yq="$temp_dir/yq"
+            
+            # Загружаем yq
+            log "DEBUG" "Загрузка yq в $temp_yq..."
+            local download_success=false
+            
+            if command -v curl &>/dev/null; then
+                log "DEBUG" "Загрузка с помощью curl"
+                local curl_output=""
+                if curl -sSL --connect-timeout 10 "$yq_url" -o "$temp_yq" 2>/dev/null; then
+                    download_success=true
+                    log "DEBUG" "Загрузка через curl успешна"
+                else
+                    curl_output=$(curl -sSL --connect-timeout 10 "$yq_url" -o "$temp_yq" 2>&1)
+                    log "ERROR" "Не удалось загрузить yq с помощью curl: $curl_output"
+                fi
+            fi
+            
+            if [ "$download_success" = "false" ] && command -v wget &>/dev/null; then
+                log "DEBUG" "Загрузка с помощью wget"
+                local wget_output=""
+                if wget -q --timeout=10 -O "$temp_yq" "$yq_url" 2>/dev/null; then
+                    download_success=true
+                    log "DEBUG" "Загрузка через wget успешна"
+                else
+                    wget_output=$(wget -q --timeout=10 -O "$temp_yq" "$yq_url" 2>&1)
+                    log "ERROR" "Не удалось загрузить yq с помощью wget: $wget_output"
+                fi
+            fi
+            
+            if [ "$download_success" = "false" ]; then
+                log "ERROR" "Не удалось загрузить yq. Проверьте подключение к интернету."
+                rm -rf "$temp_dir"
+                return 1
+            fi
+            
+            # Проверяем успешность загрузки
+            if [ ! -s "$temp_yq" ]; then
+                log "ERROR" "Загруженный файл пуст или не существует"
+                log "DEBUG" "Проверка файла: $(ls -la "$temp_yq" 2>&1 || echo "файл не существует")"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+            
+            log "DEBUG" "Размер загруженного файла: $(stat -c %s "$temp_yq" 2>/dev/null || ls -la "$temp_yq" | awk '{print $5}') байт"
+            
+            # Делаем файл исполняемым
+            log "DEBUG" "Установка прав на исполнение..."
+            if ! chmod +x "$temp_yq"; then
+                log "ERROR" "Не удалось установить права на исполнение"
+                log "DEBUG" "Проверка прав доступа: $(ls -la "$temp_yq" 2>&1)"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+            
+            # Перемещаем файл в каталог с исполняемыми файлами
+            log "DEBUG" "Перемещение yq в системный каталог..."
+            local install_paths=("/usr/local/bin" "/usr/bin" "/opt/bin")
+            local installed=false
+            
+            for install_path in "${install_paths[@]}"; do
+                log "DEBUG" "Попытка установки в $install_path/yq"
+                if [ -d "$install_path" ] && [ -w "$install_path" ]; then
+                    if mv "$temp_yq" "$install_path/yq"; then
+                        log "SUCCESS" "yq успешно установлен в $install_path/yq"
+                        installed=true
+                        break
+                    else
+                        log "WARN" "Не удалось переместить файл в $install_path/yq"
+                    fi
+                else
+                    log "DEBUG" "Каталог $install_path не существует или нет прав на запись"
+                fi
+            done
+            
+            if [ "$installed" = "false" ]; then
+                log "WARN" "Не удалось установить yq в системные каталоги, пробуем локальную установку"
+                local local_bin="$HOME/bin"
+                
+                if [ ! -d "$local_bin" ]; then
+                    log "DEBUG" "Создание каталога $local_bin"
+                    if ! mkdir -p "$local_bin"; then
+                        log "ERROR" "Не удалось создать каталог $local_bin"
+                        rm -rf "$temp_dir"
+                        return 1
+                    fi
+                fi
+                
+                if mv "$temp_yq" "$local_bin/yq"; then
+                    log "SUCCESS" "yq успешно установлен в $local_bin/yq"
+                    installed=true
+                    
+                    # Добавляем в PATH
+                    export PATH="$PATH:$local_bin"
+                    log "INFO" "Добавлен $local_bin в PATH"
+                    
+                    # Добавляем в .bashrc для постоянного эффекта
+                    if [ -f "$HOME/.bashrc" ]; then
+                        if ! grep -q "PATH=.*$local_bin" "$HOME/.bashrc"; then
+                            log "DEBUG" "Добавление $local_bin в PATH в .bashrc"
+                            echo "export PATH=\$PATH:$local_bin" >> "$HOME/.bashrc"
+                            log "INFO" "Добавлено в .bashrc: export PATH=\$PATH:$local_bin"
+                        fi
+                    fi
+                else
+                    log "ERROR" "Не удалось установить yq в $local_bin"
+                fi
+            fi
+            
+            # Очищаем временную директорию
+            rm -rf "$temp_dir"
+            
+            # Проверяем, что yq теперь доступен
+            if command -v yq &>/dev/null; then
+                local yq_version=$(yq --version 2>&1 || echo "неизвестно")
+                log "SUCCESS" "yq успешно установлен, версия: $yq_version"
                 return 0
             else
-                log "ERROR" "Не удалось установить yq"
+                log "ERROR" "yq установлен, но не найден в PATH"
+                log "DEBUG" "PATH: $PATH"
+                log "DEBUG" "Проверка наличия файла yq в различных каталогах:"
+                for dir in /usr/local/bin /usr/bin /opt/bin "$HOME/bin"; do
+                    log "DEBUG" "  $dir/yq: $([ -x "$dir/yq" ] && echo "существует" || echo "не существует")"
+                done
                 return 1
             fi
         else
@@ -61,6 +241,9 @@ check_yq_dependency() {
             return 1
         fi
     fi
+    
+    local yq_version=$(yq --version 2>&1 || echo "неизвестно")
+    log "DEBUG" "yq найден, версия: $yq_version"
     return 0
 }
 
