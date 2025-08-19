@@ -38,29 +38,35 @@ fi
 check_yq_dependency() {
     log "DEBUG" "Проверка наличия yq..."
     
-    # Проверяем наличие yq
+    # Сначала удаляем все следы snap версии
+    if command -v snap &>/dev/null; then
+        snap remove yq 2>/dev/null
+    fi
+    
+    # Удаляем возможные симлинки
+    for path in /usr/local/bin/yq /usr/bin/yq /opt/bin/yq "$HOME/bin/yq" /snap/bin/yq; do
+        if [ -f "$path" ] || [ -L "$path" ]; then
+            rm -f "$path" 2>/dev/null
+        fi
+    done
+    
+    hash -r 2>/dev/null
+    
+    # Проверяем наличие yq после очистки
     if command -v yq &>/dev/null; then
         local yq_version=$(yq --version 2>/dev/null || echo "unknown")
         log "DEBUG" "yq найден, версия: $yq_version"
         
-        # Проверяем, установлен ли через snap (проблемная версия)
+        # Если все еще snap, продолжаем удаление
         if [[ "$yq_version" == *"snap"* ]] || [[ "$(which yq 2>/dev/null)" == *"/snap/"* ]]; then
-            log "WARN" "yq установлен через snap, возможны проблемы с правами доступа"
-            log "INFO" "Удаляем snap версию и устанавливаем полноценную..."
-            
-            # Удаляем snap версию
-            if command -v snap &>/dev/null; then
-                snap remove yq 2>/dev/null
-                log "DEBUG" "Snap версия yq удалена"
-            fi
-            
-            # Удаляем симлинки если есть
-            local yq_path=$(which yq 2>/dev/null)
-            if [ -n "$yq_path" ] && [ -L "$yq_path" ]; then
-                rm -f "$yq_path" 2>/dev/null
-            fi
-            
-            # Продолжаем установку
+            log "WARN" "yq все еще установлен через snap, принудительно удаляем..."
+            pkill -f "yq" 2>/dev/null || true
+            sudo umount /snap/yq/* 2>/dev/null || true
+            sudo rm -rf /snap/yq 2>/dev/null || true
+            for path in /usr/local/bin/yq /usr/bin/yq /opt/bin/yq "$HOME/bin/yq" /snap/bin/yq; do
+                sudo rm -f "$path" 2>/dev/null || true
+            done
+            hash -r
         else
             # yq уже установлен правильно
             return 0
@@ -200,8 +206,48 @@ check_and_fix_yq_installation() {
     
     if [[ "$yq_version" == *"snap"* ]] || [[ "$yq_path" == *"/snap/"* ]]; then
         log "WARN" "Обнаружена snap версия yq, заменяем на полноценную..."
-        check_yq_dependency
-        return $?
+        
+        # Агрессивное удаление snap версии
+        if command -v snap &>/dev/null; then
+            log "DEBUG" "Удаляем snap версию yq..."
+            snap remove yq 2>/dev/null
+            # Ждем завершения удаления
+            sleep 2
+        fi
+        
+        # Удаляем все симлинки и бинарники yq
+        log "DEBUG" "Очищаем старые версии yq..."
+        for path in /usr/local/bin/yq /usr/bin/yq /opt/bin/yq "$HOME/bin/yq" /snap/bin/yq; do
+            if [ -f "$path" ] || [ -L "$path" ]; then
+                rm -f "$path" 2>/dev/null
+                log "DEBUG" "Удален: $path"
+            fi
+        done
+        
+        # Очищаем кэш команд
+        hash -r 2>/dev/null
+        
+        # Принудительно устанавливаем правильную версию
+        log "DEBUG" "Принудительная установка правильной версии yq..."
+        if check_yq_dependency; then
+            log "SUCCESS" "yq успешно переустановлен"
+            
+            # Дополнительная проверка
+            local new_yq_path=$(which yq 2>/dev/null)
+            local new_yq_version=$(yq --version 2>/dev/null || echo "")
+            
+            if [[ "$new_yq_version" == *"snap"* ]] || [[ "$new_yq_path" == *"/snap/"* ]]; then
+                log "ERROR" "Не удалось избавиться от snap версии"
+                return 1
+            else
+                log "DEBUG" "Новая версия yq: $new_yq_version"
+                log "DEBUG" "Новое расположение: $new_yq_path"
+                return 0
+            fi
+        else
+            log "ERROR" "Не удалось установить yq"
+            return 1
+        fi
     fi
     
     log "DEBUG" "yq установлен корректно: $yq_version"
