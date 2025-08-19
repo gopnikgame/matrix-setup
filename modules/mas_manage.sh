@@ -209,30 +209,135 @@ check_mas_status() {
 
 # Проверка наличия yq
 check_yq_dependency() {
+    log "DEBUG" "Проверка наличия утилиты yq..."
+    
     if ! command -v yq &>/dev/null; then
         log "WARN" "Утилита 'yq' не найдена. Она необходима для управления YAML конфигурацией MAS."
+        
+        # Проверяем возможные альтернативные пути
+        local alt_paths=("/usr/local/bin/yq" "/usr/bin/yq" "/snap/bin/yq" "/opt/bin/yq")
+        for path in "${alt_paths[@]}"; do
+            if [ -x "$path" ]; then
+                log "INFO" "Найден yq в нестандартном расположении: $path"
+                export PATH="$PATH:$(dirname "$path")"
+                return 0
+            fi
+        done
+        
         if ask_confirmation "Установить yq автоматически?"; then
             log "INFO" "Установка yq..."
+            
+            # Проверяем наличие snap
             if command -v snap &>/dev/null; then
-                if snap install yq; then
+                log "DEBUG" "Установка через snap..."
+                local snap_output=""
+                if ! snap_output=$(snap install yq 2>&1); then
+                    log "ERROR" "Не удалось установить yq через snap: $snap_output"
+                else
                     log "SUCCESS" "yq установлен через snap"
                     return 0
                 fi
+            else
+                log "DEBUG" "Snap не установлен, пробуем другие методы"
             fi
+            
+            # Установка через GitHub releases
             log "INFO" "Установка yq через GitHub releases..."
             local arch=$(uname -m)
             local yq_binary=""
             case "$arch" in
                 x86_64) yq_binary="yq_linux_amd64" ;;
                 aarch64|arm64) yq_binary="yq_linux_arm64" ;;
-                *) log "ERROR" "Неподдерживаемая архитектура для yq: $arch"; return 1 ;;
+                *) 
+                    log "ERROR" "Неподдерживаемая архитектура для yq: $arch"
+                    log "DEBUG" "Доступные архитектуры: x86_64, aarch64, arm64"
+                    return 1 
+                    ;;
             esac
+            
+            log "DEBUG" "Определена архитектура: $arch, используем бинарник: $yq_binary"
             local yq_url="https://github.com/mikefarah/yq/releases/latest/download/$yq_binary"
-            if download_file "$yq_url" "/tmp/yq" && chmod +x /tmp/yq && mv /tmp/yq /usr/local/bin/yq; then
-                log "SUCCESS" "yq установлен через GitHub releases"
+            log "DEBUG" "URL для загрузки: $yq_url"
+            
+            # Создаем временную директорию для загрузки
+            local temp_dir=""
+            if ! temp_dir=$(mktemp -d -t yq-install-XXXXXX 2>/dev/null); then
+                log "ERROR" "Не удалось создать временную директорию"
+                log "DEBUG" "Пробуем альтернативный путь"
+                temp_dir="/tmp/yq-install-$(date +%s)"
+                if ! mkdir -p "$temp_dir"; then
+                    log "ERROR" "Не удалось создать временную директорию $temp_dir"
+                    return 1
+                fi
+            fi
+            
+            log "DEBUG" "Создана временная директория: $temp_dir"
+            local temp_yq="$temp_dir/yq"
+            
+            # Загружаем yq
+            log "DEBUG" "Загрузка yq в $temp_yq..."
+            local curl_output=""
+            if command -v curl &>/dev/null; then
+                if ! curl_output=$(curl -sSL --connect-timeout 10 "$yq_url" -o "$temp_yq" 2>&1); then
+                    log "ERROR" "Не удалось загрузить yq с помощью curl: $curl_output"
+                    rm -rf "$temp_dir"
+                    return 1
+                fi
+            elif command -v wget &>/dev/null; then
+                local wget_output=""
+                if ! wget_output=$(wget -q --timeout=10 -O "$temp_yq" "$yq_url" 2>&1); then
+                    log "ERROR" "Не удалось загрузить yq с помощью wget: $wget_output"
+                    rm -rf "$temp_dir"
+                    return 1
+                fi
+            else
+                log "ERROR" "Не найдено средств для загрузки (curl или wget)"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+            
+            # Проверяем успешность загрузки
+            if [ ! -s "$temp_yq" ]; then
+                log "ERROR" "Загруженный файл пуст или не существует"
+                log "DEBUG" "Проверка файла: $(ls -la "$temp_yq" 2>&1 || echo "файл не существует")"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+            
+            log "DEBUG" "Размер загруженного файла: $(stat -c %s "$temp_yq" 2>/dev/null || ls -la "$temp_yq" | awk '{print $5}') байт"
+            
+            # Делаем файл исполняемым
+            log "DEBUG" "Установка прав на исполнение..."
+            if ! chmod +x "$temp_yq"; then
+                log "ERROR" "Не удалось установить права на исполнение"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+            
+            # Перемещаем файл в каталог с исполняемыми файлами
+            log "DEBUG" "Перемещение yq в /usr/local/bin..."
+            if ! mv "$temp_yq" /usr/local/bin/yq; then
+                log "ERROR" "Не удалось переместить yq в /usr/local/bin"
+                log "DEBUG" "Пробуем альтернативный путь /usr/bin..."
+                if ! mv "$temp_yq" /usr/bin/yq; then
+                    log "ERROR" "Не удалось переместить yq в /usr/bin"
+                    rm -rf "$temp_dir"
+                    return 1
+                fi
+            fi
+            
+            # Очищаем временную директорию
+            rm -rf "$temp_dir"
+            
+            # Проверяем, что yq теперь доступен
+            if command -v yq &>/dev/null; then
+                local yq_version=$(yq --version 2>&1 || echo "неизвестно")
+                log "SUCCESS" "yq успешно установлен, версия: $yq_version"
                 return 0
             else
-                log "ERROR" "Не удалось установить yq"
+                log "ERROR" "yq установлен, но не найден в PATH"
+                log "DEBUG" "PATH: $PATH"
+                log "DEBUG" "Проверка наличия файла: $(ls -la /usr/local/bin/yq 2>&1 || ls -la /usr/bin/yq 2>&1 || echo "не найден")"
                 return 1
             fi
         else
@@ -241,6 +346,37 @@ check_yq_dependency() {
             return 1
         fi
     fi
+    
+    local yq_version=$(yq --version 2>&1 || echo "неизвестно")
+    log "DEBUG" "yq найден, версия: $yq_version"
+    return 0
+}
+
+# Функция безопасного выполнения команды с расширенным логированием
+safe_execute_command() {
+    local cmd="$1"
+    local description="$2"
+    local error_message="${3:-Команда завершилась с ошибкой}"
+    
+    log "DEBUG" "Выполнение команды: $cmd"
+    
+    local output=""
+    local exit_code=0
+    
+    # Выполняем команду с перехватом вывода и кода завершения
+    if ! output=$(eval "$cmd" 2>&1); then
+        exit_code=$?
+        log "ERROR" "$error_message (код: $exit_code)"
+        log "DEBUG" "Вывод команды: $output"
+        return $exit_code
+    fi
+    
+    log "DEBUG" "Команда успешно выполнена"
+    if [ -n "$output" ]; then
+        log "DEBUG" "Вывод команды: $output"
+    fi
+    
+    echo "$output"
     return 0
 }
 
@@ -952,7 +1088,6 @@ set_mas_config_value() {
                         fi
                     else
                         log "ERROR" "Не удалось заменить оригинальный файл"
-                        log "DEBUG" "Текущий пользователь: $(whoami), права на файл: $(ls -la "$MAS_CONFIG_FILE")"
                         config_success=false
                     fi
                 fi
@@ -1230,7 +1365,7 @@ emergency_diagnostics() {
             if bash -n "$submodule_path" 2>/dev/null; then
                 safe_echo "     ${GREEN}✅ Синтаксис корректен${NC}"
             else
-                safe_echo "     ${RED}❌ Ошибка синтакса:${NC}"
+                safe_echo "     ${RED}❌ Ошибка синтаксиса:${NC}"
                 bash -n "$submodule_path" 2>&1 | while IFS= read -r error_line; do
                     safe_echo "       $error_line"
                 done
