@@ -33,160 +33,178 @@ if ! id -u "$MAS_USER" >/dev/null 2>&1; then
     exit 1
 fi
 
-# Проверка зависимости yq
+
+# Проверка и установка yq (без snap)
 check_yq_dependency() {
-    if ! command -v yq &>/dev/null; then
-        log "WARN" "Утилита 'yq' не найдена. Она необходима для управления YAML конфигурацией MAS."
+    log "DEBUG" "Проверка наличия yq..."
+    
+    # Проверяем наличие yq
+    if command -v yq &>/dev/null; then
+        local yq_version=$(yq --version 2>/dev/null || echo "unknown")
+        log "DEBUG" "yq найден, версия: $yq_version"
         
-        # Проверяем возможные альтернативные пути
-        local alt_paths=("/usr/local/bin/yq" "/usr/bin/yq" "/snap/bin/yq" "/opt/bin/yq")
-        for path in "${alt_paths[@]}"; do
-            if [ -x "$path" ]; then
-                log "INFO" "Найден yq в нестандартном расположении: $path"
-                export PATH="$PATH:$(dirname "$path")"
-                if command -v yq &>/dev/null; then
-                    log "SUCCESS" "Найден и добавлен в PATH yq из: $path"
-                    return 0
-                else
-                    log "WARN" "yq найден в $path, но не доступен после добавления в PATH"
-                fi
-            fi
-        done
-        
-        if ask_confirmation "Установить yq автоматически?"; then
-            log "INFO" "Установка yq..."
+        # Проверяем, установлен ли через snap (проблемная версия)
+        if [[ "$yq_version" == *"snap"* ]] || [[ "$(which yq 2>/dev/null)" == *"/snap/"* ]]; then
+            log "WARN" "yq установлен через snap, возможны проблемы с правами доступа"
+            log "INFO" "Удаляем snap версию и устанавливаем полноценную..."
+            
+            # Удаляем snap версию
             if command -v snap &>/dev/null; then
-                log "INFO" "Установка yq через snap..."
-                local snap_output=""
-                if ! snap_output=$(snap install yq 2>&1); then
-                    log "ERROR" "Не удалось установить yq через snap: $snap_output"
-                else
-                    log "SUCCESS" "yq установлен через snap"
-                    if command -v yq &>/dev/null; then
-                        return 0
-                    else
-                        log "WARN" "yq установлен через snap, но не доступен в PATH"
-                        if [ -x "/snap/bin/yq" ]; then
-                            export PATH="$PATH:/snap/bin"
-                            if command -v yq &>/dev/null; then
-                                log "SUCCESS" "yq теперь доступен в PATH"
-                                return 0
-                            fi
-                        fi
-                    fi
-                fi
+                snap remove yq 2>/dev/null
+                log "DEBUG" "Snap версия yq удалена"
             fi
             
-            log "INFO" "Установка yq через GitHub releases..."
-            local arch=$(uname -m)
-            local yq_binary=""
-            case "$arch" in
-                x86_64) yq_binary="yq_linux_amd64" ;;
-                aarch64|arm64) yq_binary="yq_linux_arm64" ;;
-                *) 
-                    log "ERROR" "Неподдерживаемая архитектура для yq: $arch"
-                    return 1 
-                    ;;
-            esac
-            
-            local yq_url="https://github.com/mikefarah/yq/releases/latest/download/$yq_binary"
-            
-            # Создаем временную директорию для загрузки
-            local temp_dir=""
-            if ! temp_dir=$(mktemp -d -t yq-install-XXXXXX 2>/dev/null); then
-                temp_dir="/tmp/yq-install-$(date +%s)"
-                if ! mkdir -p "$temp_dir"; then
-                    log "ERROR" "Не удалось создать временную директорию $temp_dir"
-                    return 1
-                fi
+            # Удаляем симлинки если есть
+            local yq_path=$(which yq 2>/dev/null)
+            if [ -n "$yq_path" ] && [ -L "$yq_path" ]; then
+                rm -f "$yq_path" 2>/dev/null
             fi
             
-            local temp_yq="$temp_dir/yq"
-            
-            # Загружаем yq
-            local download_success=false
+            # Продолжаем установку
+        else
+            # yq уже установлен правильно
+            return 0
+        fi
+    fi
+    
+    # Если yq не найден или был удален, устанавливаем
+    if ! command -v yq &>/dev/null; then
+        log "INFO" "Установка yq..."
+        
+        # Определяем архитектуру
+        local arch=$(uname -m)
+        local yq_binary=""
+        
+        case "$arch" in
+            x86_64) yq_binary="yq_linux_amd64" ;;
+            aarch64|arm64) yq_binary="yq_linux_arm64" ;;
+            armv7l|armv6l) yq_binary="yq_linux_arm" ;;
+            *)
+                log "ERROR" "Неподдерживаемая архитектура: $arch"
+                return 1
+                ;;
+        esac
+        
+        log "DEBUG" "Архитектура: $arch, бинарник: $yq_binary"
+        
+        # URL для загрузки
+        local yq_url="https://github.com/mikefarah/yq/releases/latest/download/$yq_binary"
+        log "DEBUG" "URL для загрузки: $yq_url"
+        
+        # Пытаемся установить в /usr/local/bin (требует sudo)
+        local install_success=false
+        
+        # Вариант 1: Установка в /usr/local/bin (требует прав root)
+        if [ "$EUID" -eq 0 ]; then
+            log "DEBUG" "Установка в /usr/local/bin как root"
             
             if command -v curl &>/dev/null; then
-                if curl -sSL --connect-timeout 10 "$yq_url" -o "$temp_yq" 2>/dev/null; then
-                    download_success=true
+                if curl -sSL --connect-timeout 30 "$yq_url" -o /usr/local/bin/yq; then
+                    chmod +x /usr/local/bin/yq
+                    install_success=true
+                fi
+            elif command -v wget &>/dev/null; then
+                if wget -q --timeout=30 -O /usr/local/bin/yq "$yq_url"; then
+                    chmod +x /usr/local/bin/yq
+                    install_success=true
                 fi
             fi
+        fi
+        
+        # Вариант 2: Установка в /opt/bin (может не требовать root)
+        if [ "$install_success" = false ] && [ -w "/opt" ]; then
+            log "DEBUG" "Попытка установки в /opt/bin"
             
-            if [ "$download_success" = "false" ] && command -v wget &>/dev/null; then
-                if wget -q --timeout=10 -O "$temp_yq" "$yq_url" 2>/dev/null; then
-                    download_success=true
-                fi
+            if [ ! -d "/opt/bin" ]; then
+                mkdir -p "/opt/bin"
             fi
             
-            if [ "$download_success" = "false" ]; then
-                log "ERROR" "Не удалось загрузить yq. Проверьте подключение к интернету."
-                rm -rf "$temp_dir"
-                return 1
+            if command -v curl &>/dev/null; then
+                if curl -sSL --connect-timeout 30 "$yq_url" -o /opt/bin/yq; then
+                    chmod +x /opt/bin/yq
+                    export PATH="/opt/bin:$PATH"
+                    install_success=true
+                fi
+            elif command -v wget &>/dev/null; then
+                if wget -q --timeout=30 -O /opt/bin/yq "$yq_url"; then
+                    chmod +x /opt/bin/yq
+                    export PATH="/opt/bin:$PATH"
+                    install_success=true
+                fi
+            fi
+        fi
+        
+        # Вариант 3: Установка в домашнюю директорию
+        if [ "$install_success" = false ]; then
+            log "DEBUG" "Попытка установки в домашнюю директорию"
+            
+            local user_bin="$HOME/bin"
+            if [ ! -d "$user_bin" ]; then
+                mkdir -p "$user_bin"
             fi
             
-            # Делаем файл исполняемым
-            if ! chmod +x "$temp_yq"; then
-                log "ERROR" "Не удалось установить права на исполнение"
-                rm -rf "$temp_dir"
-                return 1
-            fi
-            
-            # Перемещаем файл в каталог с исполняемыми файлами
-            local install_paths=("/usr/local/bin" "/usr/bin" "/opt/bin")
-            local installed=false
-            
-            for install_path in "${install_paths[@]}"; do
-                if [ -d "$install_path" ] && [ -w "$install_path" ]; then
-                    if mv "$temp_yq" "$install_path/yq"; then
-                        log "SUCCESS" "yq успешно установлен в $install_path/yq"
-                        installed=true
-                        break
-                    fi
-                fi
-            done
-            
-            if [ "$installed" = "false" ]; then
-                local local_bin="$HOME/bin"
-                
-                if [ ! -d "$local_bin" ]; then
-                    if ! mkdir -p "$local_bin"; then
-                        log "ERROR" "Не удалось создать каталог $local_bin"
-                        rm -rf "$temp_dir"
-                        return 1
-                    fi
-                fi
-                
-                if mv "$temp_yq" "$local_bin/yq"; then
-                    log "SUCCESS" "yq успешно установлен в $local_bin/yq"
-                    installed=true
-                    export PATH="$PATH:$local_bin"
+            if command -v curl &>/dev/null; then
+                if curl -sSL --connect-timeout 30 "$yq_url" -o "$user_bin/yq"; then
+                    chmod +x "$user_bin/yq"
+                    export PATH="$user_bin:$PATH"
+                    install_success=true
                     
-                    if [ -f "$HOME/.bashrc" ]; then
-                        if ! grep -q "PATH=.*$local_bin" "$HOME/.bashrc"; then
-                            echo "export PATH=\$PATH:$local_bin" >> "$HOME/.bashrc"
-                        fi
+                    # Добавляем в .bashrc для постоянного эффекта
+                    if [ -f "$HOME/.bashrc" ] && ! grep -q "PATH.*$user_bin" "$HOME/.bashrc"; then
+                        echo "export PATH=\"\$PATH:$user_bin\"" >> "$HOME/.bashrc"
                     fi
-                else
-                    log "ERROR" "Не удалось установить yq в $local_bin"
+                fi
+            elif command -v wget &>/dev/null; then
+                if wget -q --timeout=30 -O "$user_bin/yq" "$yq_url"; then
+                    chmod +x "$user_bin/yq"
+                    export PATH="$user_bin:$PATH"
+                    install_success=true
+                    
+                    if [ -f "$HOME/.bashrc" ] && ! grep -q "PATH.*$user_bin" "$HOME/.bashrc"; then
+                        echo "export PATH=\"\$PATH:$user_bin\"" >> "$HOME/.bashrc"
+                    fi
                 fi
             fi
-            
-            rm -rf "$temp_dir"
-            
-            if command -v yq &>/dev/null; then
-                local yq_version=$(yq --version 2>&1 || echo "неизвестно")
-                log "SUCCESS" "yq успешно установлен, версия: $yq_version"
-                return 0
-            else
-                log "ERROR" "yq установлен, но не найден в PATH"
-                return 1
-            fi
+        fi
+        
+        # Проверяем успешность установки
+        if [ "$install_success" = true ] && command -v yq &>/dev/null; then
+            local yq_version=$(yq --version 2>/dev/null || echo "unknown")
+            log "SUCCESS" "yq успешно установлен, версия: $yq_version"
+            log "DEBUG" "Расположение: $(which yq)"
+            return 0
         else
-            log "ERROR" "yq необходим для управления конфигурацией MAS"
+            log "ERROR" "Не удалось установить yq"
+            log "DEBUG" "Проверьте подключение к интернету и права доступа"
             return 1
         fi
     fi
     
+    return 0
+}
+
+# Проверка и исправление установки yq при запуске
+check_and_fix_yq_installation() {
+    log "DEBUG" "Проверка корректности установки yq..."
+    
+    # Проверяем наличие yq
+    if ! command -v yq &>/dev/null; then
+        log "WARN" "yq не найден, пытаемся установить..."
+        check_yq_dependency
+        return $?
+    fi
+    
+    # Проверяем, не установлен ли через snap
+    local yq_version=$(yq --version 2>/dev/null || echo "")
+    local yq_path=$(which yq 2>/dev/null)
+    
+    if [[ "$yq_version" == *"snap"* ]] || [[ "$yq_path" == *"/snap/"* ]]; then
+        log "WARN" "Обнаружена snap версия yq, заменяем на полноценную..."
+        check_yq_dependency
+        return $?
+    fi
+    
+    log "DEBUG" "yq установлен корректно: $yq_version"
     return 0
 }
 
@@ -1165,6 +1183,30 @@ manage_mas_registration() {
     done
 }
 
+main() {
+    log "DEBUG" "Запуск главной функции модуля mas_manage_mas_registration.sh"
+    
+    # Проверяем и исправляем установку yq
+    if ! check_and_fix_yq_installation; then
+        log "ERROR" "Не удалось обеспечить корректную установку yq"
+        return 1
+    fi
+    
+    # Проверяем, что MAS установлен
+    if ! command -v mas >/dev/null 2>&1 && [ ! -f "$MAS_CONFIG_FILE" ]; then
+        print_header "MATRIX AUTHENTICATION SERVICE НЕ УСТАНОВЛЕН" "$RED"
+        log "ERROR" "Matrix Authentication Service не установлен"
+        log "INFO" "Установите MAS через главное меню"
+        
+        safe_echo "${RED}❌ Matrix Authentication Service не установлен!${NC}"
+        safe_echo "${YELLOW}Установите MAS через главное меню:${NC}"
+        safe_echo "${CYAN}  Дополнительные компоненты → Matrix Authentication Service (MAS)${NC}"
+        return 1
+    else
+        log "DEBUG" "MAS установлен, запуск меню управления регистрацией"
+        manage_mas_registration
+    fi
+}
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     main "$@"
