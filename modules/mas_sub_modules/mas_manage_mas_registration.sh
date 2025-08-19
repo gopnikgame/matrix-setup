@@ -440,6 +440,257 @@ initialize_mas_account_section() {
     return 0
 }
 
+# Изменение параметра в YAML файле (УЛУЧШЕННАЯ ВЕРСИЯ)
+set_mas_config_value() {
+    local key="$1"
+    local value="$2"
+    
+    log "INFO" "Начинаем изменение параметра $key на значение '$value'"
+    log "DEBUG" "Проверка существования файла конфигурации: $MAS_CONFIG_FILE"
+    
+    if [ ! -f "$MAS_CONFIG_FILE" ]; then
+        log "ERROR" "Файл конфигурации MAS не найден: $MAS_CONFIG_FILE"
+        log "DEBUG" "Содержимое директории $(dirname "$MAS_CONFIG_FILE"): $(ls -la "$(dirname "$MAS_CONFIG_FILE")" 2>/dev/null || echo "недоступно")"
+        return 1
+    fi
+    
+    log "DEBUG" "Файл конфигурации существует, размер: $(stat -c %s "$MAS_CONFIG_FILE" 2>/dev/null || echo "неизвестно") байт"
+    
+    if ! check_yq_dependency; then
+        log "ERROR" "Не удалось проверить зависимость yq"
+        return 1
+    fi
+    
+    # Проверяем версию yq
+    local yq_version=$(yq --version 2>/dev/null || echo "Unknown")
+    log "DEBUG" "Используемая версия yq: $yq_version"
+    
+    local full_path=""
+    case "$key" in
+        "password_registration_enabled"|"registration_token_required"|"email_change_allowed"|"displayname_change_allowed"|"password_change_allowed"|"password_recovery_enabled"|"account_deactivation_allowed")
+            full_path=".account.$key"
+            
+            log "DEBUG" "Проверка наличия секции account для параметра: $key"
+            if ! sudo -u "$MAS_USER" yq eval '.account' "$MAS_CONFIG_FILE" >/dev/null 2>&1; then
+                log "WARN" "Секция account отсутствует, инициализирую..."
+                if ! initialize_mas_account_section; then
+                    log "ERROR" "Не удалось инициализировать секцию account"
+                    return 1
+                fi
+            else
+                log "DEBUG" "Секция account уже существует"
+            fi
+            ;;
+        "captcha_service")
+            full_path=".captcha.service"
+            ;;
+        "captcha_site_key")
+            full_path=".captcha.site_key"
+            ;;
+        "captcha_secret_key")
+            full_path=".captcha.secret_key"
+            ;;
+        *)
+            log "ERROR" "Неизвестный параметр конфигурации: $key"
+            log "DEBUG" "Доступные параметры: password_registration_enabled, registration_token_required, email_change_allowed, displayname_change_allowed, password_change_allowed, password_recovery_enabled, account_deactivation_allowed, captcha_service, captcha_site_key, captcha_secret_key"
+            return 1
+            ;;
+    esac
+    
+    log "DEBUG" "Полный путь к параметру: $full_path"
+    
+    # Проверяем текущее значение параметра
+    local current_value=$(sudo -u "$MAS_USER" yq eval "$full_path" "$MAS_CONFIG_FILE" 2>/dev/null)
+    log "DEBUG" "Текущее значение параметра $key: '$current_value'"
+    
+    if [ "$current_value" = "$value" ]; then
+        log "INFO" "Параметр $key уже имеет значение '$value', изменение не требуется"
+        return 0
+    fi
+    
+    # Проверяем права доступа к файлу конфигурации
+    local file_perms=$(stat -c "%a" "$MAS_CONFIG_FILE" 2>/dev/null)
+    local file_owner=$(stat -c "%U:%G" "$MAS_CONFIG_FILE" 2>/dev/null)
+    log "DEBUG" "Права на файл конфигурации: $file_perms, владелец: $file_owner"
+    
+    # Проверяем, имеет ли пользователь MAS права на запись
+    if ! sudo -u "$MAS_USER" test -w "$MAS_CONFIG_FILE"; then
+        log "WARN" "Пользователь $MAS_USER не имеет прав на запись в файл конфигурации"
+        log "DEBUG" "Временное изменение прав для редактирования"
+        
+        # Сохраняем оригинальные права
+        local original_owner="$file_owner"
+        local original_perms="$file_perms"
+        
+        # Временно даем права root для редактирования
+        if chown root:root "$MAS_CONFIG_FILE"; then
+            log "DEBUG" "Владелец временно изменен на root:root"
+        else
+            log "ERROR" "Не удалось изменить владельца файла"
+            return 1
+        fi
+        
+        if chmod 644 "$MAS_CONFIG_FILE"; then
+            log "DEBUG" "Права доступа временно изменены на 644"
+        else
+            log "ERROR" "Не удалось изменить права доступа файла"
+            chown "$original_owner" "$MAS_CONFIG_FILE" 2>/dev/null
+            return 1
+        fi
+    else
+        log "DEBUG" "Пользователь $MAS_USER имеет права на запись в файл конфигурации"
+    fi
+    
+    # Создаем резервную копию
+    log "DEBUG" "Создание резервной копии конфигурационного файла"
+    backup_file "$MAS_CONFIG_FILE" "mas_config_change"
+    local backup_result=$?
+    local latest_backup=$(ls -t "$BACKUP_DIR"/mas_config_change_* 2>/dev/null | head -1)
+    
+    if [ $backup_result -eq 0 ] && [ -f "$latest_backup" ]; then
+        log "SUCCESS" "Резервная копия создана: $latest_backup"
+        log "DEBUG" "Размер резервной копии: $(stat -c %s "$latest_backup" 2>/dev/null || echo "неизвестно") байт"
+    else
+        log "WARN" "Проблема при создании резервной копии (код: $backup_result)"
+    fi
+    
+    # Сохраняем контрольную сумму файла перед изменением
+    local checksum_before=""
+    if command -v md5sum >/dev/null 2>&1; then
+        checksum_before=$(md5sum "$MAS_CONFIG_FILE" 2>/dev/null | awk '{print $1}')
+        log "DEBUG" "MD5 до изменения: $checksum_before"
+    fi
+    
+    # Основная попытка изменения с помощью yq
+    log "INFO" "Применение изменения: $full_path = $value"
+    local yq_output=""
+    local yq_exit_code=0
+    local config_success=false
+    
+    if ! yq_output=$(sudo -u "$MAS_USER" yq eval -i "$full_path = $value" "$MAS_CONFIG_FILE" 2>&1); then
+        yq_exit_code=$?
+        log "ERROR" "Ошибка при выполнении yq (код: $yq_exit_code): $yq_output"
+    else
+        log "DEBUG" "Команда yq выполнена успешно"
+        config_success=true
+    fi
+    
+    # Проверяем контрольную сумму после изменения
+    if [ -n "$checksum_before" ] && [ "$config_success" = true ]; then
+        local checksum_after=$(md5sum "$MAS_CONFIG_FILE" 2>/dev/null | awk '{print $1}')
+        log "DEBUG" "MD5 после изменения: $checksum_after"
+        
+        if [ "$checksum_before" = "$checksum_after" ]; then
+            log "WARN" "Файл не изменился после выполнения yq (MD5 совпадает)"
+            config_success=false
+        else
+            log "DEBUG" "Файл успешно изменен (MD5 отличается)"
+        fi
+    fi
+    
+    # Проверяем, что изменение действительно применилось
+    if [ "$config_success" = true ]; then
+        local new_value=$(sudo -u "$MAS_USER" yq eval "$full_path" "$MAS_CONFIG_FILE" 2>/dev/null)
+        if [ "$new_value" = "$value" ]; then
+            log "DEBUG" "Подтверждение: значение $key успешно изменено на '$value'"
+        else
+            log "WARN" "Изменение не применено: ожидалось '$value', получено '$new_value'"
+            config_success=false
+        fi
+    fi
+    
+    # Восстанавливаем оригинальные права доступа
+    if [ -n "$original_owner" ]; then
+        log "DEBUG" "Восстановление оригинальных прав доступа: $original_owner:$original_perms"
+        chown "$original_owner" "$MAS_CONFIG_FILE" 2>/dev/null
+        chmod "$original_perms" "$MAS_CONFIG_FILE" 2>/dev/null
+    fi
+    
+    # Если изменение не удалось, восстанавливаем из бэкапа
+    if [ "$config_success" = false ]; then
+        log "ERROR" "Не удалось применить изменения к конфигурации"
+        
+        if [ -n "$latest_backup" ] && [ -f "$latest_backup" ]; then
+            log "INFO" "Восстановление конфигурации из резервной копии: $latest_backup"
+            if cp "$latest_backup" "$MAS_CONFIG_FILE"; then
+                log "SUCCESS" "Конфигурация успешно восстановлена из резервной копии"
+                # Восстанавливаем права после восстановления
+                if [ -n "$original_owner" ]; then
+                    chown "$original_owner" "$MAS_CONFIG_FILE" 2>/dev/null
+                    chmod "$original_perms" "$MAS_CONFIG_FILE" 2>/dev/null
+                fi
+            else
+                log "ERROR" "Не удалось восстановить конфигурацию из резервной копии"
+            fi
+        else
+            log "ERROR" "Резервная копия не найдена для восстановления"
+        fi
+        return 1
+    fi
+    
+    # Проверяем валидность YAML после изменений
+    log "DEBUG" "Проверка валидности YAML после изменений"
+    if command -v python3 >/dev/null 2>&1; then
+        if ! python3 -c "import yaml; yaml.safe_load(open('$MAS_CONFIG_FILE'))" 2>/dev/null; then
+            log "ERROR" "YAML файл поврежден после изменений"
+            if [ -n "$latest_backup" ] && [ -f "$latest_backup" ]; then
+                cp "$latest_backup" "$MAS_CONFIG_FILE"
+                log "INFO" "Конфигурация восстановлена из резервной копии после повреждения YAML"
+            fi
+            return 1
+        else
+            log "DEBUG" "YAML файл валиден после изменений"
+        fi
+    else
+        log "WARN" "Python3 не найден, пропуск проверки валидности YAML"
+    fi
+    
+    # Устанавливаем окончательные права доступа
+    log "DEBUG" "Установка окончательных прав доступа: владелец=$MAS_USER:$MAS_GROUP, права=600"
+    chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE" 2>/dev/null
+    chmod 600 "$MAS_CONFIG_FILE" 2>/dev/null
+    
+    # Перезапускаем MAS для применения изменений
+    log "INFO" "Перезапуск Matrix Authentication Service для применения изменений..."
+    local restart_output=""
+    
+    if restart_output=$(restart_service "matrix-auth-service" 2>&1); then
+        log "DEBUG" "Команда перезапуска выполнена успешно"
+        sleep 2
+        
+        if systemctl is-active --quiet matrix-auth-service; then
+            log "SUCCESS" "Matrix Authentication Service успешно запущен после перезапуска"
+            
+            # Дополнительная проверка доступности службы
+            local service_status=$(systemctl is-active matrix-auth-service 2>&1)
+            log "DEBUG" "Статус службы: $service_status"
+            
+        else
+            log "ERROR" "Matrix Authentication Service не запустился после изменения конфигурации"
+            log "DEBUG" "Вывод systemctl status:"
+            systemctl status matrix-auth-service --no-pager -n 5 2>&1 | while read -r line; do
+                log "DEBUG" "  $line"
+            done
+            return 1
+        fi
+    else
+        log "ERROR" "Ошибка выполнения команды перезапуска: $restart_output"
+        return 1
+    fi
+    
+    # Финальная проверка значения после перезапуска
+    local final_value=$(sudo -u "$MAS_USER" yq eval "$full_path" "$MAS_CONFIG_FILE" 2>/dev/null)
+    log "DEBUG" "Финальное значение параметра $key после перезапуска: '$final_value'"
+    
+    if [ "$final_value" = "$value" ]; then
+        log "SUCCESS" "Параметр $key успешно изменен на '$value' и применен после перезапуска"
+    else
+        log "WARN" "Значение параметра изменилось после перезапуска: '$final_value' (ожидалось: '$value')"
+    fi
+    
+    return 0
+}
+
 # Просмотр секции account конфигурации MAS
 view_mas_account_config() {
     print_header "КОНФИГУРАЦИЯ СЕКЦИИ ACCOUNT В MAS" "$CYAN"
