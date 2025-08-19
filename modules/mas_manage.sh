@@ -3,6 +3,7 @@
 # Matrix Authentication Service (MAS) Management Module
 
 # Определение директории скрипта с учетом символических ссылок
+# ВАЖНО: НЕ используем переменную SCRIPT_DIR из родительского процесса
 if [[ -L "${BASH_SOURCE[0]}" ]]; then
     # Если это символическая ссылка, получаем реальный путь
     REAL_SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -11,83 +12,108 @@ else
     REAL_SCRIPT_PATH="${BASH_SOURCE[0]}"
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "$REAL_SCRIPT_PATH")" && pwd)"
+# Всегда определяем MAS_SCRIPT_DIR независимо от экспортированного SCRIPT_DIR
+MAS_SCRIPT_DIR="$(cd "$(dirname "$REAL_SCRIPT_PATH")" && pwd)"
 
 # Подключение общей библиотеки
-if [ -f "${SCRIPT_DIR}/../common/common_lib.sh" ]; then
-    source "${SCRIPT_DIR}/../common/common_lib.sh"
+if [ -f "${MAS_SCRIPT_DIR}/../common/common_lib.sh" ]; then
+    source "${MAS_SCRIPT_DIR}/../common/common_lib.sh"
 else
     echo "ОШИБКА: Не найдена общая библиотека common_lib.sh"
     echo "Проверяем пути:"
     echo "  REAL_SCRIPT_PATH: $REAL_SCRIPT_PATH"
-    echo "  SCRIPT_DIR: $SCRIPT_DIR"
-    echo "  Ищем библиотеку: ${SCRIPT_DIR}/../common/common_lib.sh"
+    echo "  MAS_SCRIPT_DIR: $MAS_SCRIPT_DIR"
+    echo "  Ищем библиотеку: ${MAS_SCRIPT_DIR}/../common/common_lib.sh"
     exit 1
 fi
 
 # Отладочная информация для поиска подмодулей
 log "DEBUG" "Определение путей к подмодулям:"
 log "DEBUG" "  REAL_SCRIPT_PATH: $REAL_SCRIPT_PATH"
-log "DEBUG" "  SCRIPT_DIR: $SCRIPT_DIR"
-log "DEBUG" "  Директория подмодулей: ${SCRIPT_DIR}/mas_sub_modules"
+log "DEBUG" "  MAS_SCRIPT_DIR: $MAS_SCRIPT_DIR"
+log "DEBUG" "  Экспортированный SCRIPT_DIR: ${SCRIPT_DIR:-не установлен}"
+log "DEBUG" "  Директория подмодулей: ${MAS_SCRIPT_DIR}/mas_sub_modules"
 
 # Проверяем существование директории подмодулей
-if [ ! -d "${SCRIPT_DIR}/mas_sub_modules" ]; then
-    log "ERROR" "Директория подмодулей не найдена: ${SCRIPT_DIR}/mas_sub_modules"
-    log "INFO" "Содержимое SCRIPT_DIR (${SCRIPT_DIR}):"
-    ls -la "${SCRIPT_DIR}/" 2>/dev/null || log "ERROR" "Не удалось прочитать содержимое SCRIPT_DIR"
-    exit 1
+if [ ! -d "${MAS_SCRIPT_DIR}/mas_sub_modules" ]; then
+    log "ERROR" "Директория подмодулей не найдена: ${MAS_SCRIPT_DIR}/mas_sub_modules"
+    log "INFO" "Содержимое MAS_SCRIPT_DIR (${MAS_SCRIPT_DIR}):"
+    ls -la "${MAS_SCRIPT_DIR}/" 2>/dev/null || log "ERROR" "Не удалось прочитать содержимое MAS_SCRIPT_DIR"
+    
+    # Дополнительная диагностика
+    log "INFO" "Попробуем найти mas_sub_modules в разных местах..."
+    
+    # Проверяем в текущей директории
+    if [ -d "./mas_sub_modules" ]; then
+        log "INFO" "Найдена директория ./mas_sub_modules"
+        ls -la "./mas_sub_modules/" 2>/dev/null | head -5
+    fi
+    
+    # Проверяем в директории modules
+    if [ -d "./modules/mas_sub_modules" ]; then
+        log "INFO" "Найдена директория ./modules/mas_sub_modules"
+        ls -la "./modules/mas_sub_modules/" 2>/dev/null | head -5
+    fi
+    
+    # Проверяем относительно SCRIPT_DIR если он установлен
+    if [ -n "${SCRIPT_DIR:-}" ] && [ -d "${SCRIPT_DIR}/modules/mas_sub_modules" ]; then
+        log "INFO" "Найдена директория ${SCRIPT_DIR}/modules/mas_sub_modules"
+        log "INFO" "Переопределяем MAS_SCRIPT_DIR на правильный путь"
+        MAS_SCRIPT_DIR="${SCRIPT_DIR}/modules"
+    else
+        exit 1
+    fi
 fi
 
 # Подключение всех подмодулей MAS
 log "DEBUG" "Подключение подмодулей MAS..."
 
 # Подключение модуля удаления MAS
-if [ -f "${SCRIPT_DIR}/mas_sub_modules/mas_removing.sh" ]; then
-    source "${SCRIPT_DIR}/mas_sub_modules/mas_removing.sh"
+if [ -f "${MAS_SCRIPT_DIR}/mas_sub_modules/mas_removing.sh" ]; then
+    source "${MAS_SCRIPT_DIR}/mas_sub_modules/mas_removing.sh"
     log "DEBUG" "Модуль mas_removing.sh подключен"
 else
-    log "WARN" "Модуль mas_removing.sh не найден: ${SCRIPT_DIR}/mas_sub_modules/mas_removing.sh"
+    log "WARN" "Модуль mas_removing.sh не найден: ${MAS_SCRIPT_DIR}/mas_sub_modules/mas_removing.sh"
 fi
 
 # Подключение модуля диагностики и восстановления
-if [ -f "${SCRIPT_DIR}/mas_sub_modules/mas_diagnosis_and_recovery.sh" ]; then
-    source "${SCRIPT_DIR}/mas_sub_modules/mas_diagnosis_and_recovery.sh"
+if [ -f "${MAS_SCRIPT_DIR}/mas_sub_modules/mas_diagnosis_and_recovery.sh" ]; then
+    source "${MAS_SCRIPT_DIR}/mas_sub_modules/mas_diagnosis_and_recovery.sh"
     log "DEBUG" "Модуль mas_diagnosis_and_recovery.sh подключен"
 else
-    log "WARN" "Модуль mas_diagnosis_and_recovery.sh не найден: ${SCRIPT_DIR}/mas_sub_modules/mas_diagnosis_and_recovery.sh"
+    log "WARN" "Модуль mas_diagnosis_and_recovery.sh не найден: ${MAS_SCRIPT_DIR}/mas_sub_modules/mas_diagnosis_and_recovery.sh"
 fi
 
 # Подключение модуля управления регистрацией
-if [ -f "${SCRIPT_DIR}/mas_sub_modules/mas_manage_mas_registration.sh" ]; then
-    source "${SCRIPT_DIR}/mas_sub_modules/mas_manage_mas_registration.sh"
+if [ -f "${MAS_SCRIPT_DIR}/mas_sub_modules/mas_manage_mas_registration.sh" ]; then
+    source "${MAS_SCRIPT_DIR}/mas_sub_modules/mas_manage_mas_registration.sh"
     log "DEBUG" "Модуль mas_manage_mas_registration.sh подключен"
 else
-    log "WARN" "Модуль mas_manage_mas_registration.sh не найден: ${SCRIPT_DIR}/mas_sub_modules/mas_manage_mas_registration.sh"
+    log "WARN" "Модуль mas_manage_mas_registration.sh не найден: ${MAS_SCRIPT_DIR}/mas_sub_modules/mas_manage_mas_registration.sh"
 fi
 
 # Подключение модуля управления SSO провайдерами
-if [ -f "${SCRIPT_DIR}/mas_sub_modules/mas_manage_sso.sh" ]; then
-    source "${SCRIPT_DIR}/mas_sub_modules/mas_manage_sso.sh"
+if [ -f "${MAS_SCRIPT_DIR}/mas_sub_modules/mas_manage_sso.sh" ]; then
+    source "${MAS_SCRIPT_DIR}/mas_sub_modules/mas_manage_sso.sh"
     log "DEBUG" "Модуль mas_manage_sso.sh подключен"
 else
-    log "WARN" "Модуль mas_manage_sso.sh не найден: ${SCRIPT_DIR}/mas_sub_modules/mas_manage_sso.sh"
+    log "WARN" "Модуль mas_manage_sso.sh не найден: ${MAS_SCRIPT_DIR}/mas_sub_modules/mas_manage_sso.sh"
 fi
 
 # Подключение модуля управления CAPTCHA
-if [ -f "${SCRIPT_DIR}/mas_sub_modules/mas_manage_captcha.sh" ]; then
-    source "${SCRIPT_DIR}/mas_sub_modules/mas_manage_captcha.sh"
+if [ -f "${MAS_SCRIPT_DIR}/mas_sub_modules/mas_manage_captcha.sh" ]; then
+    source "${MAS_SCRIPT_DIR}/mas_sub_modules/mas_manage_captcha.sh"
     log "DEBUG" "Модуль mas_manage_captcha.sh подключен"
 else
-    log "WARN" "Модуль mas_manage_captcha.sh не найден: ${SCRIPT_DIR}/mas_sub_modules/mas_manage_captcha.sh"
+    log "WARN" "Модуль mas_manage_captcha.sh не найден: ${MAS_SCRIPT_DIR}/mas_sub_modules/mas_manage_captcha.sh"
 fi
 
 # Подключение модуля управления заблокированными именами пользователей
-if [ -f "${SCRIPT_DIR}/mas_sub_modules/mas_manage_ban_usernames.sh" ]; then
-    source "${SCRIPT_DIR}/mas_sub_modules/mas_manage_ban_usernames.sh"
+if [ -f "${MAS_SCRIPT_DIR}/mas_sub_modules/mas_manage_ban_usernames.sh" ]; then
+    source "${MAS_SCRIPT_DIR}/mas_sub_modules/mas_manage_ban_usernames.sh"
     log "DEBUG" "Модуль mas_manage_ban_usernames.sh подключен"
 else
-    log "WARN" "Модуль mas_manage_ban_usernames.sh не найден: ${SCRIPT_DIR}/mas_sub_modules/mas_manage_ban_usernames.sh"
+    log "WARN" "Модуль mas_manage_ban_usernames.sh не найден: ${MAS_SCRIPT_DIR}/mas_sub_modules/mas_manage_ban_usernames.sh"
 fi
 
 # Настройки модуля
@@ -880,12 +906,12 @@ check_submodule_availability() {
     local missing_modules=()
     
     log "DEBUG" "Проверка доступности подмодулей MAS..."
-    log "DEBUG" "Директория подмодулей: ${SCRIPT_DIR}/mas_sub_modules"
+    log "DEBUG" "Директория подмодулей: ${MAS_SCRIPT_DIR}/mas_sub_modules"
     
     # Показываем содержимое директории подмодулей для отладки
-    if [ -d "${SCRIPT_DIR}/mas_sub_modules" ]; then
+    if [ -d "${MAS_SCRIPT_DIR}/mas_sub_modules" ]; then
         log "DEBUG" "Содержимое директории mas_sub_modules:"
-        ls -la "${SCRIPT_DIR}/mas_sub_modules/" 2>/dev/null | while IFS= read -r line; do
+        ls -la "${MAS_SCRIPT_DIR}/mas_sub_modules/" 2>/dev/null | while IFS= read -r line; do
             log "DEBUG" "  $line"
         done
     else
@@ -960,7 +986,7 @@ check_submodule_availability() {
         log "WARN" "Недоступные подмодули: ${missing_modules[*]}"
         log "DEBUG" "Проверим существование файлов модулей:"
         for module in "${missing_modules[@]}"; do
-            local module_path="${SCRIPT_DIR}/mas_sub_modules/${module}"
+            local module_path="${MAS_SCRIPT_DIR}/mas_sub_modules/${module}"
             if [ -f "$module_path" ]; then
                 log "DEBUG" "  $module: файл существует, но функции не загружены"
                 log "DEBUG" "    Проверка синтаксиса: $(bash -n "$module_path" 2>&1 || echo "ОШИБКА СИНТАКСИСА")"
@@ -989,11 +1015,12 @@ emergency_diagnostics() {
         safe_echo "   Реальный путь: $(readlink -f "${BASH_SOURCE[0]}")"
     fi
     safe_echo "   REAL_SCRIPT_PATH: ${REAL_SCRIPT_PATH:-не определен}"
-    safe_echo "   SCRIPT_DIR: ${SCRIPT_DIR:-не определен}"
+    safe_echo "   MAS_SCRIPT_DIR: ${MAS_SCRIPT_DIR:-не определен}"
+    safe_echo "   Экспортированный SCRIPT_DIR: ${SCRIPT_DIR:-не установлен}"
     
     echo
     safe_echo "${BLUE}2. Проверка директорий:${NC}"
-    local mas_modules_dir="${SCRIPT_DIR}/mas_sub_modules"
+    local mas_modules_dir="${MAS_SCRIPT_DIR}/mas_sub_modules"
     safe_echo "   Директория подмодулей: $mas_modules_dir"
     
     if [ -d "$mas_modules_dir" ]; then
@@ -1004,10 +1031,30 @@ emergency_diagnostics() {
         done
     else
         safe_echo "   ${RED}❌ Директория НЕ существует${NC}"
-        safe_echo "   Содержимое родительской директории (${SCRIPT_DIR}):"
-        ls -la "${SCRIPT_DIR}" | while IFS= read -r line; do
+        safe_echo "   Содержимое родительской директории (${MAS_SCRIPT_DIR}):"
+        ls -la "${MAS_SCRIPT_DIR}" | while IFS= read -r line; do
             safe_echo "     $line"
         done
+        
+        # Дополнительный поиск
+        echo
+        safe_echo "   ${BLUE}Поиск mas_sub_modules в других местах:${NC}"
+        
+        if [ -n "${SCRIPT_DIR:-}" ] && [ -d "${SCRIPT_DIR}/modules/mas_sub_modules" ]; then
+            safe_echo "   ${YELLOW}⚠️  Найдена в: ${SCRIPT_DIR}/modules/mas_sub_modules${NC}"
+            safe_echo "     Содержимое:"
+            ls -la "${SCRIPT_DIR}/modules/mas_sub_modules/" 2>/dev/null | head -5 | while IFS= read -r line; do
+                safe_echo "       $line"
+            done
+        fi
+        
+        if [ -d "./modules/mas_sub_modules" ]; then
+            safe_echo "   ${YELLOW}⚠️  Найдена в: ./modules/mas_sub_modules${NC}"
+        fi
+        
+        if [ -d "../mas_sub_modules" ]; then
+            safe_echo "   ${YELLOW}⚠️  Найдена в: ../mas_sub_modules${NC}"
+        fi
     fi
     
     echo
@@ -1039,7 +1086,7 @@ emergency_diagnostics() {
             if bash -n "$submodule_path" 2>/dev/null; then
                 safe_echo "     ${GREEN}✅ Синтаксис корректен${NC}"
             else
-                safe_echo "     ${RED}❌ Ошибка синтаксиса:${NC}"
+                safe_echo "     ${RED}❌ Ошибка синтакса:${NC}"
                 bash -n "$submodule_path" 2>&1 | while IFS= read -r error_line; do
                     safe_echo "       $error_line"
                 done
@@ -1051,6 +1098,14 @@ emergency_diagnostics() {
             
         else
             safe_echo "     ${RED}❌ Файл НЕ существует: $submodule_path${NC}"
+            
+            # Ищем в альтернативных местах
+            if [ -n "${SCRIPT_DIR:-}" ]; then
+                local alt_path="${SCRIPT_DIR}/modules/mas_sub_modules/${submodule}"
+                if [ -f "$alt_path" ]; then
+                    safe_echo "     ${YELLOW}⚠️  Найден в альтернативном месте: $alt_path${NC}"
+                fi
+            fi
         fi
         echo
     done
@@ -1064,7 +1119,7 @@ emergency_diagnostics() {
     
     echo
     safe_echo "${BLUE}5. Проверка общей библиотеки:${NC}"
-    local common_lib_path="${SCRIPT_DIR}/../common/common_lib.sh"
+    local common_lib_path="${MAS_SCRIPT_DIR}/../common/common_lib.sh"
     safe_echo "   Путь к библиотеке: $common_lib_path"
     
     if [ -f "$common_lib_path" ]; then
@@ -1086,6 +1141,7 @@ emergency_diagnostics() {
     safe_echo "2. Если файлы существуют, но функции не загружаются, проверьте ошибки синтаксиса"
     safe_echo "3. Убедитесь, что вы запускаете скрипт с правами root"
     safe_echo "4. Попробуйте запустить: export DEBUG_MODE=true && ./modules/mas_manage.sh"
+    safe_echo "5. Если подмодули найдены в другом месте, возможно проблема с переменными путей"
     
     echo
     read -p "Нажмите Enter для продолжения..."
@@ -1120,25 +1176,45 @@ handle_missing_function() {
             # Пытаемся заново загрузить подмодули
             local reload_success=true
             
-            if [ -f "${SCRIPT_DIR}/mas_sub_modules/$module_name" ]; then
-                log "INFO" "Попытка загрузки $module_name..."
-                if source "${SCRIPT_DIR}/mas_sub_modules/$module_name" 2>/dev/null; then
-                    log "SUCCESS" "Модуль $module_name загружен"
+            # Проверяем разные возможные пути
+            local module_paths=(
+                "${MAS_SCRIPT_DIR}/mas_sub_modules/$module_name"
+                "${SCRIPT_DIR}/modules/mas_sub_modules/$module_name"
+                "./modules/mas_sub_modules/$module_name"
+                "./mas_sub_modules/$module_name"
+            )
+            
+            local found_module=false
+            for module_path in "${module_paths[@]}"; do
+                if [ -f "$module_path" ]; then
+                    log "INFO" "Найден модуль по пути: $module_path"
+                    log "INFO" "Попытка загрузки $module_name..."
                     
-                    # Проверяем, доступна ли теперь функция
-                    if command -v "$function_name" >/dev/null 2>&1; then
-                        log "SUCCESS" "Функция $function_name теперь доступна!"
-                        return 0
+                    if source "$module_path" 2>/dev/null; then
+                        log "SUCCESS" "Модуль $module_name загружен"
+                        found_module=true
+                        
+                        # Проверяем, доступна ли теперь функция
+                        if command -v "$function_name" >/dev/null 2>&1; then
+                            log "SUCCESS" "Функция $function_name теперь доступна!"
+                            return 0
+                        else
+                            log "WARN" "Модуль загружен, но функция $function_name все еще недоступна"
+                            reload_success=false
+                        fi
+                        break
                     else
-                        log "WARN" "Модуль загружен, но функция $function_name все еще недоступна"
+                        log "ERROR" "Ошибка загрузки модуля $module_name из $module_path"
                         reload_success=false
                     fi
-                else
-                    log "ERROR" "Ошибка загрузки модуля $module_name"
-                    reload_success=false
                 fi
-            else
-                log "ERROR" "Файл модуля не найден: ${SCRIPT_DIR}/mas_sub_modules/$module_name"
+            done
+            
+            if [ "$found_module" = false ]; then
+                log "ERROR" "Файл модуля не найден ни в одном из ожидаемых мест:"
+                for module_path in "${module_paths[@]}"; do
+                    log "ERROR" "  $module_path"
+                done
                 reload_success=false
             fi
             

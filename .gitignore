@@ -479,3 +479,4 @@ test_mas_fixes_simple.sh
 test_mas_integration.sh
 MAS_SUBMODULES_FIX_REPORT.md
 quick_mas_diagnostic.sh
+test_mas_submodules_fix.sh
