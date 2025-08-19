@@ -33,6 +33,215 @@ if ! id -u "$MAS_USER" >/dev/null 2>&1; then
     exit 1
 fi
 
+# Проверка и исправление установки yq при запуске (АГРЕССИВНОЕ УДАЛЕНИЕ SNAP)
+check_and_fix_yq_installation() {
+    log "DEBUG" "АГРЕССИВНАЯ проверка корректности установки yq..."
+    
+    # Шаг 1: Полное удаление всех версий yq
+    log "INFO" "Удаляем ВСЕ существующие версии yq..."
+    
+    # Удаляем snap версию максимально агрессивно
+    if command -v snap &>/dev/null; then
+        log "DEBUG" "Принудительное удаление snap версии yq..."
+        snap remove yq 2>/dev/null || true
+        snap remove yq --purge 2>/dev/null || true
+        # Ждем завершения операций snap
+        sleep 2
+    fi
+    
+    # Удаляем все возможные бинарники yq из всех известных мест
+    local yq_paths=(
+        "/usr/local/bin/yq"
+        "/usr/bin/yq"
+        "/opt/bin/yq"
+        "$HOME/bin/yq"
+        "/snap/bin/yq"
+        "/var/lib/snapd/snap/bin/yq"
+        "/snap/yq/current/bin/yq"
+        "/usr/local/sbin/yq"
+        "/usr/sbin/yq"
+        "/sbin/yq"
+        "/bin/yq"
+    )
+    
+    for path in "${yq_paths[@]}"; do
+        if [ -f "$path" ] || [ -L "$path" ]; then
+            log "DEBUG" "Удаляем: $path"
+            rm -f "$path" 2>/dev/null || true
+        fi
+    done
+    
+    # Очищаем кэш команд агрессивно
+    hash -d yq 2>/dev/null || true
+    hash -r 2>/dev/null || true
+    unset -f yq 2>/dev/null || true
+    
+    # Ждем
+    sleep 1
+    
+    # Убеждаемся, что yq больше не найден
+    local attempts=0
+    while command -v yq &>/dev/null && [ $attempts -lt 5 ]; do
+        local remaining_path=$(which yq 2>/dev/null)
+        log "WARN" "yq все еще найден по пути: $remaining_path, попытка удаления $((attempts + 1))"
+        rm -f "$remaining_path" 2>/dev/null || true
+        
+        # Если это snap путь, убиваем snap процессы
+        if [[ "$remaining_path" == *"/snap/"* ]]; then
+            log "DEBUG" "Найден snap путь, принудительное завершение snap процессов..."
+            pkill -f "snap.*yq" 2>/dev/null || true
+            umount -f "/snap/yq"* 2>/dev/null || true
+            rm -rf "/snap/yq" 2>/dev/null || true
+            rm -rf "/var/lib/snapd/snap/yq" 2>/dev/null || true
+        fi
+        
+        hash -r 2>/dev/null || true
+        sleep 1
+        ((attempts++))
+    done
+    
+    # Окончательная проверка отсутствия yq
+    if command -v yq &>/dev/null; then
+        local final_path=$(which yq 2>/dev/null)
+        log "ERROR" "Не удалось полностью удалить yq: $final_path"
+        log "DEBUG" "Попытка принудительного удаления из PATH..."
+        
+        # Временно исключаем из PATH
+        local old_path="$PATH"
+        export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v snap | tr '\n' ':' | sed 's/:$//')
+        
+        # Проверяем снова
+        if command -v yq &>/dev/null; then
+            log "ERROR" "yq все еще найден даже после удаления snap из PATH"
+            export PATH="$old_path"  # Возвращаем PATH
+            return 1
+        else
+            log "DEBUG" "yq успешно исключен из PATH"
+            export PATH="$old_path"  # Возвращаем PATH
+        fi
+    else
+        log "SUCCESS" "Все версии yq успешно удалены"
+    fi
+    
+    # Шаг 2: Принудительная установка правильной версии
+    log "INFO" "Принудительная установка правильной версии yq..."
+    
+    # Определяем архитектуру
+    local arch=$(uname -m)
+    local yq_binary=""
+    
+    case "$arch" in
+        x86_64) yq_binary="yq_linux_amd64" ;;
+        aarch64|arm64) yq_binary="yq_linux_arm64" ;;
+        armv7l|armv6l) yq_binary="yq_linux_arm" ;;
+        *)
+            log "ERROR" "Неподдерживаемая архитектура: $arch"
+            return 1
+            ;;
+    esac
+    
+    log "DEBUG" "Архитектура: $arch, бинарник: $yq_binary"
+    
+    # URL для загрузки
+    local yq_url="https://github.com/mikefarah/yq/releases/latest/download/$yq_binary"
+    log "DEBUG" "URL для загрузки: $yq_url"
+    
+    # Пытаемся установить в /usr/local/bin с проверкой
+    local install_success=false
+    local install_path="/usr/local/bin/yq"
+    
+    # Создаем директорию если нужно
+    mkdir -p "$(dirname "$install_path")"
+    
+    # Скачиваем с помощью curl
+    if command -v curl &>/dev/null; then
+        log "DEBUG" "Скачивание yq с помощью curl..."
+        if curl -sSL --connect-timeout 30 --retry 3 "$yq_url" -o "$install_path"; then
+            chmod +x "$install_path"
+            
+            # ВАЖНО: Проверяем что это не snap и что файл работает
+            if [ -f "$install_path" ] && "$install_path" --version >/dev/null 2>&1; then
+                # Дополнительная проверка что это не snap
+                local file_info=$(file "$install_path" 2>/dev/null || echo "")
+                if [[ "$file_info" == *"ELF"* ]]; then
+                    install_success=true
+                    log "SUCCESS" "yq успешно установлен в $install_path"
+                else
+                    log "ERROR" "Установленный файл не является исполняемым ELF файлом"
+                    rm -f "$install_path"
+                fi
+            else
+                log "ERROR" "Установленный yq не работает"
+                rm -f "$install_path"
+            fi
+        else
+            log "ERROR" "Не удалось скачать yq с помощью curl"
+        fi
+    elif command -v wget &>/dev/null; then
+        log "DEBUG" "Скачивание yq с помощью wget..."
+        if wget -q --timeout=30 --tries=3 -O "$install_path" "$yq_url"; then
+            chmod +x "$install_path"
+            
+            if [ -f "$install_path" ] && "$install_path" --version >/dev/null 2>&1; then
+                local file_info=$(file "$install_path" 2>/dev/null || echo "")
+                if [[ "$file_info" == *"ELF"* ]]; then
+                    install_success=true
+                    log "SUCCESS" "yq успешно установлен в $install_path"
+                else
+                    log "ERROR" "Установленный файл не является исполняемым ELF файлом"
+                    rm -f "$install_path"
+                fi
+            else
+                log "ERROR" "Установленный yq не работает"
+                rm -f "$install_path"
+            fi
+        else
+            log "ERROR" "Не удалось скачать yq с помощью wget"
+        fi
+    else
+        log "ERROR" "Не найдены curl или wget для скачивания yq"
+        return 1
+    fi
+    
+    # Обновляем PATH и кэш команд
+    export PATH="/usr/local/bin:$PATH"
+    hash -r 2>/dev/null || true
+    
+    # Финальная проверка установки
+    if [ "$install_success" = true ] && command -v yq &>/dev/null; then
+        local yq_version=$(yq --version 2>/dev/null || echo "unknown")
+        local yq_path=$(which yq 2>/dev/null)
+        log "SUCCESS" "yq успешно установлен и работает"
+        log "DEBUG" "Версия: $yq_version"
+        log "DEBUG" "Расположение: $yq_path"
+        
+        # Финальная проверка что это НЕ snap версия
+        if [[ "$yq_path" == *"/snap/"* ]]; then
+            log "ERROR" "КРИТИЧЕСКАЯ ОШИБКА: Установилась snap версия несмотря на все предостережения!"
+            return 1
+        fi
+        
+        # Проверяем что можем выполнить простую команду
+        if echo "test: value" | yq eval '.test' - >/dev/null 2>&1; then
+            log "SUCCESS" "yq успешно прошел функциональный тест"
+            return 0
+        else
+            log "ERROR" "yq установлен, но не прошел функциональный тест"
+            return 1
+        fi
+    else
+        log "ERROR" "Не удалось установить рабочую версию yq"
+        log "DEBUG" "Проверьте подключение к интернету и права доступа"
+        
+        # Показываем пользователю команды для ручной установки
+        safe_echo "${RED}❌ Не удалось автоматически установить yq${NC}"
+        safe_echo "${YELLOW}Выполните вручную:${NC}"
+        safe_echo "sudo curl -sSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq"
+        safe_echo "sudo chmod +x /usr/local/bin/yq"
+        
+        return 1
+    fi
+}
 
 # Проверка и установка yq (БЕЗ SNAP)
 check_yq_dependency() {
@@ -164,42 +373,6 @@ check_yq_dependency() {
         safe_echo "sudo chmod +x /usr/local/bin/yq"
         
         return 1
-    fi
-}
-
-# Проверка и исправление установки yq при запуске
-check_and_fix_yq_installation() {
-    log "DEBUG" "Проверка корректности установки yq..."
-    
-    # Проверяем наличие yq и что это не snap
-    if command -v yq &>/dev/null; then
-        local yq_path=$(which yq 2>/dev/null)
-        local yq_version=$(yq --version 2>/dev/null || echo "")
-        
-        if [[ "$yq_path" == *"/snap/"* ]]; then
-            log "WARN" "Обнаружена snap версия yq по пути: $yq_path"
-            log "INFO" "Удаляем snap версию и устанавливаем правильную..."
-            
-            # Удаляем snap
-            if command -v snap &>/dev/null; then
-                snap remove yq 2>/dev/null
-            fi
-            
-            # Удаляем симлинки
-            rm -f "$yq_path" 2>/dev/null
-            hash -r
-            
-            # Устанавливаем заново
-            check_yq_dependency
-            return $?
-        else
-            log "DEBUG" "yq установлен корректно: $yq_version"
-            return 0
-        fi
-    else
-        log "WARN" "yq не найден, устанавливаем..."
-        check_yq_dependency
-        return $?
     fi
 }
 
@@ -387,7 +560,7 @@ initialize_mas_account_section() {
                 log "ERROR" "YAML файл поврежден после неудачной попытки модификации"
                 if [ -n "$latest_backup" ] && [ -f "$latest_backup" ]; then
                     log "INFO" "Восстановление из резервной копии после ошибки yq"
-                    if restore_file "$latest_backup" "$MAS_CONFIG_FILE"; then
+                    if restore_file "$latest_backup" "$MAS_CONFIG_FILE" ]; then
                         log "SUCCESS" "Конфигурация восстановлена после ошибки"
                     fi
                 fi
@@ -469,14 +642,27 @@ set_mas_config_value() {
     
     log "DEBUG" "Файл конфигурации существует, размер: $(stat -c %s "$MAS_CONFIG_FILE" 2>/dev/null || echo "неизвестно") байт"
     
-    if ! check_yq_dependency; then
-        log "ERROR" "Не удалось проверить зависимость yq"
+    # ПРИНУДИТЕЛЬНАЯ проверка корректности yq перед использованием
+    log "DEBUG" "Принудительная проверка корректности yq перед изменением конфигурации..."
+    if ! check_and_fix_yq_installation; then
+        log "ERROR" "Не удалось обеспечить корректную установку yq"
         return 1
     fi
     
     # Проверяем версию yq
     local yq_version=$(yq --version 2>/dev/null || echo "Unknown")
     log "DEBUG" "Используемая версия yq: $yq_version"
+    
+    # Проверяем что это НЕ snap версия
+    local yq_path=$(which yq 2>/dev/null)
+    if [[ "$yq_path" == *"/snap/"* ]]; then
+        log "ERROR" "КРИТИЧЕСКАЯ ОШИБКА: Обнаружена snap версия yq по пути: $yq_path"
+        log "ERROR" "Принудительное удаление snap версии и переустановка..."
+        if ! check_and_fix_yq_installation; then
+            log "ERROR" "Не удалось исправить проблему со snap версией yq"
+            return 1
+        fi
+    fi
     
     local full_path=""
     case "$key" in
@@ -713,8 +899,11 @@ view_mas_account_config() {
         return 1
     fi
     
-    if ! check_yq_dependency; then
-        log "ERROR" "Невозможно продолжить без yq"
+    # Принудительная проверка yq перед использованием
+    log "DEBUG" "Проверка корректности yq для просмотра конфигурации..."
+    if ! check_and_fix_yq_installation; then
+        log "ERROR" "Невозможно продолжить без корректной версии yq"
+        safe_echo "${RED}❌ Невозможно просмотреть конфигурацию без yq${NC}"
         return 1
     fi
     
@@ -812,9 +1001,21 @@ get_mas_registration_status() {
         return 1
     fi
     
-    if ! check_yq_dependency; then
+    # Быстрая проверка yq перед использованием
+    if ! command -v yq >/dev/null 2>&1; then
+        log "WARN" "yq не найден для чтения конфигурации"
         echo "unknown"
         return 1
+    fi
+    
+    # Проверяем что это не snap версия
+    local yq_path=$(which yq 2>/dev/null)
+    if [[ "$yq_path" == *"/snap/"* ]]; then
+        log "WARN" "Обнаружена snap версия yq, исправляем..."
+        if ! check_and_fix_yq_installation; then
+            echo "unknown"
+            return 1
+        fi
     fi
     
     local status=$(sudo -u "$MAS_USER" yq eval '.account.password_registration_enabled' "$MAS_CONFIG_FILE" 2>/dev/null)
@@ -835,9 +1036,21 @@ get_mas_token_registration_status() {
         return 1
     fi
     
-    if ! check_yq_dependency; then
+    # Быстрая проверка yq перед использованием
+    if ! command -v yq >/dev/null 2>&1; then
+        log "WARN" "yq не найден для чтения конфигурации"
         echo "unknown"
         return 1
+    fi
+    
+    # Проверяем что это не snap версия
+    local yq_path=$(which yq 2>/dev/null)
+    if [[ "$yq_path" == *"/snap/"* ]]; then
+        log "WARN" "Обнаружена snap версия yq, исправляем..."
+        if ! check_and_fix_yq_installation; then
+            echo "unknown"
+            return 1
+        fi
     fi
     
     local status=$(sudo -u "$MAS_USER" yq eval '.account.registration_token_required' "$MAS_CONFIG_FILE" 2>/dev/null)
@@ -1076,18 +1289,6 @@ manage_mas_registration_tokens() {
 manage_mas_registration() {
     print_header "УПРАВЛЕНИЕ РЕГИСТРАЦИЕЙ MAS" "$BLUE"
     
-        # Проверяем и исправляем установку yq
-    if ! check_and_fix_yq_installation; then
-        log "ERROR" "Не удалось обеспечить корректную установку yq"
-        return 1
-    fi
-
-    if ! check_yq_dependency; then
-        log "ERROR" "Невозможно продолжить без yq"
-        read -p "Нажмите Enter для возврата..."
-        return 1
-    fi
-    
     if [ ! -f "$MAS_CONFIG_FILE" ]; then
         safe_echo "${RED}❌ Файл конфигурации MAS не найден: $MAS_CONFIG_FILE${NC}"
         safe_echo "${YELLOW}Убедитесь, что MAS установлен и настроен${NC}"
@@ -1187,9 +1388,16 @@ manage_mas_registration() {
 main() {
     log "DEBUG" "Запуск главной функции модуля mas_manage_mas_registration.sh"
     
-    # Проверяем и исправляем установку yq
+    # ПРИНУДИТЕЛЬНАЯ проверка и исправление установки yq в самом начале
+    log "INFO" "Принудительная проверка корректности установки yq..."
     if ! check_and_fix_yq_installation; then
         log "ERROR" "Не удалось обеспечить корректную установку yq"
+        safe_echo "${RED}❌ Критическая ошибка: не удалось установить корректную версию yq${NC}"
+        safe_echo "${YELLOW}yq необходим для управления YAML конфигурацией MAS${NC}"
+        safe_echo "${CYAN}Попробуйте выполнить вручную:${NC}"
+        safe_echo "sudo snap remove yq"
+        safe_echo "sudo curl -sSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq"
+        safe_echo "sudo chmod +x /usr/local/bin/yq"
         return 1
     fi
     
