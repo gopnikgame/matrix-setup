@@ -269,11 +269,19 @@ download_and_install_mas() {
         return 1
     fi
     
-    # Устанавливаем бинарный файл
+    # Устанавливаем бинарный файл КАК mas-cli (основное имя)
     if [ -f "$temp_dir/mas-cli" ]; then
         chmod +x "$temp_dir/mas-cli"
-        mv "$temp_dir/mas-cli" /usr/local/bin/mas
-        log "SUCCESS" "Бинарный файл MAS установлен"
+        mv "$temp_dir/mas-cli" /usr/local/bin/mas-cli
+        log "SUCCESS" "Бинарный файл mas-cli установлен"
+        
+        # ВАЖНО: Создаем симлинк mas для обратной совместимости
+        if [ -L "/usr/local/bin/mas" ]; then
+            rm -f "/usr/local/bin/mas"
+        fi
+        ln -s /usr/local/bin/mas-cli /usr/local/bin/mas
+        log "SUCCESS" "Симлинк mas -> mas-cli создан"
+        
     else
         log "ERROR" "Бинарный файл mas-cli не найден в архиве"
         rm -rf "$temp_dir"
@@ -338,11 +346,19 @@ download_and_install_mas() {
     rm -f "/tmp/$mas_binary"
     rm -rf "$temp_dir"
     
-    # Проверяем установку
-    if mas --version >/dev/null 2>&1; then
-        local mas_version=$(mas --version | head -1)
+    # Проверяем установку обеих команд
+    if mas-cli --version >/dev/null 2>&1; then
+        local mas_version=$(mas-cli --version | head -1)
         log "SUCCESS" "Matrix Authentication Service установлен: $mas_version"
         log "SUCCESS" "Файлы установлены в: $mas_install_dir"
+        log "SUCCESS" "Команды доступны: mas-cli и mas (симлинк)"
+        
+        # Проверяем симлинк
+        if mas --version >/dev/null 2>&1; then
+            log "SUCCESS" "Симлинк mas работает корректно"
+        else
+            log "WARN" "Симлинк mas не работает, но mas-cli доступен"
+        fi
     else
         log "ERROR" "Установка MAS завершилась с ошибкой"
         return 1
@@ -1200,8 +1216,8 @@ User=$MAS_USER
 Group=$MAS_GROUP
 # КРИТИЧЕСКИ ВАЖНО: Устанавливаем правильную рабочую директорию
 WorkingDirectory=/var/lib/mas
-# ВАЖНО: Явно указываем путь к конфигурации 
-ExecStart=/usr/local/bin/mas server --config $MAS_CONFIG_FILE
+# ВАЖНО: Используем mas-cli с явным указанием пути к конфигурации 
+ExecStart=/usr/local/bin/mas-cli server --config $MAS_CONFIG_FILE
 Restart=always
 RestartSec=10
 
@@ -1249,7 +1265,7 @@ EOF
     systemctl daemon-reload
     systemctl enable matrix-auth-service
     
-    log "SUCCESS" "Systemd сервис создан и включен с правильной рабочей директорией (/var/lib/mas)"
+    log "SUCCESS" "Systemd сервис создан и включен с правильной командой (/usr/local/bin/mas-cli)"
     log "INFO" "Сервис будет запускаться с очищенным окружением и правильными правами доступа"
     return 0
 }
@@ -1741,7 +1757,7 @@ install_matrix_authentication_service() {
                 safe_echo "• ✅ База данных: $MAS_DB_NAME"
                 safe_echo "• ✅ Synapse настроен для работы с MAS (MSC3861)"
                 safe_echo "• ✅ Мобильные приложения Element X теперь поддерживаются"
-                safe_echo "• ✅ Современная OAuth2/OIDC аутентификация включена"
+                safe_echo "• ✅ Современная OAuth2/OCID аутентификация включена"
                 echo
                 safe_echo "${BOLD}${BLUE}Проверка работы:${NC}"
                 safe_echo "• Статус MAS: ${CYAN}systemctl status matrix-auth-service${NC}"

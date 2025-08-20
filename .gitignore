@@ -483,3 +483,4 @@ test_mas_submodules_fix.sh
 test_yq_fixes.sh
 test_yq_installation_fix.sh
 YQ_INSTALLATION_FIX_SUMMARY.md
+fix_mas_binary_issue.sh
