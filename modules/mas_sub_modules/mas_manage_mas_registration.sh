@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Matrix Authentication Service (MAS) - Модуль управления регистрацией
-# Версия: 1.1.0
+# Версия: 1.2.0 - исправлена проблема с правами доступа
 
 # Определение директории скрипта
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,6 +20,7 @@ MAS_CONFIG_DIR="/etc/mas"
 MAS_CONFIG_FILE="$MAS_CONFIG_DIR/config.yaml"
 MAS_USER="matrix-synapse"
 MAS_GROUP="matrix-synapse"
+MAS_WORK_DIR="/var/lib/mas"
 
 # Проверка root прав
 check_root
@@ -32,6 +33,53 @@ if ! id -u "$MAS_USER" >/dev/null 2>&1; then
     log "ERROR" "Пользователь $MAS_USER не существует"
     exit 1
 fi
+
+# Функция для проверки и создания рабочей среды MAS
+ensure_mas_environment() {
+    log "DEBUG" "Проверка и создание рабочей среды MAS..."
+    
+    # Создаем рабочую директорию если нужно
+    if [ ! -d "$MAS_WORK_DIR" ]; then
+        log "INFO" "Создание рабочей директории MAS: $MAS_WORK_DIR"
+        mkdir -p "$MAS_WORK_DIR"
+    fi
+    
+    # Устанавливаем правильные права
+    chown "$MAS_USER:$MAS_GROUP" "$MAS_WORK_DIR" 2>/dev/null || {
+        log "ERROR" "Не удалось установить владельца рабочей директории"
+        return 1
+    }
+    chmod 755 "$MAS_WORK_DIR" 2>/dev/null || {
+        log "ERROR" "Не удалось установить права на рабочую директорию"
+        return 1
+    }
+    
+    # Создаем .env файл если нужно
+    local env_file="$MAS_WORK_DIR/.env"
+    if [ ! -f "$env_file" ]; then
+        log "DEBUG" "Создание .env файла в рабочей директории"
+        cat > "$env_file" << 'EOF'
+# MAS Environment Variables
+# Created by matrix-setup automation
+
+RUST_LOG=info
+EOF
+        chown "$MAS_USER:$MAS_GROUP" "$env_file" 2>/dev/null
+        chmod 600 "$env_file" 2>/dev/null
+    fi
+    
+    # Проверяем права на конфигурационный файл
+    if [ -f "$MAS_CONFIG_FILE" ]; then
+        if ! sudo -u "$MAS_USER" test -r "$MAS_CONFIG_FILE"; then
+            log "WARN" "Исправление прав доступа к конфигурационному файлу"
+            chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE" 2>/dev/null
+            chmod 600 "$MAS_CONFIG_FILE" 2>/dev/null
+        fi
+    fi
+    
+    log "DEBUG" "Рабочая среда MAS готова"
+    return 0
+}
 
 # Проверка и исправление установки yq при запуске (АГРЕССИВНОЕ УДАЛЕНИЕ SNAP)
 check_and_fix_yq_installation() {
@@ -873,11 +921,11 @@ set_mas_config_value() {
             return 1
         fi
     else
-        log "ERROR" "Ошибка выполнения команды перезапуска: $restart_output"
+        log "ERROR" "Ошибка выполнения команды перезагрузки: $restart_output"
         return 1
     fi
     
-    # Финальная проверка значения после перезапуска
+    # Финальная проверка значения после перезагрузки
     local final_value=$(sudo -u "$MAS_USER" yq eval "$full_path" "$MAS_CONFIG_FILE" 2>/dev/null)
     log "DEBUG" "Финальное значение параметра $key после перезапуска: '$final_value'"
     
@@ -1106,11 +1154,11 @@ create_registration_token() {
     read -p "Лимит использований (или оставьте пустым для неограниченного): " usage_limit
     read -p "Срок действия в секундах (или оставьте пустым для бессрочного): " expires_in
     
-    # Формируем массив параметров для команды
-    local cmd_args=("$mas_cli_path" "manage" "issue-user-registration-token" "--config" "$MAS_CONFIG_FILE")
+    # Формируем команду
+    local cmd_array=("$mas_cli_path" "manage" "issue-user-registration-token" "--config" "$MAS_CONFIG_FILE")
     
     if [ -n "$custom_token" ]; then
-        cmd_args+=("--token" "$custom_token")
+        cmd_array+=("--token" "$custom_token")
     fi
     
     if [ -n "$usage_limit" ]; then
@@ -1118,7 +1166,7 @@ create_registration_token() {
             safe_echo "${RED}❌ Ошибка: Лимит использований должен быть числом${NC}"
             return 1
         fi
-        cmd_args+=("--usage-limit" "$usage_limit")
+        cmd_array+=("--usage-limit" "$usage_limit")
     fi
     
     if [ -n "$expires_in" ]; then
@@ -1126,47 +1174,71 @@ create_registration_token() {
             safe_echo "${RED}❌ Ошибка: Срок действия должен быть числом в секундах${NC}"
             return 1
         fi
-        cmd_args+=("--expires-in" "$expires_in")
+        cmd_array+=("--expires-in" "$expires_in")
     fi
     
     log "INFO" "Создание токена регистрации..."
-    log "DEBUG" "Команда: ${cmd_args[*]}"
+    log "DEBUG" "Команда: ${cmd_array[*]}"
     
-    # Выполняем команду как пользователь MAS без использования eval
-    local output
+    # ИСПРАВЛЕНИЕ: Выполняем команду напрямую без временного файла
+    # Переходим в рабочую директорию MAS для выполнения команды
+    local original_dir=$(pwd)
+    cd /var/lib/mas 2>/dev/null || {
+        log "WARN" "Не удалось перейти в /var/lib/mas, выполняем из текущей директории"
+    }
+    
+    # Выполняем команду как пользователь MAS 
+    local output=""
     local exit_code=0
     
-    # Создаем временный скрипт для выполнения команды
-    local temp_script=$(mktemp)
-    cat > "$temp_script" << 'EOF'
-#!/bin/bash
-exec "$@"
-EOF
-    chmod +x "$temp_script"
-    
-    # Выполняем команду через временный скрипт
-    if ! output=$(sudo -u "$MAS_USER" "$temp_script" "${cmd_args[@]}" 2>&1); then
+    # Используем более простой подход без временных файлов
+    log "DEBUG" "Выполнение команды от имени пользователя $MAS_USER..."
+    if ! output=$(sudo -u "$MAS_USER" "${cmd_array[@]}" 2>&1); then
         exit_code=$?
-        rm -f "$temp_script"
+        cd "$original_dir" 2>/dev/null
         
         safe_echo "${RED}❌ Ошибка создания токена регистрации (код: $exit_code)${NC}"
         safe_echo "${YELLOW}Вывод команды:${NC}"
         safe_echo "$output"
         echo
-        safe_echo "${YELLOW}Возможные причины ошибки:${NC}"
-        safe_echo "• MAS не запущен (проверьте: systemctl status matrix-auth-service)"
-        safe_echo "• Проблемы с базой данных MAS"
-        safe_echo "• Недостаточные права пользователя $MAS_USER"
-        safe_echo "• Неправильная конфигурация MAS"
+        
+        # Анализ конкретных ошибок
+        if [[ "$output" == *"Permission denied"* ]]; then
+            safe_echo "${YELLOW}Возможные причины ошибки с правами доступа:${NC}"
+            safe_echo "• Проблемы с правами пользователя $MAS_USER"
+            safe_echo "• Неправильные права на рабочую директорию /var/lib/mas"
+            safe_echo "• Проблемы с доступом к конфигурационному файлу"
+            echo
+            safe_echo "${CYAN}Попробуйте выполнить команду вручную:${NC}"
+            safe_echo "sudo -u $MAS_USER $mas_cli_path manage issue-user-registration-token --config $MAS_CONFIG_FILE"
+        elif [[ "$output" == *"database"* ]]; then
+            safe_echo "${YELLOW}Проблема с базой данных:${NC}"
+            safe_echo "• Проверьте подключение к базе данных MAS"
+            safe_echo "• Убедитесь, что база данных mas_db существует"
+            safe_echo "• Проверьте права пользователя synapse_user на базу данных"
+        elif [[ "$output" == *"config"* ]]; then
+            safe_echo "${YELLOW}Проблема с конфигурацией:${NC}"
+            safe_echo "• Проверьте синтаксис файла $MAS_CONFIG_FILE"
+            safe_echo "• Убедитесь, что файл доступен для чтения пользователем $MAS_USER"
+        else
+            safe_echo "${YELLOW}Общие причины ошибки:${NC}"
+            safe_echo "• MAS служба может быть не полностью запущена"
+            safe_echo "• Проблемы с базой данных MAS"
+            safe_echo "• Недостаточные права пользователя $MAS_USER"
+            safe_echo "• Неправильная конфигурация MAS"
+        fi
+        
         echo
         safe_echo "${CYAN}Диагностика:${NC}"
         safe_echo "• Проверьте логи: journalctl -u matrix-auth-service -n 20"
         safe_echo "• Проверьте конфигурацию: mas-cli config check --config $MAS_CONFIG_FILE"
         safe_echo "• Проверьте подключение к БД: mas-cli database migrate --config $MAS_CONFIG_FILE"
+        safe_echo "• Проверьте права: ls -la $MAS_CONFIG_FILE /var/lib/mas"
         return 1
     fi
     
-    rm -f "$temp_script"
+    # Возвращаемся в исходную директорию
+    cd "$original_dir" 2>/dev/null || true
     
     echo
     safe_echo "${BOLD}${GREEN}✅ Токен регистрации успешно создан!${NC}"
@@ -1254,6 +1326,33 @@ manage_mas_registration_tokens() {
         return 1
     fi
     
+    # Проверяем и создаем рабочую директорию MAS с правильными правами
+    local mas_work_dir="/var/lib/mas"
+    if [ ! -d "$mas_work_dir" ]; then
+        log "INFO" "Создание рабочей директории MAS: $mas_work_dir"
+        mkdir -p "$mas_work_dir"
+        chown "$MAS_USER:$MAS_GROUP" "$mas_work_dir"
+        chmod 755 "$mas_work_dir"
+    else
+        # Проверяем права на существующую директорию
+        local current_owner=$(stat -c "%U:%G" "$mas_work_dir" 2>/dev/null)
+        if [ "$current_owner" != "$MAS_USER:$MAS_GROUP" ]; then
+            log "INFO" "Исправление прав на рабочую директорию MAS"
+            chown "$MAS_USER:$MAS_GROUP" "$mas_work_dir"
+            chmod 755 "$mas_work_dir"
+        fi
+    fi
+    
+    # Проверяем права доступа к конфигурационному файлу
+    if [ -f "$MAS_CONFIG_FILE" ]; then
+        if ! sudo -u "$MAS_USER" test -r "$MAS_CONFIG_FILE"; then
+            log "WARN" "Пользователь $MAS_USER не может читать конфигурационный файл"
+            log "INFO" "Исправление прав доступа к конфигурационному файлу"
+            chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE"
+            chmod 600 "$MAS_CONFIG_FILE"
+        fi
+    fi
+    
     if ! systemctl is-active --quiet matrix-auth-service; then
         safe_echo "${RED}❌ Matrix Authentication Service не запущен!${NC}"
         safe_echo "${YELLOW}Для создания токенов MAS должен быть запущен.${NC}"
@@ -1261,15 +1360,17 @@ manage_mas_registration_tokens() {
         if ask_confirmation "Попробовать запустить MAS?"; then
             if restart_output=$(restart_service "matrix-auth-service" 2>&1); then
                 sleep 2
-                if systemctl is-active --quiet matrix-auth-service; then
+                if systemctl is_active --quiet matrix-auth-service; then
                     safe_echo "${GREEN}✅ MAS успешно запущен${NC}"
                 else
                     safe_echo "${RED}❌ Не удалось запустить MAS${NC}"
+                    safe_echo "${YELLOW}Проверьте логи: journalctl -u matrix-auth-service -n 20${NC}"
                     read -p "Нажмите Enter для возврата..."
                     return 1
                 fi
             else
                 safe_echo "${RED}❌ Ошибка запуска MAS${NC}"
+                safe_echo "${YELLOW}$restart_output${NC}"
                 read -p "Нажмите Enter для возврата..."
                 return 1
             fi
@@ -1301,15 +1402,20 @@ manage_mas_registration_tokens() {
             safe_echo "• MAS служба: ${RED}НЕ АКТИВНА${NC}"
         fi
         
+        # Показываем дополнительную диагностическую информацию
+        safe_echo "• Рабочая директория: ${BLUE}$mas_work_dir${NC} $([ -d "$mas_work_dir" ] && echo "${GREEN}✓${NC}" || echo "${RED}✗${NC}")"
+        safe_echo "• Конфигурация: ${BLUE}$MAS_CONFIG_FILE${NC} $([ -f "$MAS_CONFIG_FILE" ] && echo "${GREEN}✓${NC}" || echo "${RED}✗${NC}")"
+        
         echo
         safe_echo "${BOLD}Управление токенами регистрации:${NC}"
         safe_echo "1. ${GREEN}✅ Включить требование токенов регистрации${NC}"
         safe_echo "2. ${RED}❌ Отключить требование токенов регистрации${NC}"
-        safe_echo "3. ${GREEN}Создать новый токен регистрации${NC}"
+        safe_echo "3. ${GREEN}🎫 Создать новый токен регистрации${NC}"
         safe_echo "4. ${GREEN}ℹ️  Показать информацию о токенах${NC}"
-        safe_echo "5. ${WHITE}↩️  Назад${NC}"
+        safe_echo "5. ${CYAN}🔧 Диагностика прав доступа${NC}"
+        safe_echo "6. ${WHITE}↩️  Назад${NC}"
 
-        read -p "Выберите действие [1-5]: " action
+        read -p "Выберите действие [1-6]: " action
 
         case $action in
             1)
@@ -1325,6 +1431,9 @@ manage_mas_registration_tokens() {
                 show_registration_tokens_info
                 ;;
             5)
+                diagnose_mas_permissions
+                ;;
+            6)
                 return 0
                 ;;
             *)
@@ -1333,7 +1442,7 @@ manage_mas_registration_tokens() {
                 ;;
         esac
         
-        if [ $action -ne 5 ]; then
+        if [ $action -ne 6 ]; then
             echo
             read -p "Нажмите Enter для продолжения..."
         fi
@@ -1439,6 +1548,186 @@ manage_mas_registration() {
     done
 }
 
+# Диагностика прав доступа MAS
+diagnose_mas_permissions() {
+    print_header "ДИАГНОСТИКА ПРАВ ДОСТУПА MAS" "$CYAN"
+    
+    safe_echo "${BOLD}Проверка компонентов MAS:${NC}"
+    echo
+    
+    # 1. Проверка пользователя и группы
+    safe_echo "${CYAN}1. Пользователь и группа MAS:${NC}"
+    if id "$MAS_USER" >/dev/null 2>&1; then
+        local user_info=$(id "$MAS_USER" 2>/dev/null)
+        safe_echo "   • Пользователь $MAS_USER: ${GREEN}✓ существует${NC}"
+        safe_echo "   • Информация: $user_info"
+    else
+        safe_echo "   • Пользователь $MAS_USER: ${RED}✗ не существует${NC}"
+    fi
+    echo
+    
+    # 2. Проверка рабочей директории
+    safe_echo "${CYAN}2. Рабочая директория MAS:${NC}"
+    local mas_work_dir="/var/lib/mas"
+    if [ -d "$mas_work_dir" ]; then
+        local dir_perms=$(stat -c "%a" "$mas_work_dir" 2>/dev/null)
+        local dir_owner=$(stat -c "%U:%G" "$mas_work_dir" 2>/dev/null)
+        safe_echo "   • Директория: ${GREEN}✓ $mas_work_dir${NC}"
+        safe_echo "   • Владелец: $dir_owner $([ "$dir_owner" = "$MAS_USER:$MAS_GROUP" ] && echo "${GREEN}✓${NC}" || echo "${YELLOW}!${NC}")"
+        safe_echo "   • Права: $dir_perms $([ "$dir_perms" = "755" ] && echo "${GREEN}✓${NC}" || echo "${YELLOW}!${NC}")"
+        
+        # Проверяем возможность записи
+        if sudo -u "$MAS_USER" test -w "$mas_work_dir"; then
+            safe_echo "   • Запись для $MAS_USER: ${GREEN}✓ разрешена${NC}"
+        else
+            safe_echo "   • Запись для $MAS_USER: ${RED}✗ запрещена${NC}"
+        fi
+    else
+        safe_echo "   • Директория: ${RED}✗ $mas_work_dir не существует${NC}"
+    fi
+    echo
+    
+    # 3. Проверка конфигурационного файла
+    safe_echo "${CYAN}3. Конфигурационный файл MAS:${NC}"
+    if [ -f "$MAS_CONFIG_FILE" ]; then
+        local file_perms=$(stat -c "%a" "$MAS_CONFIG_FILE" 2>/dev/null)
+        local file_owner=$(stat -c "%U:%G" "$MAS_CONFIG_FILE" 2>/dev/null)
+        safe_echo "   • Файл: ${GREEN}✓ $MAS_CONFIG_FILE${NC}"
+        safe_echo "   • Владелец: $file_owner $([ "$file_owner" = "$MAS_USER:$MAS_GROUP" ] && echo "${GREEN}✓${NC}" || echo "${YELLOW}!${NC}")"
+        safe_echo "   • Права: $file_perms $([ "$file_perms" = "600" ] && echo "${GREEN}✓${NC}" || echo "${YELLOW}!${NC}")"
+        
+        # Проверяем возможность чтения
+        if sudo -u "$MAS_USER" test -r "$MAS_CONFIG_FILE"; then
+            safe_echo "   • Чтение для $MAS_USER: ${GREEN}✓ разрешено${NC}"
+        else
+            safe_echo "   • Чтение для $MAS_USER: ${RED}✗ запрещено${NC}"
+        fi
+        
+        # Проверка валидности YAML
+        if command -v python3 >/dev/null 2>&1; then
+            if python3 -c "import yaml; yaml.safe_load(open('$MAS_CONFIG_FILE'))" 2>/dev/null; then
+                safe_echo "   • YAML синтаксис: ${GREEN}✓ корректный${NC}"
+            else
+                safe_echo "   • YAML синтаксис: ${RED}✗ некорректный${NC}"
+            fi
+        fi
+    else
+        safe_echo "   • Файл: ${RED}✗ $MAS_CONFIG_FILE не существует${NC}"
+    fi
+    echo
+    
+    # 4. Проверка исполняемого файла mas-cli
+    safe_echo "${CYAN}4. Исполняемый файл mas-cli:${NC}"
+    if command -v mas-cli >/dev/null 2>&1; then
+        local mas_cli_path=$(which mas-cli 2>/dev/null)
+        safe_echo "   • Команда mas-cli: ${GREEN}✓ найдена${NC}"
+        safe_echo "   • Путь: $mas_cli_path"
+        
+        # Проверяем версию
+        local mas_version=$(mas-cli --version 2>/dev/null | head -1)
+        safe_echo "   • Версия: $mas_version"
+        
+        # Проверяем возможность выполнения пользователем MAS
+        if sudo -u "$MAS_USER" mas-cli --version >/dev/null 2>&1; then
+            safe_echo "   • Выполнение от $MAS_USER: ${GREEN}✓ работает${NC}"
+        else
+            safe_echo "   • Выполнение от $MAS_USER: ${RED}✗ не работает${NC}"
+        fi
+    else
+        safe_echo "   • Команда mas-cli: ${RED}✗ не найдена${NC}"
+    fi
+    echo
+    
+    # 5. Проверка службы systemd
+    safe_echo "${CYAN}5. Служба matrix-auth-service:${NC}"
+    if systemctl is-enabled --quiet matrix-auth-service 2>/dev/null; then
+        safe_echo "   • Служба включена: ${GREEN}✓${NC}"
+    else
+        safe_echo "   • Служба включена: ${RED}✗${NC}"
+    fi
+    
+    if systemctl is-active --quiet matrix-auth-service; then
+        safe_echo "   • Служба активна: ${GREEN}✓${NC}"
+        
+        # Проверяем время запуска
+        local start_time=$(systemctl show -p ActiveEnterTimestamp matrix-auth-service --value 2>/dev/null)
+        safe_echo "   • Время запуска: $start_time"
+    else
+        safe_echo "   • Служба активна: ${RED}✗${NC}"
+        
+        # Показываем последние ошибки
+        local service_status=$(systemctl status matrix-auth-service --no-pager -n 3 2>&1 | tail -3)
+        safe_echo "   • Последний статус:"
+        echo "$service_status" | while read -r line; do
+            safe_echo "     $line"
+        done
+    fi
+    echo
+    
+    # 6. Проверка тестовой команды
+    safe_echo "${CYAN}6. Тестовая команда:${NC}"
+    safe_echo "   Пробуем выполнить: mas-cli config check --config $MAS_CONFIG_FILE"
+    
+    if sudo -u "$MAS_USER" mas-cli config check --config "$MAS_CONFIG_FILE" >/dev/null 2>&1; then
+        safe_echo "   • Результат: ${GREEN}✓ команда выполнена успешно${NC}"
+    else
+        local test_output=$(sudo -u "$MAS_USER" mas-cli config check --config "$MAS_CONFIG_FILE" 2>&1)
+        safe_echo "   • Результат: ${RED}✗ ошибка выполнения${NC}"
+        safe_echo "   • Вывод ошибки: $test_output"
+    fi
+    echo
+    
+    # Рекомендации по исправлению
+    safe_echo "${BOLD}${YELLOW}🔧 Автоматическое исправление:${NC}"
+    if ask_confirmation "Попробовать автоматически исправить обнаруженные проблемы?"; then
+        echo
+        safe_echo "${CYAN}Применение исправлений...${NC}"
+        
+        # Создаем рабочую директорию если нужно
+        if [ ! -d "$mas_work_dir" ]; then
+            safe_echo "• Создание рабочей директории..."
+            mkdir -p "$mas_work_dir"
+            chown "$MAS_USER:$MAS_GROUP" "$mas_work_dir"
+            chmod 755 "$mas_work_dir"
+            safe_echo "  ${GREEN}✓ Директория создана${NC}"
+        fi
+        
+        # Исправляем права на рабочую директорию
+        safe_echo "• Исправление прав рабочей директории..."
+        chown "$MAS_USER:$MAS_GROUP" "$mas_work_dir" 2>/dev/null
+        chmod 755 "$mas_work_dir" 2>/dev/null
+        safe_echo "  ${GREEN}✓ Права исправлены${NC}"
+        
+        # Исправляем права на конфигурационный файл
+        if [ -f "$MAS_CONFIG_FILE" ]; then
+            safe_echo "• Исправление прав конфигурационного файла..."
+            chown "$MAS_USER:$MAS_GROUP" "$MAS_CONFIG_FILE" 2>/dev/null
+            chmod 600 "$MAS_CONFIG_FILE" 2>/dev/null
+            safe_echo "  ${GREEN}✓ Права исправлены${NC}"
+        fi
+        
+        # Создаем .env файл если нужно
+        local env_file="$mas_work_dir/.env"
+        if [ ! -f "$env_file" ]; then
+            safe_echo "• Создание .env файла..."
+            cat > "$env_file" << 'EOF'
+# MAS Environment Variables
+# Created by matrix-setup automation
+
+RUST_LOG=info
+EOF
+            chown "$MAS_USER:$MAS_GROUP" "$env_file"
+            chmod 600 "$env_file"
+            safe_echo "  ${GREEN}✓ .env файл создан${NC}"
+        fi
+        
+        safe_echo "${GREEN}✅ Автоматическое исправление завершено${NC}"
+        echo
+        safe_echo "${CYAN}Попробуйте снова создать токен регистрации.${NC}"
+    fi
+}
+
+# Главная функция модуля
 main() {
     log "DEBUG" "Запуск главной функции модуля mas_manage_mas_registration.sh"
     
@@ -1452,6 +1741,16 @@ main() {
         safe_echo "sudo snap remove yq"
         safe_echo "sudo curl -sSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq"
         safe_echo "sudo chmod +x /usr/local/bin/yq"
+        return 1
+    fi
+    
+    # Проверяем и создаем рабочую среду MAS
+    log "INFO" "Проверка рабочей среды MAS..."
+    if ! ensure_mas_environment; then
+        log "ERROR" "Не удалось подготовить рабочую среду MAS"
+        safe_echo "${RED}❌ Ошибка подготовки рабочей среды MAS${NC}"
+        safe_echo "${YELLOW}Попробуйте запустить скрипт исправления:${NC}"
+        safe_echo "${CYAN}sudo ./fix_mas_permissions.sh${NC}"
         return 1
     fi
     
@@ -1471,6 +1770,7 @@ main() {
     fi
 }
 
+# Проверка запуска скрипта напрямую
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     main "$@"
 fi
