@@ -923,25 +923,26 @@ main_menu() {
         safe_echo "${GREEN}2.${NC}  🌐 Установить Element Web (веб-клиент)"
         safe_echo "${GREEN}3.${NC}  👥 Установить Synapse Admin (веб-админка)"
         safe_echo "${GREEN}4.${NC}  🔑 Установить MAS (Система для пользовательских регистраций)"
-        safe_echo "${GREEN}5.${NC}  📞 Установить Coturn TURN Server (для VoIP через сервер)"
+        safe_echo "${GREEN}5.${NC} 🐳 Установить MAS (компиляция/Docker)"
+        safe_echo "${GREEN}6.${NC}  📞 Установить Coturn TURN Server (для VoIP через сервер)"
 
         echo
         safe_echo "${BOLD}Управление системой:${NC}"
         echo
-        safe_echo "${GREEN}6.${NC}  🌍 Управление федерацией"
-        safe_echo "${GREEN}7.${NC}  🔐 Управление регистрацией"
-        safe_echo "${GREEN}8.${NC}  👥 Управление пользователями Matrix"
-        safe_echo "${GREEN}9.${NC}  ⚙️  Управление MAS (настройки)"
-        safe_echo "${GREEN}10.${NC} 🔧 Дополнительные компоненты"
+        safe_echo "${GREEN}7.${NC}  🌍 Управление федерацией"
+        safe_echo "${GREEN}8.${NC}  🔐 Управление регистрацией"
+        safe_echo "${GREEN}9.${NC}  👥 Управление пользователями Matrix"
+        safe_echo "${GREEN}10.${NC}  ⚙️  Управление MAS (настройки)"
+        safe_echo "${GREEN}11.${NC} 🔧 Дополнительные компоненты"
         
         echo
         safe_echo "${BOLD}Инструменты:${NC}"
         echo
-        safe_echo "${GREEN}11.${NC} 📋 Показать конфигурацию"
-        safe_echo "${GREEN}12.${NC} 💾 Создать резервную копии"
-        safe_echo "${GREEN}13.${NC} 🔄 Обновить модули и библиотеку"
-        safe_echo "${GREEN}14.${NC} 🔍 Диагностика и устранение проблем"
-        safe_echo "${GREEN}15.${NC} 📖 Показать системную информацию"
+        safe_echo "${GREEN}12.${NC} 📋 Показать конфигурацию"
+        safe_echo "${GREEN}13.${NC} 💾 Создать резервную копии"
+        safe_echo "${GREEN}14.${NC} 🔄 Обновить модули и библиотеку"
+        safe_echo "${GREEN}15.${NC} 🔍 Диагностика и устранение проблем"
+        safe_echo "${GREEN}16.${NC} 📖 Показать системную информацию"
         
         echo
         safe_echo "${GREEN}00.${NC} ❌ Выход"
@@ -979,21 +980,22 @@ main_menu() {
             2) install_element_web ;;
             3) run_module "synapse_admin" ;;
             4) run_module "install_mas" ;;
-            5) run_module "coturn_setup" ;;
-            6) run_module "federation_control" ;;
-            7) run_module "registration_control" ;;
-            8) manage_matrix_users ;;
-            9) run_module "mas_manage" ;;
-            10) manage_additional_components ;;
-            11) show_configuration_info ;;
-            12) create_backup ;;
-            13) update_modules_and_library ;;
-            14)
+            5) install_mas_compile_docker ;;
+            6) run_module "coturn_setup" ;;
+            7) run_module "federation_control" ;;
+            8) run_module "registration_control" ;;
+            9) manage_matrix_users ;;
+            10) run_module "mas_manage" ;;
+            11) manage_additional_components ;;
+            12) show_configuration_info ;;
+            13) create_backup ;;
+            14) update_modules_and_library ;;
+            15)
                 log "INFO" "Запуск диагностики..."
                 get_system_info
                 check_matrix_status
                 ;;
-            15) get_system_info ;;
+            16) get_system_info ;;
             "00")
                 print_header "ЗАВЕРШЕНИЕ РАБОТЫ" "$GREEN"
                 log "INFO" "Спасибо за использование Matrix Setup Tool!"
