@@ -101,25 +101,48 @@ check_mas_port() {
 check_mas_build_dependencies() {
     log "INFO" "Проверка зависимостей для сборки MAS из исходников..."
     
-    local dependencies=("curl" "wget" "tar" "openssl" "systemctl" "git" "make" "cargo" "npm" "node" "opa")
+    local dependencies=("curl" "wget" "tar" "openssl" "systemctl" "git" "make")
     local missing_deps=()
+    local special_deps=()
     
+    # Проверяем обычные зависимости
     for dep in "${dependencies[@]}"; do
         if ! command -v "$dep" &>/dev/null; then
             missing_deps+=("$dep")
         fi
     done
     
-    # Проверяем версию Node.js
-    if command -v node &>/dev/null; then
+    # Проверяем Rust/Cargo
+    if ! command -v cargo &>/dev/null; then
+        special_deps+=("cargo")
+    fi
+    
+    # Проверяем Node.js и npm
+    if ! command -v node &>/dev/null; then
+        special_deps+=("nodejs")
+    else
+        # Проверяем версию Node.js
         local node_version=$(node --version | cut -d'v' -f2 | cut -d'.' -f1)
         if [ "$node_version" -lt 18 ]; then
-            missing_deps+=("nodejs>=18")
+            special_deps+=("nodejs>=18")
         fi
     fi
     
-    if [ ${#missing_deps[@]} -gt 0 ]; then
-        log "ERROR" "Отсутствуют зависимости для сборки: ${missing_deps[*]}"
+    if ! command -v npm &>/dev/null; then
+        special_deps+=("npm")
+    fi
+    
+    # Проверяем OPA
+    if ! command -v opa &>/dev/null; then
+        special_deps+=("opa")
+    fi
+    
+    # Если есть отсутствующие зависимости
+    if [ ${#missing_deps[@]} -gt 0 ] || [ ${#special_deps[@]} -gt 0 ]; then
+        log "ERROR" "Отсутствуют зависимости для сборки:"
+        [ ${#missing_deps[@]} -gt 0 ] && log "ERROR" "  Обычные пакеты: ${missing_deps[*]}"
+        [ ${#special_deps[@]} -gt 0 ] && log "ERROR" "  Специальные пакеты: ${special_deps[*]}"
+        
         log "INFO" "Установка недостающих пакетов..."
         
         if ! apt update; then
@@ -128,18 +151,20 @@ check_mas_build_dependencies() {
         fi
         
         # Устанавливаем Rust toolchain если нужно
-        if [[ " ${missing_deps[@]} " =~ "cargo" ]]; then
+        if [[ " ${special_deps[@]} " =~ "cargo" ]]; then
             log "INFO" "Установка Rust toolchain..."
             if ! curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; then
                 log "ERROR" "Не удалось установить Rust"
                 return 1
             fi
-            source "$HOME/.cargo/env"
+            # ВАЖНО: Обновляем PATH для текущей сессии
+            export PATH="$HOME/.cargo/bin:$PATH"
+            source "$HOME/.cargo/env" 2>/dev/null || true
         fi
         
         # Устанавливаем Node.js если нужно
-        if [[ " ${missing_deps[@]} " =~ "nodejs>=18" ]] || [[ " ${missing_deps[@]} " =~ "npm" ]]; then
-            log "INFO" "Установка Node.js 18+..."
+        if [[ " ${special_deps[@]} " =~ "nodejs" ]] || [[ " ${special_deps[@]} " =~ "nodejs>=18" ]] || [[ " ${special_deps[@]} " =~ "npm" ]]; then
+            log "INFO" "Установка Node.js 18+ и npm..."
             if ! curl -fsSL https://deb.nodesource.com/setup_18.x | bash -; then
                 log "ERROR" "Не удалось добавить репозиторий Node.js"
                 return 1
@@ -151,7 +176,7 @@ check_mas_build_dependencies() {
         fi
         
         # Устанавливаем OPA если нужно
-        if [[ " ${missing_deps[@]} " =~ "opa" ]]; then
+        if [[ " ${special_deps[@]} " =~ "opa" ]]; then
             log "INFO" "Установка Open Policy Agent..."
             if ! curl -L -o /usr/local/bin/opa https://openpolicyagent.org/downloads/v0.58.0/opa_linux_amd64_static; then
                 log "ERROR" "Не удалось скачать OPA"
@@ -160,23 +185,65 @@ check_mas_build_dependencies() {
             chmod +x /usr/local/bin/opa
         fi
         
-        # Устанавливаем остальные зависимости
-        local apt_deps=()
-        for dep in "${missing_deps[@]}"; do
-            case "$dep" in
-                "cargo"|"nodejs>=18"|"npm"|"opa") continue ;;
-                *) apt_deps+=("$dep") ;;
-            esac
-        done
-        
-        if [ ${#apt_deps[@]} -gt 0 ]; then
-            if ! apt install -y "${apt_deps[@]}"; then
-                log "ERROR" "Не удалось установить зависимости"
+        # Устанавливаем обычные зависимости через apt
+        if [ ${#missing_deps[@]} -gt 0 ]; then
+            log "INFO" "Установка обычных зависимостей: ${missing_deps[*]}"
+            if ! apt install -y "${missing_deps[@]}"; then
+                log "ERROR" "Не удалось установить зависимости: ${missing_deps[*]}"
                 return 1
             fi
         fi
         
-        log "SUCCESS" "Зависимости для сборки установлены"
+        # Проверяем, что все установилось корректно
+        log "INFO" "Проверка установленных зависимостей..."
+        
+        # Проверяем Rust/Cargo
+        if [[ " ${special_deps[@]} " =~ "cargo" ]]; then
+            if command -v cargo &>/dev/null; then
+                local cargo_version=$(cargo --version | head -1)
+                log "SUCCESS" "✅ Rust/Cargo установлен: $cargo_version"
+            else
+                log "ERROR" "❌ Rust/Cargo не установлен корректно"
+                return 1
+            fi
+        fi
+        
+        # Проверяем Node.js
+        if [[ " ${special_deps[@]} " =~ "nodejs" ]] || [[ " ${special_deps[@]} " =~ "nodejs>=18" ]]; then
+            if command -v node &>/dev/null; then
+                local node_version=$(node --version)
+                log "SUCCESS" "✅ Node.js установлен: $node_version"
+            else
+                log "ERROR" "❌ Node.js не установлен корректно"
+                return 1
+            fi
+        fi
+        
+        # Проверяем npm
+        if [[ " ${special_deps[@]} " =~ "npm" ]]; then
+            if command -v npm &>/dev/null; then
+                local npm_version=$(npm --version)
+                log "SUCCESS" "✅ npm установлен: v$npm_version"
+            else
+                log "ERROR" "❌ npm не установлен корректно"
+                return 1
+            fi
+        fi
+        
+        # Проверяем OPA
+        if [[ " ${special_deps[@]} " =~ "opa" ]]; then
+            if command -v opa &>/dev/null; then
+                local opa_version=$(opa version | head -1)
+                log "SUCCESS" "✅ OPA установлен: $opa_version"
+            else
+                log "ERROR" "❌ OPA не установлен корректно"
+                return 1
+            fi
+        fi
+        
+        log "SUCCESS" "Все зависимости для сборки установлены"
+    else
+        log "SUCCESS" "Все зависимости для сборки уже установлены"
     fi
     
     return 0
@@ -185,6 +252,34 @@ check_mas_build_dependencies() {
 # Клонирование и сборка MAS из исходников
 build_mas_from_source() {
     log "INFO" "Клонирование и сборка Matrix Authentication Service из исходников..."
+    
+    # ВАЖНО: Убеждаемся, что Rust и Node.js доступны в PATH
+    export PATH="$HOME/.cargo/bin:/usr/local/bin:$PATH"
+    
+    # Проверяем доступность необходимых команд
+    if ! command -v cargo &>/dev/null; then
+        log "ERROR" "Cargo не найден в PATH после установки"
+        log "DEBUG" "PATH: $PATH"
+        return 1
+    fi
+    
+    if ! command -v node &>/dev/null; then
+        log "ERROR" "Node.js не найден в PATH после установки"
+        return 1
+    fi
+    
+    if ! command -v npm &>/dev/null; then
+        log "ERROR" "npm не найден в PATH после установки"
+        return 1
+    fi
+    
+    # Показываем версии для диагностики
+    log "INFO" "Версии инструментов сборки:"
+    log "INFO" "  Rust: $(rustc --version 2>/dev/null || echo 'не установлен')"
+    log "INFO" "  Cargo: $(cargo --version 2>/dev/null || echo 'не установлен')"
+    log "INFO" "  Node.js: $(node --version 2>/dev/null || echo 'не установлен')"
+    log "INFO" "  npm: v$(npm --version 2>/dev/null || echo 'не установлен')"
+    log "INFO" "  OPA: $(opa version 2>/dev/null | head -1 || echo 'не установлен')"
     
     # Создаем директорию для исходников
     mkdir -p "$MAS_SOURCE_DIR"
@@ -219,13 +314,27 @@ build_mas_from_source() {
     # Собираем фронтенд
     log "INFO" "Сборка фронтенда..."
     cd frontend
-    if ! npm ci; then
-        log "ERROR" "Ошибка установки зависимостей фронтенда"
-        return 1
+    
+    # Очищаем npm кэш если нужно
+    if [ -d "node_modules" ]; then
+        log "INFO" "Очистка предыдущей установки npm..."
+        rm -rf node_modules package-lock.json
     fi
     
+    log "INFO" "Установка зависимостей фронтенда..."
+    if ! npm ci; then
+        log "WARN" "npm ci не удалась, пробуем npm install..."
+        if ! npm install; then
+            log "ERROR" "Ошибка установки зависимостей фронтенда"
+            return 1
+        fi
+    fi
+    
+    log "INFO" "Сборка фронтенда..."
     if ! npm run build; then
         log "ERROR" "Ошибка сборки фронтенда"
+        log "INFO" "Проверка доступных npm scripts..."
+        npm run 2>/dev/null | grep -E "^  [a-zA-Z]" || true
         return 1
     fi
     cd ..
@@ -239,15 +348,22 @@ build_mas_from_source() {
     # Собираем политики OPA
     log "INFO" "Сборка политик OPA..."
     cd policies
+    
     if command -v opa >/dev/null 2>&1; then
+        log "INFO" "Использование локально установленного OPA..."
         if ! make; then
             log "ERROR" "Ошибка сборки политик OPA"
             return 1
         fi
     else
         log "WARN" "OPA не установлен, попытка сборки через Docker..."
-        if ! make DOCKER=1; then
-            log "ERROR" "Ошибка сборки политик OPA через Docker"
+        if command -v docker >/dev/null 2>&1; then
+            if ! make DOCKER=1; then
+                log "ERROR" "Ошибка сборки политик OPA через Docker"
+                return 1
+            fi
+        else
+            log "ERROR" "Ни OPA, ни Docker не доступны для сборки политик"
             return 1
         fi
     fi
@@ -261,8 +377,21 @@ build_mas_from_source() {
     
     # Компилируем CLI
     log "INFO" "Компиляция MAS CLI..."
+    
+    # Убеждаемся, что Rust доступен
+    source "$HOME/.cargo/env" 2>/dev/null || true
+    
     if ! cargo build --release; then
         log "ERROR" "Ошибка компиляции MAS"
+        log "INFO" "Проверка Cargo и Rust..."
+        cargo --version 2>/dev/null || log "ERROR" "Cargo недоступен"
+        rustc --version 2>/dev/null || log "ERROR" "Rust compiler недоступен"
+        return 1
+    fi
+    
+    # Проверяем, что бинарник создан
+    if [ ! -f "./target/release/mas-cli" ]; then
+        log "ERROR" "Бинарник mas-cli не создан"
         return 1
     fi
     
@@ -312,8 +441,8 @@ build_mas_from_source() {
     find "$MAS_INSTALL_DIR" -type d -exec chmod 755 {} \;
     
     # Проверяем установку
-    if mas-cli --version >/dev/null 2>&1; then
-        local mas_version=$(mas-cli --version | head -1)
+    if /usr/local/bin/mas-cli --version >/dev/null 2>&1; then
+        local mas_version=$(/usr/local/bin/mas-cli --version | head -1)
         log "SUCCESS" "Matrix Authentication Service собран из исходников: $mas_version"
         
         # Проверяем наличие всех критических файлов
@@ -334,6 +463,8 @@ build_mas_from_source() {
         
     else
         log "ERROR" "Ошибка установки MAS из исходников"
+        log "INFO" "Проверка бинарника..."
+        ls -la /usr/local/bin/mas-cli 2>/dev/null || log "ERROR" "Бинарник не найден"
         return 1
     fi
     
@@ -785,7 +916,7 @@ EOF
         if python3 -c "import yaml; yaml.safe_load(open('$MAS_CONFIG_FILE'))" 2>/dev/null; then
             log "SUCCESS" "YAML синтаксис конфигурации корректен"
         else
-            log "ERROR" "Ошибка в YAML синтаксисе конфигурации!"
+            log "ERROR" "Ошибка в YAML синтаксиса конфигурации!"
             log "INFO" "Проверьте конфигурацию: $MAS_CONFIG_FILE"
             return 1
         fi
@@ -1021,12 +1152,13 @@ fix_mas_database_issues() {
     # Проверяем секцию database в конфигурации MAS
     if ! grep -q "^database:" "$MAS_CONFIG_FILE"; then
         log "ERROR" "Секция database отсутствует в конфигурации MAS!"
-        log "ERROR" "Это критическая ошибка конфигурации"
+        log "INFO" "Проблема с конфигурацией, отсутствует секция database:"
+        grep -A 5 "^http:" "$MAS_CONFIG_FILE" || true
         return 1
     fi
     
     # Проверяем URI в конфигурации MAS
-    local config_uri=$(grep -A 5 "^database:" "$MAS_CONFIG_FILE" | grep "uri:" | sed 's/.*uri: *"//' | sed 's/".*//' 2>/dev/null)
+    local config_uri=$(grep -A 5 "^database:" "$MAS_CONFIG_FILE" | grep "uri:" | sed 's/.*uri: *//' | tr -d '"' 2>/dev/null)
     
     if [ -z "$config_uri" ]; then
         log "ERROR" "URI базы данных не найден в конфигурации MAS"
