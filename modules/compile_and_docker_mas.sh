@@ -117,14 +117,17 @@ check_mas_build_dependencies() {
         special_deps+=("cargo")
     fi
     
-    # Проверяем Node.js и npm
+    # Проверяем Node.js и npm - ИСПРАВЛЕНО: требуется версия 20+
     if ! command -v node &>/dev/null; then
-        special_deps+=("nodejs")
+        special_deps+=("nodejs20")
     else
-        # Проверяем версию Node.js
+        # Проверяем версию Node.js - ВАЖНО: требуется версия 20 или выше
         local node_version=$(node --version | cut -d'v' -f2 | cut -d'.' -f1)
-        if [ "$node_version" -lt 18 ]; then
-            special_deps+=("nodejs>=18")
+        if [ "$node_version" -lt 20 ]; then
+            log "WARN" "Установлена устаревшая версия Node.js: v$node_version (требуется v20+)"
+            special_deps+=("nodejs20")
+        else
+            log "SUCCESS" "Node.js версии $node_version соответствует требованиям (>=20)"
         fi
     fi
     
@@ -162,16 +165,53 @@ check_mas_build_dependencies() {
             source "$HOME/.cargo/env" 2>/dev/null || true
         fi
         
-        # Устанавливаем Node.js если нужно
-        if [[ " ${special_deps[@]} " =~ "nodejs" ]] || [[ " ${special_deps[@]} " =~ "nodejs>=18" ]] || [[ " ${special_deps[@]} " =~ "npm" ]]; then
-            log "INFO" "Установка Node.js 18+ и npm..."
-            if ! curl -fsSL https://deb.nodesource.com/setup_18.x | bash -; then
-                log "ERROR" "Не удалось добавить репозиторий Node.js"
+        # ИСПРАВЛЕНО: Устанавливаем Node.js 20+ если нужно
+        if [[ " ${special_deps[@]} " =~ "nodejs20" ]] || [[ " ${special_deps[@]} " =~ "npm" ]]; then
+            log "INFO" "Удаление старой версии Node.js..."
+            # Удаляем старую версию Node.js если установлена
+            apt remove -y nodejs npm 2>/dev/null || true
+            apt autoremove -y 2>/dev/null || true
+            
+            # Очищаем старые репозитории NodeSource
+            rm -f /etc/apt/sources.list.d/nodesource.list* 2>/dev/null || true
+            rm -f /usr/share/keyrings/nodesource.gpg 2>/dev/null || true
+            
+            log "INFO" "Установка Node.js 20.x и npm..."
+            
+            # Добавляем официальный репозиторий NodeSource для версии 20
+            if ! curl -fsSL https://deb.nodesource.com/setup_20.x | bash -; then
+                log "ERROR" "Не удалось добавить репозиторий Node.js 20"
                 return 1
             fi
+            
+            # Устанавливаем Node.js 20
             if ! apt install -y nodejs; then
-                log "ERROR" "Не удалось установить Node.js"
+                log "ERROR" "Не удалось установить Node.js 20"
                 return 1
+            fi
+            
+            # Проверяем установленную версию
+            local installed_version=$(node --version | cut -d'v' -f2 | cut -d'.' -f1)
+            if [ "$installed_version" -lt 20 ]; then
+                log "ERROR" "Установилась неправильная версия Node.js: v$installed_version (требуется v20+)"
+                
+                # Пробуем альтернативный способ через snap
+                log "INFO" "Попытка установки Node.js через snap..."
+                if command -v snap &>/dev/null; then
+                    if snap install node --classic --channel=20/stable; then
+                        # Обновляем PATH для snap
+                        export PATH="/snap/bin:$PATH"
+                        log "SUCCESS" "Node.js установлен через snap"
+                    else
+                        log "ERROR" "Не удалось установить Node.js через snap"
+                        return 1
+                    fi
+                else
+                    log "ERROR" "snap не доступен для установки Node.js"
+                    return 1
+                fi
+            else
+                log "SUCCESS" "Node.js v$installed_version установлен успешно"
             fi
         fi
         
@@ -185,7 +225,7 @@ check_mas_build_dependencies() {
             chmod +x /usr/local/bin/opa
         fi
         
-        # Устанавливаем обычные зависимости через apt
+        # Устанавливаем обычныеDependencies через apt
         if [ ${#missing_deps[@]} -gt 0 ]; then
             log "INFO" "Установка обычных зависимостей: ${missing_deps[*]}"
             if ! apt install -y "${missing_deps[@]}"; then
@@ -208,11 +248,17 @@ check_mas_build_dependencies() {
             fi
         fi
         
-        # Проверяем Node.js
-        if [[ " ${special_deps[@]} " =~ "nodejs" ]] || [[ " ${special_deps[@]} " =~ "nodejs>=18" ]]; then
+        # ВАЖНО: Проверяем Node.js версию 20+
+        if [[ " ${special_deps[@]} " =~ "nodejs20" ]]; then
             if command -v node &>/dev/null; then
                 local node_version=$(node --version)
-                log "SUCCESS" "✅ Node.js установлен: $node_version"
+                local node_major=$(echo "$node_version" | cut -d'v' -f2 | cut -d'.' -f1)
+                if [ "$node_major" -ge 20 ]; then
+                    log "SUCCESS" "✅ Node.js установлен: $node_version (требуется v20+)"
+                else
+                    log "ERROR" "❌ Node.js версии $node_version не соответствует требованиям (нужно v20+)"
+                    return 1
+                fi
             else
                 log "ERROR" "❌ Node.js не установлен корректно"
                 return 1
@@ -220,7 +266,7 @@ check_mas_build_dependencies() {
         fi
         
         # Проверяем npm
-        if [[ " ${special_deps[@]} " =~ "npm" ]]; then
+        if [[ " ${special_deps[@]} " =~ "npm" ]] || [[ " ${special_deps[@]} " =~ "nodejs20" ]]; then
             if command -v npm &>/dev/null; then
                 local npm_version=$(npm --version)
                 log "SUCCESS" "✅ npm установлен: v$npm_version"
@@ -243,7 +289,22 @@ check_mas_build_dependencies() {
         
         log "SUCCESS" "Все зависимости для сборки установлены"
     else
-        log "SUCCESS" "Все зависимости для сборки уже установлены"
+        # Даже если зависимости установлены, проверим версию Node.js
+        if command -v node &>/dev/null; then
+            local node_version=$(node --version | cut -d'v' -f2 | cut -d'.' -f1)
+            if [ "$node_version" -lt 20 ]; then
+                log "WARN" "Установлена Node.js v$node_version, но для MAS требуется v20+"
+                log "INFO" "Обновление Node.js до версии 20..."
+                
+                # Рекурсивно вызываем функцию с обновлением Node.js
+                special_deps+=("nodejs20")
+                return $(check_mas_build_dependencies)
+            else
+                log "SUCCESS" "Все зависимости для сборки уже установлены (Node.js v$node_version)"
+            fi
+        else
+            log "SUCCESS" "Все зависимости для сборки уже установлены"
+        fi
     fi
     
     return 0
@@ -254,17 +315,28 @@ build_mas_from_source() {
     log "INFO" "Клонирование и сборка Matrix Authentication Service из исходников..."
     
     # ВАЖНО: Убеждаемся, что Rust и Node.js доступны в PATH
-    export PATH="$HOME/.cargo/bin:/usr/local/bin:$PATH"
+    export PATH="$HOME/.cargo/bin:/usr/local/bin:/snap/bin:$PATH"
     
-    # Проверяем доступность необходимых команд
-    if ! command -v cargo &>/dev/null; then
-        log "ERROR" "Cargo не найден в PATH после установки"
-        log "DEBUG" "PATH: $PATH"
+    # КРИТИЧЕСКАЯ ПРОВЕРКА: убеждаемся, что используется Node.js 20+
+    if ! command -v node &>/dev/null; then
+        log "ERROR" "Node.js не найден в PATH после установки"
         return 1
     fi
     
-    if ! command -v node &>/dev/null; then
-        log "ERROR" "Node.js не найден в PATH после установки"
+    local node_major_version=$(node --version | cut -d'v' -f2 | cut -d'.' -f1)
+    if [ "$node_major_version" -lt 20 ]; then
+        log "ERROR" "Обнаружена устаревшая версия Node.js: $(node --version)"
+        log "ERROR" "Matrix Authentication Service требует Node.js версии 20 или выше"
+        log "ERROR" "Перезапустите скрипт для обновления Node.js"
+        return 1
+    fi
+    
+    log "SUCCESS" "Используется совместимая версия Node.js: $(node --version)"
+    
+    # Проверяем доступность остальных необходимых команд
+    if ! command -v cargo &>/dev/null; then
+        log "ERROR" "Cargo не найден в PATH после установки"
+        log "DEBUG" "PATH: $PATH"
         return 1
     fi
     
@@ -315,17 +387,46 @@ build_mas_from_source() {
     log "INFO" "Сборка фронтенда..."
     cd frontend
     
+    # ВАЖНО: Еще раз проверяем версию Node.js перед сборкой
+    local current_node_version=$(node --version)
+    local current_node_major=$(echo "$current_node_version" | cut -d'v' -f2 | cut -d'.' -f1)
+    
+    if [ "$current_node_major" -lt 20 ]; then
+        log "ERROR" "КРИТИЧЕСКАЯ ОШИБКА: Node.js версии $current_node_version не поддерживается"
+        log "ERROR" "Пакеты фронтенда требуют Node.js версии 20 или выше"
+        log "ERROR" "Обнаруженные требования пакетов:"
+        log "ERROR" "  - @storybook/react требует Node.js >=20.0.0"
+        log "ERROR" "  - undici требует Node.js >=20.18.1"
+        log "ERROR" "  - graphql-ws требует Node.js >=20"
+        log "ERROR" "  - happy-dom требует Node.js >=20.0.0"
+        return 1
+    fi
+    
+    log "SUCCESS" "Node.js версии $current_node_version подходит для сборки фронтенда"
+    
     # Очищаем npm кэш если нужно
     if [ -d "node_modules" ]; then
         log "INFO" "Очистка предыдущей установки npm..."
         rm -rf node_modules package-lock.json
     fi
     
+    # Обновляем npm до последней версии для лучшей совместимости
+    log "INFO" "Обновление npm до последней версии..."
+    if ! npm install -g npm@latest; then
+        log "WARN" "Не удалось обновить npm, продолжаем с текущей версией"
+    fi
+    
     log "INFO" "Установка зависимостей фронтенда..."
-    if ! npm ci; then
-        log "WARN" "npm ci не удалась, пробуем npm install..."
+    
+    # Используем npm install с флагами для обхода предупреждений о версиях
+    if ! npm install --legacy-peer-deps --engine-strict=false; then
+        log "WARN" "npm install с флагами не удалась, пробуем стандартную установку..."
         if ! npm install; then
             log "ERROR" "Ошибка установки зависимостей фронтенда"
+            log "INFO" "Проверка package.json на наличие engines..."
+            if [ -f "package.json" ]; then
+                grep -A 5 '"engines"' package.json 2>/dev/null || log "INFO" "Секция engines не найдена в package.json"
+            fi
             return 1
         fi
     fi
@@ -335,6 +436,14 @@ build_mas_from_source() {
         log "ERROR" "Ошибка сборки фронтенда"
         log "INFO" "Проверка доступных npm scripts..."
         npm run 2>/dev/null | grep -E "^  [a-zA-Z]" || true
+        
+        # Дополнительная диагностика
+        log "INFO" "Проверка логов npm..."
+        if [ -f "npm-debug.log" ]; then
+            log "INFO" "Последние строки npm-debug.log:"
+            tail -20 npm-debug.log 2>/dev/null || true
+        fi
+        
         return 1
     fi
     cd ..
@@ -444,6 +553,7 @@ build_mas_from_source() {
     if /usr/local/bin/mas-cli --version >/dev/null 2>&1; then
         local mas_version=$(/usr/local/bin/mas-cli --version | head -1)
         log "SUCCESS" "Matrix Authentication Service собран из исходников: $mas_version"
+        log "SUCCESS" "Сборка выполнена с Node.js версии $current_node_version"
         
         # Проверяем наличие всех критических файлов
         local critical_files=(
