@@ -10,12 +10,9 @@ LIB_VERSION="3.0.0"
 PROJECT_NAME="Matrix Setup"
 
 # Подключение общей библиотеки
-# Сначала определяем реальный путь к скрипту, учитывая символические ссылки
 if [[ -L "${BASH_SOURCE[0]}" ]]; then
-    # Если это символическая ссылка, получаем реальный путь
     REAL_SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 else
-    # Если это обычный файл
     REAL_SCRIPT_PATH="${BASH_SOURCE[0]}"
 fi
 
@@ -49,66 +46,6 @@ source "$COMMON_LIB"
 CONFIG_DIR="/opt/matrix-install"
 MODULES_DIR="$SCRIPT_DIR/modules"
 
-# Функция проверки системных требований
-check_system_requirements() {
-    print_header "ПРОВЕРКА СИСТЕМЫ" "$BLUE"
-    
-    # Проверка операционной системы
-    if [ ! -f /etc/os-release ]; then
-        log "ERROR" "Неподдерживаемая операционная система"
-        return 1
-    fi
-    
-    source /etc/os-release
-    log "INFO" "Операционная система: $PRETTY_NAME"
-    
-    # Проверка поддерживаемых дистрибутивов
-    case "$ID" in
-        ubuntu|debian)
-            log "SUCCESS" "Поддерживаемый дистрибутив: $ID"
-            ;;
-        *)
-            log "WARN" "Дистрибутив $ID может не поддерживаться полностью"
-            if ! ask_confirmation "Продолжить на свой страх и риск?"; then
-                return 1
-            fi
-            ;;
-    esac
-    
-    # Проверка версии Ubuntu/Debian
-    if [ "$ID" = "ubuntu" ]; then
-        local version_id="${VERSION_ID%.*}"
-        if [ "$version_id" -lt 20 ]; then
-            log "WARN" "Рекомендуется Ubuntu 20.04 или новее (текущая: $VERSION_ID)"
-        fi
-    elif [ "$ID" = "debian" ]; then
-        local version_id="${VERSION_ID%.*}"
-        if [ "$version_id" -lt 11 ]; then
-            log "WARN" "Рекомендуется Debian 11 или новее (текущая: $VERSION_ID)"
-        fi
-    fi
-    
-    # Проверка прав root
-    check_root || return 1
-    
-    # Определение типа сервера на раннем этапе
-    load_server_type || return 1
-    
-    log "INFO" "Тип сервера: $SERVER_TYPE"
-    log "INFO" "Bind адрес: $BIND_ADDRESS"
-    [[ -n "${PUBLIC_IP:-}" ]] && log "INFO" "Публичный IP: $PUBLIC_IP"
-    [[ -n "${LOCAL_IP:-}" ]] && log "INFO" "Локальный IP: $LOCAL_IP"
-    
-    # Проверка подключения к интернету
-    check_internet || return 1
-    
-    # Проверка системных ресурсов
-    get_system_info
-    
-    log "SUCCESS" "Проверка системы завершена"
-    return 0
-}
-
 # Функция загрузки модуля
 load_module() {
     local module_name="$1"
@@ -137,7 +74,6 @@ run_module() {
     print_header "ЗАПУСК МОДУЛЯ: ${module_name^^}" "$CYAN"
     log "INFO" "Выполнение модуля: $module_name"
     
-    # Запуск модуля в подоболочке с передачей окружения
     (
         export SCRIPT_DIR CONFIG_DIR
         "$module_path"
@@ -159,13 +95,11 @@ install_matrix_core() {
     
     log "INFO" "Начало установки базовой системы Matrix Synapse"
     
-    # Проверка системных требований
     if ! check_system_requirements; then
         log "ERROR" "Системные требования не выполнены"
         return 1
     fi
     
-    # Запуск модуля установки ядра
     if ! run_module "core_install"; then
         log "ERROR" "Ошибка установки Matrix Synapse"
         return 1
@@ -179,14 +113,12 @@ install_matrix_core() {
 install_element_web() {
     print_header "УСТАНОВКА ELEMENT WEB" "$BLUE"
     
-    # Проверка, что Matrix Synapse установлен
     if [ ! -f "$CONFIG_DIR/domain" ]; then
         log "ERROR" "Matrix Synapse не установлен или не настроен"
         log "INFO" "Сначала выполните установку Matrix Synapse (опция 1)"
         return 1
     fi
     
-    # Запуск модуля Element Web
     if ! run_module "element_web"; then
         log "ERROR" "Ошибка установки Element Web"
         return 1
@@ -196,11 +128,29 @@ install_element_web() {
     return 0
 }
 
+# Функция установки MAS с компиляцией или Docker
+install_mas_compile_docker() {
+    print_header "УСТАНОВКА MAS С КОМПИЛЯЦИЕЙ ИЛИ DOCKER" "$BLUE"
+    
+    if [ ! -f "$CONFIG_DIR/domain" ]; then
+        log "ERROR" "Matrix Synapse не установлен или не настроен"
+        log "INFO" "Сначала выполните установку Matrix Synapse (опция 1)"
+        return 1
+    fi
+    
+    if ! run_module "compile_and_docker_mas"; then
+        log "ERROR" "Ошибка установки MAS с компиляцией или Docker"
+        return 1
+    fi
+    
+    log "SUCCESS" "MAS установлен с компиляцией или Docker"
+    return 0
+}
+
 # Функция проверки статуса всех компонентов
 check_matrix_status() {
     print_header "СТАТУС СИСТЕМЫ MATRIX" "$CYAN"
     
-    # Показываем информацию о типе сервера
     safe_echo "${BOLD}${BLUE}Конфигурация сервера:${NC}"
     safe_echo "  ${BOLD}Тип сервера:${NC} ${SERVER_TYPE:-не определен}"
     safe_echo "  ${BOLD}Bind адрес:${NC} ${BIND_ADDRESS:-не определен}"
@@ -213,7 +163,6 @@ check_matrix_status() {
     if systemctl is-active --quiet matrix-synapse 2>/dev/null; then
         safe_echo "  ${GREEN}✅ Служба запущена${NC}"
         
-        # Проверка API в зависимости от типа сервера
         local api_urls=()
         case "$SERVER_TYPE" in
             "proxmox"|"home_server"|"docker"|"openvz")
@@ -239,13 +188,11 @@ check_matrix_status() {
             safe_echo "  ${YELLOW}   Проверьте настройки bind_addresses в конфигурации Synapse${NC}"
         fi
         
-        # Версия Synapse
         local synapse_version=$(dpkg -l | grep matrix-synapse-py3 | awk '{print $3}' | cut -d'-' -f1 2>/dev/null)
         if [ -n "$synapse_version" ]; then
             safe_echo "  ${BOLD}Версия:${NC} $synapse_version"
         fi
         
-        # Проверка портов с учетом типа сервера
         case "$SERVER_TYPE" in
             "proxmox"|"home_server"|"docker"|"openvz")
                 if ss -tlnp | grep -q ":8008.*0.0.0.0"; then
@@ -273,12 +220,10 @@ check_matrix_status() {
         safe_echo "  ${RED}❌ Служба не запущена${NC}"
     fi
     
-    # Проверка домена
     if [ -f "$CONFIG_DIR/domain" ]; then
         local matrix_domain=$(cat "$CONFIG_DIR/domain")
         safe_echo "  ${BOLD}Домен:${NC} $matrix_domain"
         
-        # Проверка соответствия домена типу сервера
         case "$SERVER_TYPE" in
             "proxmox"|"home_server"|"docker"|"openvz")
                 if [[ "$matrix_domain" =~ \.(local|lan|home)$ ]]; then
@@ -306,11 +251,9 @@ check_matrix_status() {
     if systemctl is-active --quiet postgresql 2>/dev/null; then
         safe_echo "  ${GREEN}✅ Служба запущена${NC}"
         
-        # Проверка базы данных Synapse
         if sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw synapse_db 2>/dev/null; then
             safe_echo "  ${GREEN}✅ База данных synapse_db существует${NC}"
             
-            # Размер базы данных
             local db_size=$(sudo -u postgres psql -c "SELECT pg_size_pretty(pg_database_size('synapse_db'));" -t 2>/dev/null | xargs)
             if [ -n "$db_size" ]; then
                 safe_echo "  ${BOLD}Размер БД:${NC} $db_size"
@@ -340,7 +283,6 @@ check_matrix_status() {
             safe_echo "  ${BOLD}Домен:${NC} $element_domain"
         fi
         
-        # Проверка конфигурации Element в зависимости от типа сервера
         if [ -f "/var/www/element/config.json" ]; then
             if jq empty "/var/www/element/config.json" 2>/dev/null; then
                 local mobile_guide=$(jq -r '.mobile_guide_toast' "/var/www/element/config.json" 2>/dev/null)
@@ -389,7 +331,6 @@ check_matrix_status() {
             safe_echo "  ${GREEN}✅ $server: активен${NC}"
             active_servers=$((active_servers + 1))
             
-            # Дополнительная информация для Caddy
             if [ "$server" = "caddy" ] && [ -f "/etc/caddy/Caddyfile" ]; then
                 if caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1; then
                     safe_echo "    ${GREEN}✅ Конфигурация Caddy корректна${NC}"
@@ -406,12 +347,12 @@ check_matrix_status() {
     if [ $active_servers -eq 0 ]; then
         safe_echo "  ${RED}❌ Нет активных веб-серверов${NC}"
     elif [ $active_servers -gt 1 ]; then
-        safe_echo "  ${YELLOW}⚠️  Запущено несколько веб-серверов (возможныconfликты портов)${NC}"
+        safe_echo "  ${YELLOW}⚠️  Запущено несколько веб-серверов (возможны конфликты портов)${NC}"
     fi
     
     echo
     
-    # Проверка портов с учетом типа сервера
+    # Проверка портов
     safe_echo "${BOLD}${BLUE}Сетевые порты:${NC}"
     local ports=("8008:Matrix HTTP" "8448:Matrix Federation" "80:HTTP" "443:HTTPS" "5432:PostgreSQL")
     
@@ -421,8 +362,6 @@ check_matrix_status() {
         
         if ss -tlnp | grep -q ":$port "; then
             safe_echo "  ${GREEN}✅ Порт $port ($description): используется${NC}"
-            
-            # Показываем, на каких интерфейсах слушает порт
             local listen_info=$(ss -tlnp | grep ":$port " | awk '{print $4}' | sort -u | tr '\n' ' ')
             safe_echo "    ${DIM}Слушает на: $listen_info${NC}"
         else
@@ -437,7 +376,6 @@ check_matrix_status() {
     if systemctl is-active --quiet coturn 2>/dev/null; then
         safe_echo "  ${GREEN}✅ Служба запущена${NC}"
         
-        # Проверка портов TURN
         local turn_ports=("3478" "5349")
         for port in "${turn_ports[@]}"; do
             if ss -tlnp | grep -q ":$port "; then
@@ -447,20 +385,17 @@ check_matrix_status() {
             fi
         done
         
-        # Проверка UDP relay диапазона
         if ss -ulnp | grep -q ":4915[2-9]" || ss -ulnp | grep -q ":50000"; then
             safe_echo "  ${GREEN}✅ UDP relay диапазон: активен${NC}"
         else
             safe_echo "  ${YELLOW}⚠️  UDP relay диапазон: проверьте настройки${NC}"
         fi
         
-        # Информация о домене TURN
         if [[ -f "$CONFIG_DIR/turn_domain" ]]; then
             local turn_domain=$(cat "$CONFIG_DIR/turn_domain")
             safe_echo "  ${BOLD}Домен TURN:${NC} $turn_domain"
         fi
         
-        # Проверка интеграции с Synapse
         if [[ -f "/etc/matrix-synapse/conf.d/turn.yaml" ]]; then
             safe_echo "  ${GREEN}✅ Интеграция с Synapse: настроена${NC}"
         elif grep -q "turn_uris" /etc/matrix-synapse/homeserver.yaml 2>/dev/null; then
@@ -469,7 +404,6 @@ check_matrix_status() {
             safe_echo "  ${YELLOW}⚠️  Интеграция с Synapse: не настроена${NC}"
         fi
         
-        # Показываем важность TURN для типа сервера
         case "$SERVER_TYPE" in
             "proxmox"|"home_server"|"docker"|"openvz")
                 safe_echo "  ${BLUE}ℹ️  TURN критически важен для NAT-серверов${NC}"
@@ -482,13 +416,11 @@ check_matrix_status() {
     else
         safe_echo "  ${RED}❌ Служба не запущена${NC}"
         
-        # Проверяем, установлен ли coturn
         if command -v turnserver >/dev/null 2>&1; then
             safe_echo "  ${YELLOW}⚠️  Coturn установлен, но не запущен${NC}"
         else
             safe_echo "  ${YELLOW}⚠️  Coturn не установлен${NC}"
             
-            # Рекомендации по установке для разных типов серверов
             case "$SERVER_TYPE" in
                 "proxmox"|"home_server"|"docker"|"openvz")
                     safe_echo "  ${BLUE}💡 Рекомендуется установить TURN для надежных звонков${NC}"
@@ -502,12 +434,11 @@ check_matrix_status() {
     
     echo
     
-    # Общий статус с рекомендациями для типа сервера
+    # Общий статус
     safe_echo "${BOLD}${BLUE}Общий статус:${NC}"
     if systemctl is-active --quiet matrix-synapse && systemctl is-active --quiet postgresql; then
         safe_echo "  ${GREEN}✅ Основные компоненты работают${NC}"
         
-        # Проверка API доступности
         local api_check_url="http://localhost:8008/_matrix/client/versions"
         if curl -s -f --connect-timeout 3 "$api_check_url" >/dev/null 2>&1; then
             safe_echo "  ${GREEN}✅ Matrix API доступен локально${NC}"
@@ -515,14 +446,12 @@ check_matrix_status() {
             safe_echo "  ${YELLOW}⚠️  Matrix API недоступен локально${NC}"
         fi
         
-        # Проверка VoIP готовности
         if systemctl is-active --quiet coturn 2>/dev/null; then
             safe_echo "  ${GREEN}✅ VoIP готов (TURN сервер активен)${NC}"
         else
             safe_echo "  ${YELLOW}⚠️  VoIP может не работать за NAT (TURN не активен)${NC}"
         fi
         
-        # Рекомендации для типа сервера
         case "$SERVER_TYPE" in
             "proxmox"|"home_server"|"docker"|"openvz")
                 safe_echo "  ${BLUE}ℹ️  Рекомендации для $SERVER_TYPE:${NC}"
@@ -550,7 +479,6 @@ check_matrix_status() {
     else
         safe_echo "  ${RED}❌ Есть проблемы с основными компонентами${NC}"
         
-        # Диагностика проблем
         if ! systemctl is-active --quiet matrix-synapse; then
             safe_echo "    ${RED}• Matrix Synapse не запущен${NC}"
             safe_echo "    ${YELLOW}  Попробуйте: systemctl start matrix-synapse${NC}"
@@ -588,7 +516,6 @@ manage_services() {
                 log "INFO" "Запуск всех служб Matrix..."
                 systemctl start postgresql matrix-synapse
                 
-                # Запуск веб-сервера если он установлен
                 for server in nginx apache2 caddy; do
                     if systemctl is-enabled --quiet "$server" 2>/dev/null; then
                         systemctl start "$server"
@@ -602,7 +529,6 @@ manage_services() {
                 log "INFO" "Остановка всех служб Matrix..."
                 systemctl stop matrix-synapse
                 
-                # Остановка веб-серверов
                 for server in nginx apache2 caddy; do
                     if systemctl is-active --quiet "$server" 2>/dev/null; then
                         systemctl stop "$server"
@@ -616,7 +542,6 @@ manage_services() {
                 restart_service postgresql
                 restart_service matrix-synapse
                 
-                # Перезапуск веб-сервера
                 for server in nginx apache2 caddy; do
                     if systemctl is-enabled --quiet "$server" 2>/dev/null; then
                         restart_service "$server"
@@ -683,11 +608,9 @@ manage_synapse_service() {
         5)
             log "INFO" "Проверка конфигурации Synapse..."
             
-            # Проверяем различные способы валидации конфигурации Synapse
             local validation_success=false
             local validation_output=""
             
-            # Метод 1: Системный python3 с модулем synapse
             if python3 -c "import synapse" >/dev/null 2>&1; then
                 validation_output=$(python3 -m synapse.config -c /etc/matrix-synapse/homeserver.yaml 2>&1)
                 if [ $? -eq 0 ]; then
@@ -696,7 +619,6 @@ manage_synapse_service() {
                 fi
             fi
             
-            # Метод 2: Virtual environment (если первый не сработал)
             if [ "$validation_success" = false ] && [ -x "/opt/venvs/matrix-synapse/bin/python" ]; then
                 validation_output=$(/opt/venvs/matrix-synapse/bin/python -m synapse.config -c /etc/matrix-synapse/homeserver.yaml 2>&1)
                 if [ $? -eq 0 ]; then
@@ -705,7 +627,6 @@ manage_synapse_service() {
                 fi
             fi
             
-            # Метод 3: Основная проверка - если Synapse работает, конфигурация скорее всего корректна
             if [ "$validation_success" = false ]; then
                 if systemctl is-active --quiet matrix-synapse 2>/dev/null; then
                     log "SUCCESS" "Конфигурация проходит базовую проверку (Synapse запущен и работает)"
@@ -713,7 +634,6 @@ manage_synapse_service() {
                 fi
             fi
             
-            # Если все методы не сработали
             if [ "$validation_success" = false ]; then
                 log "ERROR" "Не удалось проверить конфигурацию или обнаружены ошибки"
                 if [ -n "$validation_output" ]; then
@@ -772,7 +692,6 @@ manage_postgresql_service() {
 manage_web_server() {
     print_header "УПРАВЛЕНИЕ ВЕБ-СЕРВЕРОМ" "$BLUE"
     
-    # Определение активного веб-сервера
     local active_server=""
     for server in nginx apache2 caddy; do
         if systemctl is-active --quiet "$server" 2>/dev/null; then
@@ -861,32 +780,28 @@ create_backup() {
     
     log "INFO" "Создание резервной копии Matrix в $backup_dir..."
     
-    # Остановка Synapse для консистентной копии
+    local synapse_was_running=false
     if systemctl is-active --quiet matrix-synapse; then
         log "INFO" "Остановка Matrix Synapse для создания резервной копии..."
         systemctl stop matrix-synapse
-        local synapse_was_running=true
+        synapse_was_running=true
     fi
     
-    # Резервная копия конфигурации Synapse
     if [ -d "/etc/matrix-synapse" ]; then
         log "INFO" "Резервная копия конфигурации Synapse..."
         cp -r /etc/matrix-synapse "$backup_dir/synapse-config"
     fi
     
-    # Резервная копия данных Synapse
     if [ -d "/var/lib/matrix-synapse" ]; then
         log "INFO" "Резервная копия данных Synapse..."
         cp -r /var/lib/matrix-synapse "$backup_dir/synapse-data"
     fi
     
-    # Резервная копия конфигурации установщика
     if [ -d "$CONFIG_DIR" ]; then
         log "INFO" "Резервная копия конфигурации установщика..."
         cp -r "$CONFIG_DIR" "$backup_dir/matrix-install-config"
     fi
     
-    # Резервная копия базы данных PostgreSQL
     log "INFO" "Резервная копия базы данных PostgreSQL..."
     if sudo -u postgres pg_dump synapse_db > "$backup_dir/synapse_db_dump.sql" 2>/dev/null; then
         log "SUCCESS" "База данных сохранена в synapse_db_dump.sql"
@@ -894,29 +809,24 @@ create_backup() {
         log "WARN" "Не удалось создать резервную копию базы данных"
     fi
     
-    # Резервная копия Element Web
     if [ -d "/var/www/element" ]; then
         log "INFO" "Резервная копия Element Web..."
         cp -r /var/www/element "$backup_dir/element-web"
     fi
     
-    # Запуск Synapse обратно
     if [ "$synapse_was_running" = true ]; then
         log "INFO" "Запуск Matrix Synapse..."
         systemctl start matrix-synapse
     fi
     
-    # Создание архива
     log "INFO" "Создание архива резервной копии..."
     local archive_path="/opt/matrix-backup/matrix-backup-$(date +%Y%m%d_%H%M%S).tar.gz"
     
     if tar -czf "$archive_path" -C "$(dirname "$backup_dir")" "$(basename "$backup_dir")"; then
         log "SUCCESS" "Архив создан: $archive_path"
         
-        # Удаление временной директории
         rm -rf "$backup_dir"
         
-        # Показ размера архива
         local archive_size=$(du -h "$archive_path" | cut -f1)
         log "INFO" "Размер архива: $archive_size"
         
@@ -933,7 +843,6 @@ create_backup() {
 show_configuration_info() {
     print_header "ИНФОРМАЦИЯ О КОНФИГУРАЦИИ" "$CYAN"
     
-    # Домены
     safe_echo "${BOLD}${BLUE}Домены:${NC}"
     if [ -f "$CONFIG_DIR/domain" ]; then
         local matrix_domain=$(cat "$CONFIG_DIR/domain")
@@ -951,7 +860,6 @@ show_configuration_info() {
     
     echo
     
-    # Конфигурационные файлы
     safe_echo "${BOLD}${BLUE}Конфигурационные файлы:${NC}"
     
     local config_files=(
@@ -978,7 +886,6 @@ show_configuration_info() {
     
     echo
     
-    # Пути данных
     safe_echo "${BOLD}${BLUE}Пути данных:${NC}"
     
     local data_paths=(
@@ -1031,7 +938,7 @@ main_menu() {
         safe_echo "${BOLD}Инструменты:${NC}"
         echo
         safe_echo "${GREEN}11.${NC} 📋 Показать конфигурацию"
-        safe_echo "${GREEN}12.${NC} 💾 Создать резервную копию"
+        safe_echo "${GREEN}12.${NC} 💾 Создать резервную копии"
         safe_echo "${GREEN}13.${NC} 🔄 Обновить модули и библиотеку"
         safe_echo "${GREEN}14.${NC} 🔍 Диагностика и устранение проблем"
         safe_echo "${GREEN}15.${NC} 📖 Показать системную информацию"
@@ -1041,11 +948,9 @@ main_menu() {
         
         echo
         
-        # Показываем краткую информацию о статусе
         if systemctl is-active --quiet matrix-synapse 2>/dev/null; then
             safe_echo "${GREEN}💚 Matrix Synapse: активен${NC}"
             
-            # Показываем количество пользователей если доступна база данных
             if sudo -u postgres psql -d synapse_db -c "SELECT 1;" >/dev/null 2>&1; then
                 local total_users=$(sudo -u postgres psql -d synapse_db -t -c "SELECT COUNT(*) FROM users WHERE deactivated = 0;" 2>/dev/null | xargs)
                 local admin_users=$(sudo -u postgres psql -d synapse_db -t -c "SELECT COUNT(*) FROM users WHERE admin = 1 AND deactivated = 0;" 2>/dev/null | xargs)
@@ -1070,53 +975,25 @@ main_menu() {
         read -p "$(safe_echo "${YELLOW}Выберите действие (00-15): ${NC}")" choice
         
         case $choice in
-            1)
-                install_matrix_core
-                ;;
-            2)
-                install_element_web
-                ;;
-            3)
-                run_module "synapse_admin"
-                ;;
-            4)
-                run_module "install_mas"
-                ;;
-            5)
-                run_module "coturn_setup"
-                ;;
-            6)
-                run_module "federation_control"
-                ;;
-            7)
-                run_module "registration_control"
-                ;;
-            8)
-                manage_matrix_users
-                ;;
-            9)
-                run_module "mas_manage"
-                ;;
-            10)
-                manage_additional_components
-                ;;
-            11)
-                show_configuration_info
-                ;;
-            12)
-                create_backup
-                ;;
-            13)
-                update_modules_and_library
-                ;;
+            1) install_matrix_core ;;
+            2) install_element_web ;;
+            3) run_module "synapse_admin" ;;
+            4) run_module "install_mas" ;;
+            5) run_module "coturn_setup" ;;
+            6) run_module "federation_control" ;;
+            7) run_module "registration_control" ;;
+            8) manage_matrix_users ;;
+            9) run_module "mas_manage" ;;
+            10) manage_additional_components ;;
+            11) show_configuration_info ;;
+            12) create_backup ;;
+            13) update_modules_and_library ;;
             14)
                 log "INFO" "Запуск диагностики..."
                 get_system_info
                 check_matrix_status
                 ;;
-            15)
-                get_system_info
-                ;;
+            15) get_system_info ;;
             "00")
                 print_header "ЗАВЕРШЕНИЕ РАБОТЫ" "$GREEN"
                 log "INFO" "Спасибо за использование Matrix Setup Tool!"
@@ -1138,12 +1015,10 @@ main_menu() {
 
 # Функция инициализации
 initialize() {
-    # Создание необходимых директорий
     mkdir -p "$CONFIG_DIR"
     mkdir -p "$LOG_DIR"
     
-    # Проверка наличия модулей
-    local required_modules=("core_install" "element_web" "coturn_setup" "caddy_config" "synapse_admin" "federation_control" "registration_control" "install_mas" "mas_manage" "ufw_config")
+    local required_modules=("core_install" "element_web" "coturn_setup" "caddy_config" "synapse_admin" "federation_control" "registration_control" "install_mas" "mas_manage" "ufw_config" "compile_and_docker_mas")
     local missing_modules=()
     
     for module in "${required_modules[@]}"; do
@@ -1158,7 +1033,6 @@ initialize() {
         return 1
     fi
     
-    # Установка прав выполнения на модули
     chmod +x "$MODULES_DIR"/*.sh 2>/dev/null || true
     
     log "SUCCESS" "Инициализация завершена"
@@ -1173,18 +1047,20 @@ manage_additional_components() {
         safe_echo "${BOLD}Доступные компоненты:${NC}"
         safe_echo "${GREEN}1.${NC} 🔒 Настройка файрвола (UFW)"
         safe_echo "${GREEN}2.${NC} 🔧 Настройка Reverse Proxy (Caddy)"
-        safe_echo "${GREEN}3.${NC} 📊 Проверить статус системы"
-        safe_echo "${GREEN}4.${NC} ⚙️  Управление службами"
+        safe_echo "${GREEN}3.${NC} 🔑 Установить MAS (компиляция/Docker)"
+        safe_echo "${GREEN}4.${NC} 📊 Проверить статус системы"
+        safe_echo "${GREEN}5.${NC} ⚙️  Управление службами"
         safe_echo "${GREEN}0.${NC} ↩️  Назад в главное меню"
         
         echo
-        read -p "$(safe_echo "${YELLOW}Выберите действие (0-4): ${NC}")" choice
+        read -p "$(safe_echo "${YELLOW}Выберите действие (0-5): ${NC}")" choice
         
         case $choice in
             1) run_module "ufw_config" ;;
             2) run_module "caddy_config" ;;
-            3) check_matrix_status ;;
-            4) manage_services ;;
+            3) install_mas_compile_docker ;;
+            4) check_matrix_status ;;
+            5) manage_services ;;
             0) return 0 ;;
             *)
                 log "ERROR" "Неверный выбор"
@@ -1200,8 +1076,6 @@ manage_additional_components() {
 
 # Функция обновления модулей и библиотеки через Git клонирование
 update_modules_and_library() {
-    # Эта функция не должна выводить заголовок, так как она работает в "тихом" режиме при старте
-    
     if ! check_internet >/dev/null 2>&1; then
         log "WARN" "Нет подключения к интернету. Обновление невозможно."
         return 1
@@ -1214,7 +1088,6 @@ update_modules_and_library() {
     local updated_files=0
     local manager_updated=false
     
-    # Проверяем наличие git и устанавливаем при необходимости
     if ! command -v git >/dev/null 2>&1; then
         log "INFO" "Git не установлен. Попытка установки..."
         if command -v apt-get >/dev/null 2>&1; then
@@ -1235,43 +1108,37 @@ update_modules_and_library() {
             fi
         else
             log "ERROR" "Не удалось установить Git. Установите вручную: apt install git"
-            log "INFO" "Возврат к старому методу обновления..."
+            log "INFO" "Обновление невозможно без Git"
             rm -rf "$temp_dir"
-            return update_modules_and_library_legacy
+            return 1
         fi
     fi
     
-    # Клонируем репозиторий (shallow clone для экономии трафика и времени)
     log "DEBUG" "Клонирование репозитория в $temp_dir..."
     if ! git clone --depth 1 --quiet "$repo_url" "$temp_dir/matrix-setup" 2>/dev/null; then
-        log "WARN" "Не удалось клонировать репозиторий. Возврат к старому методу..."
+        log "WARN" "Не удалось клонировать репозиторий. Обновление невозможно."
         rm -rf "$temp_dir"
-        return update_modules_and_library_legacy
+        return 1
     fi
     
     local repo_dir="$temp_dir/matrix-setup"
     
-    # Проверяем, что репозиторий клонировался корректно
     if [ ! -d "$repo_dir" ] || [ ! -f "$repo_dir/manager-matrix.sh" ]; then
-        log "WARN" "Репозиторий клонирован некорректно. Возврат к старому методу..."
+        log "WARN" "Репозиторий клонирован некорректно. Обновление невозможно."
         rm -rf "$temp_dir"
-        return update_modules_and_library_legacy
+        return 1
     fi
     
-    # Список путей для синхронизации
     local sync_paths=(
         "common/common_lib.sh"
         "manager-matrix.sh"
         "modules"
     )
     
-    # Маппинг переименованных файлов (старое_имя -> новое_имя)
     declare -A renamed_files=(
         ["registration_mas.sh"]="install_mas.sh"
-        # Добавляйте сюда другие переименования при необходимости
     )
     
-    # Удаляем переименованные файлы перед синхронизацией
     for old_name in "${!renamed_files[@]}"; do
         local old_file="$MODULES_DIR/$old_name"
         if [ -f "$old_file" ]; then
@@ -1281,7 +1148,6 @@ update_modules_and_library() {
         fi
     done
     
-    # Синхронизируем файлы и директории
     for sync_path in "${sync_paths[@]}"; do
         local source_path="$repo_dir/$sync_path"
         local target_path="$SCRIPT_DIR/$sync_path"
@@ -1292,7 +1158,6 @@ update_modules_and_library() {
         fi
         
         if [ -f "$source_path" ]; then
-            # Синхронизация отдельного файла
             if sync_file "$source_path" "$target_path"; then
                 ((updated_files++))
                 if [ "$sync_path" = "manager-matrix.sh" ]; then
@@ -1300,16 +1165,13 @@ update_modules_and_library() {
                 fi
             fi
         elif [ -d "$source_path" ]; then
-            # Синхронизация директории
             local dir_updates=$(sync_directory "$source_path" "$target_path")
             updated_files=$((updated_files + dir_updates))
         fi
     done
     
-    # Очистка временных файлов
     rm -rf "$temp_dir"
     
-    # Отчет о результатах
     if [ $updated_files -gt 0 ]; then
         log "SUCCESS" "Обновление завершено. Обновлено/загружено файлов: $updated_files."
         if [ "$manager_updated" = true ]; then
@@ -1329,10 +1191,8 @@ sync_file() {
     local source_file="$1"
     local target_file="$2"
     
-    # Создаем директорию если не существует
     mkdir -p "$(dirname "$target_file")"
     
-    # Если файла нет - копируем
     if [ ! -f "$target_file" ]; then
         log "INFO" "Загрузка нового файла: $(basename "$target_file")"
         if cp "$source_file" "$target_file"; then
@@ -1345,11 +1205,9 @@ sync_file() {
         fi
     fi
     
-    # Проверяем наличие команды sha256sum
     if ! command -v sha256sum >/dev/null 2>&1; then
         log "WARN" "sha256sum не найден. Используется сравнение по размеру и дате."
         
-        # Альтернативное сравнение по размеру и времени модификации
         local source_size=$(stat -c%s "$source_file" 2>/dev/null || echo "0")
         local target_size=$(stat -c%s "$target_file" 2>/dev/null || echo "0")
         
@@ -1359,7 +1217,6 @@ sync_file() {
             needs_update=false
         fi
     else
-        # Сравниваем хеши
         local source_hash=$(sha256sum "$source_file" | awk '{print $1}')
         local target_hash=$(sha256sum "$target_file" | awk '{print $1}')
         
@@ -1373,7 +1230,6 @@ sync_file() {
     if [ "$needs_update" = true ]; then
         log "INFO" "Обнаружено обновление для: $(basename "$target_file")"
         
-        # Создаем резервную копию
         cp "$target_file" "${target_file}.backup.$(date +%Y%m%d_%H%M%S)"
         
         if cp "$source_file" "$target_file"; then
@@ -1386,7 +1242,7 @@ sync_file() {
         fi
     fi
     
-    return 1  # Файл не изменился
+    return 1
 }
 
 # Функция синхронизации директории
@@ -1397,7 +1253,6 @@ sync_directory() {
     
     mkdir -p "$target_dir"
     
-    # Синхронизируем все .sh файлы из исходной директории
     find "$source_dir" -name "*.sh" -type f | while read -r source_file; do
         local relative_path="${source_file#$source_dir/}"
         local target_file="$target_dir/$relative_path"
@@ -1413,7 +1268,6 @@ sync_directory() {
             fi
         done
         
-        # Удаляем устаревшие файлы перед синхронизацией
         find "$target_dir" -name "*.sh" -type f | while read -r target_file; do
             local relative_path="${target_file#$target_dir/}"
             local source_file="$source_dir/$relative_path"
@@ -1436,1276 +1290,59 @@ sync_directory() {
     }
 }
 
-# Резервная функция обновления (старый метод через API)
-update_modules_and_library_legacy() {
-    log "INFO" "Использование резервного метода обновления через GitHub API..."
+# Функция проверки системных требований
+check_system_requirements() {
+    print_header "ПРОВЕРКА СИСТЕМЫ" "$BLUE"
     
-    local repo_raw_url="https://raw.githubusercontent.com/gopnikgame/matrix-setup/main"
-    local repo_api_url="https://api.github.com/repos/gopnikgame/matrix-setup/contents/modules"
-    local updated_files=0
-    local manager_updated=false
-    
-    # Список файлов для проверки
-    local files_to_check=()
-    
-    # Добавляем общую библиотеку
-    files_to_check+=("common/common_lib.sh")
-    
-    # Добавляем главный менеджер
-    files_to_check+=("manager-matrix.sh")
-    
-    # Получаем список модулей из репозитория
-    local remote_modules=()
-    
-    if ! command -v curl >/dev/null 2>&1; then
-        log "ERROR" "curl не установлен. Невозможно выполнить обновление."
+    if [ ! -f /etc/os-release ]; then
+        log "ERROR" "Неподдерживаемая операционная система"
         return 1
     fi
     
-    # Проверяем наличие jq, если нет - используем упрощенный метод
-    if command -v jq >/dev/null 2>&1; then
-        # Получаем ответ от API с таймаутом
-        local modules_json=""
-        local api_response_code=""
-        
-        api_response_code=$(curl -sL --connect-timeout 10 --max-time 30 -w "%{http_code}" -o /dev/null "$repo_api_url" 2>/dev/null || echo "000")
-        
-        if [ "$api_response_code" = "200" ]; then
-            modules_json=$(curl -sL --connect-timeout 10 --max-time 30 --fail "$repo_api_url" 2>/dev/null)
-            
-            if [ -n "$modules_json" ] && echo "$modules_json" | jq empty >/dev/null 2>&1; then
-                local jq_output=""
-                jq_output=$(echo "$modules_json" | jq -r '.[] | select(.type == "file") | select(.name | endswith(".sh")) | .name' 2>/dev/null)
-                
-                if [ -n "$jq_output" ]; then
-                    while IFS= read -r line; do
-                        if [ -n "$line" ]; then
-                            remote_modules+=("$line")
-                        fi
-                    done <<< "$jq_output"
-                fi
-            fi
-        fi
-    fi
+    source /etc/os-release
+    log "INFO" "Операционная система: $PRETTY_NAME"
     
-    # Добавляем найденные удаленные модули в список для проверки
-    if [ ${#remote_modules[@]} -gt 0 ]; then
-        for module_name in "${remote_modules[@]}"; do
-            files_to_check+=("modules/$module_name")
-        done
-    fi
-    
-    # Добавляем существующие локальные модули
-    for module_path in "$MODULES_DIR"/*.sh; do
-        if [ -f "$module_path" ]; then
-            local module_basename="modules/$(basename "$module_path")"
-            # Избегаем дублирования
-            if ! printf '%s\n' "${files_to_check[@]}" | grep -q "^$module_basename$"; then
-                files_to_check+=("$module_basename")
-            fi
-        fi
-    done
-    
-    # Обрабатываем файлы
-    for file_rel_path in "${files_to_check[@]}"; do
-        local local_file_path="${SCRIPT_DIR}/${file_rel_path}"
-        local remote_file_url="${repo_raw_url}/${file_rel_path}"
-        local temp_file
-        temp_file=$(mktemp)
-        
-        # Скачиваем удаленный файл
-        if ! curl -sL --connect-timeout 10 --max-time 30 --fail "$remote_file_url" -o "$temp_file" 2>/dev/null; then
-            log "WARN" "Не удалось скачать файл: $remote_file_url"
-            rm -f "$temp_file"
-            continue
-        fi
-        
-        if [ ! -s "$temp_file" ]; then
-            log "WARN" "Загруженный файл пуст: $file_rel_path"
-            rm -f "$temp_file"
-            continue
-        fi
-        
-        # Если локального файла нет, это новый файл
-        if [ ! -f "$local_file_path" ]; then
-            log "INFO" "Загрузка нового файла: $file_rel_path"
-            mkdir -p "$(dirname "$local_file_path")"
-            if mv "$temp_file" "$local_file_path"; then
-                chmod +x "$local_file_path"
-                log "SUCCESS" "Файл $file_rel_path успешно загружен."
-                ((updated_files++))
-            else
-                log "ERROR" "Ошибка при сохранении нового файла: $local_file_path"
-                rm -f "$temp_file"
-            fi
-            continue
-        fi
-        
-        # Сравниваем файлы
-        local needs_update=false
-        
-        if command -v sha256sum >/dev/null 2>&1; then
-            local local_hash
-            local remote_hash
-            local_hash=$(sha256sum "$local_file_path" | awk '{print $1}')
-            remote_hash=$(sha256sum "$temp_file" | awk '{print $1}')
-            
-            if [ "$local_hash" != "$remote_hash" ]; then
-                needs_update=true
-            fi
-        else
-            # Альтернативное сравнение по размеру
-            local local_size=$(stat -c%s "$local_file_path" 2>/dev/null || echo "0")
-            local remote_size=$(stat -c%s "$temp_file" 2>/dev/null || echo "0")
-            
-            if [ "$local_size" != "$remote_size" ]; then
-                needs_update=true
-            fi
-        fi
-        
-        if [ "$needs_update" = true ]; then
-            log "INFO" "Обнаружено обновление для: $file_rel_path"
-            cp "$local_file_path" "${local_file_path}.backup.$(date +%Y%m%d_%H%M%S)"
-            
-            if mv "$temp_file" "$local_file_path"; then
-                chmod +x "$local_file_path"
-                log "SUCCESS" "Файл $file_rel_path обновлен."
-                ((updated_files++))
-                if [ "$file_rel_path" = "manager-matrix.sh" ]; then
-                    manager_updated=true
-                fi
-            else
-                log "ERROR" "Ошибка при обновлении файла: $local_file_path"
-                rm -f "$temp_file"
-            fi
-        else
-            rm -f "$temp_file"
-        fi
-    done
-    
-    # Отчет о результатах
-    if [ $updated_files -gt 0 ]; then
-        log "SUCCESS" "Обновление завершено. Обновлено/загружено файлов: $updated_files."
-        if [ "$manager_updated" = true ]; then
-            log "WARN" "Главный менеджер был обновлен."
-            safe_echo "${YELLOW}Пожалуйста, перезапустите скрипт, чтобы применить изменения.${NC}"
-            exit 0
-        fi
-    else
-        log "INFO" "Все модули, библиотека и менеджер в актуальном состоянии."
-    fi
-    
-    return 0
-}
-
-# Функция управления пользователями Matrix
-manage_matrix_users() {
-    while true; do
-        print_header "УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ MATRIX" "$MAGENTA"
-        
-        # Проверяем статус Synapse
-        if ! systemctl is-active --quiet matrix-synapse 2>/dev/null; then
-            safe_echo "${RED}❌ Matrix Synapse не запущен!${NC}"
-            safe_echo "${YELLOW}💡 Запустите Synapse через меню 'Управление службами' → 'Управление Matrix Synapse'${NC}"
-            echo
-            safe_echo "${GREEN}1.${NC} Попробовать запустить Matrix Synapse"
-            safe_echo "${GREEN}2.${NC} Назад в главное меню"
-            
-            echo
-            read -p "$(safe_echo "${YELLOW}Выберите действие (1-2): ${NC}")" choice
-            
-            case $choice in
-                1)
-                    log "INFO" "Попытка запуска Matrix Synapse..."
-                    if systemctl start matrix-synapse; then
-                        log "SUCCESS" "Matrix Synapse запущен"
-                        sleep 3
-                        continue
-                    else
-                        log "ERROR" "Не удалось запустить Matrix Synapse"
-                        log "INFO" "Проверьте логи: journalctl -u matrix-synapse -n 20"
-                        return 1
-                    fi
-                    ;;
-                2)
-                    return 0
-                    ;;
-                *)
-                    log "ERROR" "Неверный выбор"
-                    sleep 1
-                    continue
-                    ;;
-            esac
-        fi
-        
-        # Показываем текущий статус
-        safe_echo "${GREEN}✅ Matrix Synapse активен${NC}"
-        
-        # Показываем домен сервера
-        if [ -f "$CONFIG_DIR/domain" ]; then
-            local matrix_domain=$(cat "$CONFIG_DIR/domain")
-            safe_echo "${BLUE}🌐 Домен сервера: ${BOLD}$matrix_domain${NC}"
-        else
-            safe_echo "${RED}❌ Домен сервера не настроен${NC}"
-            return 1
-        fi
-        
-        # Проверяем доступность API
-        local api_available=false
-        if curl -s -f --connect-timeout 3 http://localhost:8008/_matrix/client/versions >/dev/null 2>&1; then
-            safe_echo "${GREEN}✅ Matrix API доступен${NC}"
-            api_available=true
-        else
-            safe_echo "${YELLOW}⚠️  Matrix API недоступен (возможно, Synapse ещё запускается)${NC}"
-        fi
-        
-        echo
-        safe_echo "${YELLOW}Предупреждение! чтобы создать пользователя, сначала сгенерируйте токен регистрации и включите регистрацию, она по умолчанию выключена(пункт 6).${NC}"
-        echo
-        safe_echo "${BOLD}Управление пользователями:${NC}"
-        safe_echo "${GREEN}1.${NC} 👤 Создать администратора"
-        safe_echo "${GREEN}2.${NC} 👥 Создать обычного пользователя"
-        safe_echo "${GREEN}3.${NC} 🔍 Диагностика проблем регистрации"
-        safe_echo "${GREEN}4.${NC} 🔧 Исправить проблемы регистрации"
-        safe_echo "${GREEN}5.${NC} 📊 Показать информацию о пользователях"
-        
-        echo
-        safe_echo "${BOLD}Дополнительные возможности:${NC}"
-        safe_echo "${GREEN}6.${NC} ⚙️  Настройка регистрации"
-        safe_echo "${GREEN}7.${NC} 🔑 Управление токенами регистрации"
-        safe_echo "${GREEN}8.${NC} 📝 Показать команды для ручного управления"
-        safe_echo "${GREEN}0.${NC} ↩️  Назад в главное меню"
-        
-        echo
-        read -p "$(safe_echo "${YELLOW}Выберите действие (0-8): ${NC}")" choice
-        
-        case $choice in
-            1)
-                if [ "$api_available" = true ]; then
-                    create_admin_user_local
-                else
-                    safe_echo "${RED}❌ Matrix API недоступен. Дождитесь полного запуска Synapse.${NC}"
-                    safe_echo "${BLUE}💡 Попробуйте через 10-15 секунд или проверьте логи Synapse${NC}"
-                fi
-                ;;
-            2)
-                if [ "$api_available" = true ]; then
-                    create_regular_user
-                else
-                    safe_echo "${RED}❌ Matrix API недоступен. Дождитесь полного запуска Synapse.${NC}"
-                fi
-                ;;
-            3)
-                diagnose_registration_issues
-                ;;
-            4)
-                fix_registration_issues
-                ;;
-            5)
-                show_users_info
-                ;;
-            6)
-                run_module "registration_control"
-                ;;
-            7)
-                manage_registration_tokens
-                ;;
-            8)
-                show_manual_commands
-                ;;
-            0)
-                return 0
-                ;;
-            *)
-                log "ERROR" "Неверный выбор"
-                sleep 1
-                ;;
-        esac
-        
-        if [ "$choice" -ne 0 ]; then
-            echo
-            read -p "Нажмите Enter для продолжения..."
-        fi
-    done
-}
-
-# Локальная функция создания администратора (чтобы не импортировать весь core_install.sh)
-create_admin_user_local() {
-    print_header "СОЗДАНИЕ АДМИНИСТРАТОРА" "$MAGENTA"
-    
-    if ! systemctl is-active --quiet matrix-synapse; then
-        log "ERROR" "Matrix Synapse не запущен. Сначала запустите службу."
-        return 1
-    fi
-    
-    log "INFO" "Создание административного пользователя..."
-    
-    # Проверяем доступность API перед созданием пользователя
-    log "INFO" "Проверка доступности Synapse API..."
-    local api_attempts=0
-    local max_api_attempts=5
-    
-    while [ $api_attempts -lt $max_api_attempts ]; do
-        if curl -s -f http://localhost:8008/_matrix/client/versions >/dev/null 2>&1; then
-            log "SUCCESS" "Synapse API доступен"
-            break
-        fi
-        
-        api_attempts=$((api_attempts + 1))
-        if [ $api_attempts -eq $max_api_attempts ]; then
-            log "ERROR" "Synapse API недоступен после $max_api_attempts попыток"
-            log "INFO" "Проверьте логи: journalctl -u matrix-synapse -n 20"
-            return 1
-        fi
-        
-        log "DEBUG" "Ожидание API Synapse... ($api_attempts/$max_api_attempts)"
-        sleep 2
-    done
-    
-    # Проверяем наличие секрета регистрации в конфигурации
-    log "INFO" "Проверка секрета регистрации в конфигурации..."
-    if ! grep -q "registration_shared_secret:" /etc/matrix-synapse/homeserver.yaml; then
-        log "ERROR" "Секрет регистрации не найден в homeserver.yaml"
-        log "INFO" "Попытка восстановления секрета из файла secrets.conf..."
-        
-        if [ -f "$CONFIG_DIR/secrets.conf" ]; then
-            source "$CONFIG_DIR/secrets.conf"
-            if [ -n "$REGISTRATION_SHARED_SECRET" ]; then
-                log "INFO" "Добавление секрета регистрации в homeserver.yaml..."
-                echo "registration_shared_secret: \"$REGISTRATION_SHARED_SECRET\"" >> /etc/matrix-synapse/homeserver.yaml
-                
-                # Перезагружаем Synapse для применения изменений
-                log "INFO" "Перезагрузка Synapse для применения изменений..."
-                if ! systemctl restart matrix-synapse; then
-                    log "ERROR" "Ошибка перезагрузки Synapse"
-                    return 1
-                fi
-                
-                # Ждем запуска
-                sleep 5
-            else
-                log "ERROR" "Секрет регистрации не найден и в secrets.conf"
-                return 1
-            fi
-        else
-            log "ERROR" "Файл secrets.conf не найден"
-            return 1
-        fi
-    fi
-    
-    # Получаем домен сервера
-    if [ ! -f "$CONFIG_DIR/domain" ]; then
-        log "ERROR" "Домен сервера не настроен"
-        return 1
-    fi
-    
-    local matrix_domain=$(cat "$CONFIG_DIR/domain")
-    
-    # Запрос имени пользователя
-    while true; do
-        read -p "$(safe_echo "${YELLOW}Введите имя администратора (только латинские буквы и цифры): ${NC}")" admin_username
-        
-        if [[ ! "$admin_username" =~ ^[a-zA-Z0-9._=-]+$ ]]; then
-            log "ERROR" "Неверный формат имени пользователя"
-            log "INFO" "Разрешены только: латинские буквы, цифры, точки, подчеркидения, дефисы"
-            continue
-        fi
-        
-        if [ ${#admin_username} -lt 3 ]; then
-            log "ERROR" "Имя пользователя должно содержать минимум 3 символа"
-            continue
-        fi
-        
-        if [ ${#admin_username} -gt 50 ]; then
-            log "ERROR" "Имя пользователя слишком длинное (максимум 50 символов)"
-            continue
-        fi
-        
-        break
-    done
-    
-    # Создание пользователя с улучшенной обработкой ошибок
-    log "INFO" "Создание администратора @$admin_username:$matrix_domain..."
-    
-    # Проверяем различные варианты команды register_new_matrix_user
-    local register_command=""
-    
-    if command -v register_new_matrix_user >/dev/null 2>&1; then
-        register_command="register_new_matrix_user"
-    elif [ -x "/opt/venvs/matrix-synapse/bin/register_new_matrix_user" ]; then
-        register_command="/opt/venvs/matrix-synapse/bin/register_new_matrix_user"
-    else
-        log "ERROR" "Команда register_new_matrix_user не найдена"
-        log "INFO" "Попробуйте создать администратора вручную:"
-        log "INFO" "register_new_matrix_user -c /etc/matrix-synapse/homeserver.yaml http://localhost:8008"
-        return 1
-    fi
-    
-    log "INFO" "Используем команду: $register_command"
-    
-    # Создаем временный файл для хранения вывода
-    local temp_output=$(mktemp)
-    
-    # Выполняем команду создания пользователя
-    if $register_command \
-        -c /etc/matrix-synapse/homeserver.yaml \
-        -u "$admin_username" \
-        --admin \
-        http://localhost:8008 > "$temp_output" 2>&1; then
-        
-        log "SUCCESS" "Административный пользователь создан: @$admin_username:$matrix_domain"
-        
-        # Сохранение информации об администраторе
-        echo "ADMIN_USER=$admin_username" >> "$CONFIG_DIR/secrets.conf"
-        
-        # Показываем полезную информацию
-        echo
-        safe_echo "${GREEN}🎉 Администратор успешно создан!${NC}"
-        safe_echo "${BLUE}📋 Данные для входа:${NC}"
-        safe_echo "   ${BOLD}Пользователь:${NC} @$admin_username:$matrix_domain"
-        safe_echo "   ${BOLD}Сервер:${NC} $matrix_domain"
-        safe_echo "   ${BOLD}Логин через Element:${NC} https://app.element.io"
-        
-        # Если Element Web установлен локально
-        if [ -f "$CONFIG_DIR/element_domain" ]; then
-            local element_domain=$(cat "$CONFIG_DIR/element_domain")
-            safe_echo "   ${BOLD}Локальный Element:${NC} https://$element_domain"
-        fi
-        
-        # Очищаем временный файл
-        rm -f "$temp_file"
-        
-    else
-        log "ERROR" "Ошибка создания административного пользователя"
-        
-        # Показываем подробности ошибки
-        if [ -f "$temp_output" ]; then
-            log "DEBUG" "Вывод команды register_new_matrix_user:"
-            cat "$temp_output" | while read line; do
-                log "DEBUG" "$line"
-            done
-        fi
-        
-        # Даем рекомендации по устранению проблем
-        echo
-        safe_echo "${YELLOW}💡 Попробуйте следующее:${NC}"
-        safe_echo "1. ${CYAN}Проверьте статус Synapse:${NC} systemctl status matrix-synapse"
-        safe_echo "2. ${CYAN}Проверьте логи Synapse:${NC} journalctl -u matrix-synapse -n 20"
-        safe_echo "3. ${CYAN}Проверьте API:${NC} curl http://localhost:8008/_matrix/client/versions"
-        safe_echo "4. ${CYAN}Запустите диагностику:${NC} через пункт меню"
-        
-        # Очищаем временный файл
-        rm -f "$temp_output"
-        
-        return 1
-    fi
-    
-    return 0
-}
-
-# Функция создания обычного пользователя
-create_regular_user() {
-    print_header "СОЗДАНИЕ ОБЫЧНОГО ПОЛЬЗОВАТЕЛЯ" "$BLUE"
-    
-    if ! systemctl is-active --quiet matrix-synapse; then
-        log "ERROR" "Matrix Synapse не запущен"
-        return 1
-    fi
-    
-    # Проверяем доступность API
-    if ! curl -s -f --connect-timeout 3 http://localhost:8008/_matrix/client/versions >/dev/null 2>&1; then
-        log "ERROR" "Matrix API недоступен"
-        return 1
-    fi
-    
-    # Получаем домен
-    if [ ! -f "$CONFIG_DIR/domain" ]; then
-        log "ERROR" "Домен сервера не настроен"
-        return 1
-    fi
-    
-    local matrix_domain=$(cat "$CONFIG_DIR/domain")
-    
-    log "INFO" "Создание обычного пользователя на домене: $matrix_domain"
-    
-    # Запрос имени пользователя
-    while true; do
-        read -p "$(safe_echo "${YELLOW}Введите имя пользователя (только латинские буквы и цифры): ${NC}")" username
-        
-        if [[ ! "$username" =~ ^[a-zA-Z0-9._=-]+$ ]]; then
-            log "ERROR" "Неверный формат имени пользователя"
-            log "INFO" "Разрешены только: латинские буквы, цифры, точки, подчеркидения, дефисы"
-            continue
-        fi
-        
-        if [ ${#username} -lt 3 ]; then
-            log "ERROR" "Имя пользователя должно содержать минимум 3 символа"
-            continue
-        fi
-        
-        if [ ${#username} -gt 50 ]; then
-            log "ERROR" "Имя пользователя слишком длинное (максимум 50 символов)"
-            continue
-        fi
-        
-        break
-    done
-    
-    # Проверяем различные варианты команды register_new_matrix_user
-    local register_command=""
-    
-    if command -v register_new_matrix_user >/dev/null 2>&1; then
-        register_command="register_new_matrix_user"
-    elif [ -x "/opt/venvs/matrix-synapse/bin/register_new_matrix_user" ]; then
-        register_command="/opt/venvs/matrix-synapse/bin/register_new_matrix_user"
-    else
-        log "ERROR" "Команда register_new_matrix_user не найдена"
-        log "INFO" "Попробуйте создать пользователя вручную:"
-        log "INFO" "register_new_matrix_user -c /etc/matrix-synapse/homeserver.yaml http://localhost:8008"
-        return 1
-    fi
-    
-    log "INFO" "Используем команду: $register_command"
-    log "INFO" "Создание пользователя @$username:$matrix_domain..."
-    
-    # Создаем временный файл для хранения вывода
-    local temp_output=$(mktemp)
-    
-    # Выполняем команду создания пользователя (БЕЗ флага --admin)
-    if $register_command \
-        -c /etc/matrix-synapse/homeserver.yaml \
-        -u "$username" \
-        http://localhost:8008 > "$temp_output" 2>&1; then
-        
-        log "SUCCESS" "Пользователь создан: @$username:$matrix_domain"
-        
-        # Показываем полезную информацию
-        echo
-        safe_echo "${GREEN}🎉 Пользователь успешно создан!${NC}"
-        safe_echo "${BLUE}📋 Данные для входа:${NC}"
-        safe_echo "   ${BOLD}Пользователь:${NC} @$username:$matrix_domain"
-        safe_echo "   ${BOLD}Сервер:${NC} $matrix_domain"
-        safe_echo "   ${BOLD}Тип:${NC} Обычный пользователь"
-        safe_echo "   ${BOLD}Логин через Element:${NC} https://app.element.io"
-        
-        # Если Element Web установлен локально
-        if [ -f "$CONFIG_DIR/element_domain" ]; then
-            local element_domain=$(cat "$CONFIG_DIR/element_domain")
-            safe_echo "   ${BOLD}Локальный Element:${NC} https://$element_domain"
-        fi
-        
-        # Очищаем временный файл
-        rm -f "$temp_output"
-        
-    else
-        log "ERROR" "Ошибка создания пользователя"
-        
-        # Показываем подробности ошибки
-        if [ -f "$temp_output" ]; then
-            log "DEBUG" "Вывод команды register_new_matrix_user:"
-            cat "$temp_output" | while read line; do
-                log "DEBUG" "$line"
-            done
-        fi
-        
-        # Даем рекомендации по устранению проблем
-        echo
-        safe_echo "${YELLOW}💡 Возможные решения:${NC}"
-        safe_echo "1. ${CYAN}Проверьте статус Synapse:${NC} systemctl status matrix-synapse"
-        safe_echo "2. ${CYAN}Проверьте логи Synapse:${NC} journalctl -u matrix-synapse -n 20"
-        safe_echo "3. ${CYAN}Проверьте API:${NC} curl http://localhost:8008/_matrix/client/versions"
-        safe_echo "4. ${CYAN}Запустите диагностику:${NC} через пункт меню"
-        
-        # Очищаем временный файл
-        rm -f "$temp_output"
-        
-        return 1
-    fi
-    
-    return 0
-}
-
-# Функция показа информации о пользователях
-show_users_info() {
-    print_header "ИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЯХ" "$CYAN"
-    
-    if ! systemctl is-active --quiet matrix-synapse; then
-        safe_echo "${RED}❌ Matrix Synapse не запущен${NC}"
-        return 1
-    fi
-    
-    # Показываем домен сервера
-    if [ -f "$CONFIG_DIR/domain" ]; then
-        local matrix_domain=$(cat "$CONFIG_DIR/domain")
-        safe_echo "${BLUE}🌐 Домен сервера: ${BOLD}$matrix_domain${NC}"
-    else
-        safe_echo "${RED}❌ Домен сервера не настроен${NC}"
-        return 1
-    fi
-    
-    echo
-    
-    # Информация из базы данных
-    safe_echo "${BOLD}${BLUE}Информация из базы данных:${NC}"
-    
-    if sudo -u postgres psql -d synapse_db -c "\dt" >/dev/null 2>&1; then
-        # Подсчёт пользователей
-        local total_users=$(sudo -u postgres psql -d synapse_db -t -c "SELECT COUNT(*) FROM users;" 2>/dev/null | xargs)
-        local admin_users=$(sudo -u postgres psql -d synapse_db -t -c "SELECT COUNT(*) FROM users WHERE admin = 1;" 2>/dev/null | xargs)
-        local active_users=$(sudo -u postgres psql -d synapse_db -t -c "SELECT COUNT(*) FROM users WHERE deactivated = 0;" 2>/dev/null | xargs)
-        
-        if [ -n "$total_users" ] && [ "$total_users" != "0" ]; then
-            safe_echo "  ${GREEN}👥 Всего пользователей: $total_users${NC}"
-            safe_echo "  ${YELLOW}👑 Администраторов: ${admin_users:-0}${NC}"
-            safe_echo "  ${GREEN}✅ Активных: ${active_users:-0}${NC}"
-            safe_echo "  ${RED}🚫 Деактивированных: $((total_users - active_users))${NC}"
-        else
-            safe_echo "  ${YELLOW}⚠️  Пользователи не найдены${NC}"
-        fi
-        
-        echo
-        
-        # Список администраторов
-        safe_echo "${BOLD}${BLUE}Администраторы:${NC}"
-        local admins=$(sudo -u postgres psql -d synapse_db -t -c "SELECT name FROM users WHERE admin = 1 AND deactivated = 0;" 2>/dev/null)
-        
-        if [ -n "$admins" ]; then
-            echo "$admins" | while read -r admin_name; do
-                if [ -n "$admin_name" ]; then
-                    admin_name=$(echo "$admin_name" | xargs)  # убираем лишние пробелы
-                    safe_echo "  ${GREEN}👑 $admin_name${NC}"
-                fi
-            done
-        else
-            safe_echo "  ${RED}❌ Администраторы не найдены${NC}"
-            safe_echo "  ${YELLOW}💡 Создайте администратора через пункт меню${NC}"
-        fi
-        
-        echo
-        
-        # Последние созданные пользователи (первые 5)
-        safe_echo "${BOLD}${BLUE}Последние пользователи:${NC}"
-        local recent_users=$(sudo -u postgres psql -d synapse_db -t -c "SELECT name, creation_ts FROM users WHERE deactivated = 0 ORDER BY creation_ts DESC LIMIT 5;" 2>/dev/null)
-        
-        if [ -n "$recent_users" ]; then
-            echo "$recent_users" | while IFS='|' read -r user_name creation_ts; do
-                if [ -n "$user_name" ] && [ -n "$creation_ts" ]; then
-                    user_name=$(echo "$user_name" | xargs)
-                    creation_ts=$(echo "$creation_ts" | xargs)
-                    
-                    # Конвертируем timestamp в читаемый формат
-                    local creation_date=$(date -d "@$((creation_ts / 1000))" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "неизвестно")
-                    
-                    safe_echo "  ${BLUE}👤 $user_name${NC} ${DIM}(создан: $creation_date)${NC}"
-                fi
-            done
-        else
-            safe_echo "  ${YELLOW}⚠️  Пользователи не найдены${NC}"
-        fi
-        
-    else
-        safe_echo "  ${RED}❌ Не удалось подключиться к базе данных${NC}"
-        safe_echo "  ${YELLOW}💡 Проверьте статус PostgreSQL: systemctl status postgresql${NC}"
-    fi
-    
-    echo
-    
-    # API информация (если доступен)
-    if curl -s -f --connect-timeout 3 http://localhost:8008/_matrix/client/versions >/dev/null 2>&1; then
-        safe_echo "${BOLD}${BLUE}Статус API:${NC}"
-        safe_echo "  ${GREEN}✅ Matrix API доступен${NC}"
-        
-        # Версия сервера
-        local server_version=$(curl -s --connect-timeout 3 http://localhost:8008/_synapse/admin/v1/server_version 2>/dev/null | grep -o '"server_version":"[^"]*' | cut -d'"' -f4)
-        if [ -n "$server_version" ]; then
-            safe_echo "  ${BLUE}ℹ️  Версия Synapse: $server_version${NC}"
-        fi
-        
-    else
-        safe_echo "${BOLD}${BLUE}Статус API:${NC}"
-        safe_echo "  ${RED}❌ Matrix API недоступен${NC}"
-        safe_echo "  ${YELLOW}💡 API требуется для создания пользователей${NC}"
-    fi
-    
-    echo
-    
-    # Полезные команды
-    safe_echo "${BOLD}${BLUE}Полезные команды:${NC}"
-    safe_echo "  ${CYAN}Создать администратора:${NC} register_new_matrix_user -c /etc/matrix-synapse/homeserver.yaml --admin http://localhost:8008"
-    safe_echo "  ${CYAN}Создать пользователя:${NC} register_new_matrix_user -c /etc/matrix-synapse/homeserver.yaml http://localhost:8008"
-    safe_echo "  ${CYAN}Создать пользователя с конкретным именем:${NC} register_new_matrix_user -c /etc/matrix-synapse/homeserver.yaml -u username http://localhost:8008"
-    
-    echo
-    safe_echo "${BOLD}${BLUE}Управление через базу данных:${NC}"
-    safe_echo "${CYAN}# Подключиться к базе данных${NC}"
-    safe_echo "sudo -u postgres psql synapse_db"
-    safe_echo ""
-    safe_echo "${CYAN}# Показать всех пользователей${NC}"
-    safe_echo "sudo -u postgres psql -d synapse_db -c \"SELECT name, admin, deactivated FROM users;\""
-    safe_echo ""
-    safe_echo "${CYAN}# Сделать пользователя администратором${NC}"
-    safe_echo "sudo -u postgres psql -d synapse_db -c \"UPDATE users SET admin = 1 WHERE name = '@username:$matrix_domain';\""
-    safe_echo ""
-    safe_echo "${CYAN}# Деактивировать пользователя${NC}"
-    safe_echo "sudo -u postgres psql -d synapse_db -c \"UPDATE users SET deactivated = 1 WHERE name = '@username:$matrix_domain';\""
-    
-    echo
-    safe_echo "${BOLD}${BLUE}Управление службами:${NC}"
-    safe_echo "${CYAN}# Перезапустить Synapse${NC}"
-    safe_echo "systemctl restart matrix-synapse"
-    safe_echo ""
-    safe_echo "${CYAN}# Посмотреть логи Synapse${NC}"
-    safe_echo "journalctl -u matrix-synapse -f"
-    safe_echo ""
-    safe_echo "${CYAN}# Проверить статус всех служб Matrix${NC}"
-    safe_echo "systemctl status matrix-synapse postgresql nginx"
-    
-    echo
-    safe_echo "${BOLD}${BLUE}Диагностика:${NC}"
-    safe_echo "${CYAN}# Проверить доступность API${NC}"
-    safe_echo "curl http://localhost:8008/_matrix/client/versions"
-    safe_echo ""
-    safe_echo "${CYAN}# Проверить конфигурацию Synapse${NC}"
-    safe_echo "python3 -m synapse.config -c /etc/matrix-synapse/homeserver.yaml"
-    safe_echo ""
-    safe_echo "${CYAN}# Проверить открытые порты${NC}"
-    safe_echo "ss -tlnp | grep -E ':(8008|8448|5432|80|443)'"
-    
-    echo
-    safe_echo "${BOLD}${BLUE}Важные файлы и пути:${NC}"
-    safe_echo "${YELLOW}Конфигурация Synapse:${NC} /etc/matrix-synapse/homeserver.yaml"
-    safe_echo "${YELLOW}Логи Synapse:${NC} /var/lib/matrix-synapse/homeserver.log"
-    safe_echo "${YELLOW}Данные Synapse:${NC} /var/lib/matrix-synapse/"
-    safe_echo "${YELLOW}Конфигурация установщика:${NC} $CONFIG_DIR/"
-    safe_echo "${YELLOW}База данных:${NC} PostgreSQL, база synapse_db"
-    
-    return 0
-}
-
-# Функция управления токенами регистрации
-manage_registration_tokens() {
-    print_header "УПРАВЛЕНИЕ ТОКЕНАМИ РЕГИСТРАЦИИ" "$YELLOW"
-    
-    safe_echo "${BLUE}💡 Токены регистрации позволяют контролировать, кто может регистрироваться на сервере${NC}"
-    safe_echo "${BLUE}💡 Каждый токен может иметь ограничения по количеству использований${NC}"
-    
-    echo
-    safe_echo "${BOLD}Функции токенов:${NC}"
-    safe_echo "${GREEN}1.${NC} 🎫 Создать новый токен регистрации"
-    safe_echo "${GREEN}2.${NC} 📋 Показать все токены"
-    safe_echo "${GREEN}3.${NC} 🗑️  Удалить токен"
-    safe_echo "${GREEN}4.${NC} ⚙️  Полное управление регистрации (модуль)"
-    safe_echo "${GREEN}5.${NC} ↩️  Назад"
-    
-    echo
-    read -p "$(safe_echo "${YELLOW}Выберите действие (1-5): ${NC}")" choice
-    
-    case $choice in
-        1)
-            create_registration_token
-            ;;
-        2)
-            list_registration_tokens
-            ;;
-        3)
-            delete_registration_token
-            ;;
-        4)
-            run_module "registration_control"
-            ;;
-        5)
-            return 0
+    case "$ID" in
+        ubuntu|debian)
+            log "SUCCESS" "Поддерживаемый дистрибутив: $ID"
             ;;
         *)
-            log "ERROR" "Неверный выбор"
-            sleep 1
+            log "WARN" "Дистрибутив $ID может не поддерживаться полностью"
+            if ! ask_confirmation "Продолжить на свой страх и риск?"; then
+                return 1
+            fi
             ;;
     esac
-}
-
-# Функция создания токена регистрации
-create_registration_token() {
-    log "INFO" "Создание токена регистрации..."
     
-    # TODO: Здесь нужна реализация создания токена через Synapse API
-    # Пока что показываем информацию о том, как это сделать
-    
-    safe_echo "${YELLOW}⚠️  Функция в разработке${NC}"
-    safe_echo "${BLUE}💡 Пока что используйте полный модуль управления registration_control для создания токенов${NC}"
-    safe_echo "${BLUE}💡 Или выполните команды вручную через Synapse Admin API${NC}"
-    
-    echo
-    safe_echo "${CYAN}Пример создания токена через API:${NC}"
-    safe_echo "curl -X POST http://localhost:8008/_synapse/admin/v1/registration_tokens/new \\"
-    safe_echo "  -H \"Authorization: Bearer YOUR_ACCESS_TOKEN\" \\"
-    safe_echo "  -H \"Content-Type: application/json\" \\"
-    safe_echo "  -d '{\"uses_allowed\": 10}'"
-}
-
-# Функция показа токенов регистрации
-list_registration_tokens() {
-    log "INFO" "Показ токенов регистрации..."
-    
-    # TODO: Здесь нужна реализация через Synapse API
-    safe_echo "${YELLOW}⚠️  Функция в разработке${NC}"
-    safe_echo "${BLUE}💡 Используйте полный модуль управления registration_control для полной функциональности${NC}"
-}
-
-# Функция удаления токена регистрации
-delete_registration_token() {
-    log "INFO" "Удаление токена регистрации..."
-    
-    # TODO: Здесь нужна реализация через Synapse API
-    safe_echo "${YELLOW}⚠️  Функция в разработке${NC}"
-    safe_echo "${BLUE}💡 Используйте полный модуль управления registration_control для полной функциональности${NC}"
-}
-
-# Функция показа команд для ручного управления
-show_manual_commands() {
-    print_header "КОМАНДЫ ДЛЯ РУЧНОГО УПРАВЛЕНИЯ" "$CYAN"
-    
-    # Получаем домен если есть
-    local matrix_domain="example.com"
-    if [ -f "$CONFIG_DIR/domain" ]; then
-        matrix_domain=$(cat "$CONFIG_DIR/domain")
+    if [ "$ID" = "ubuntu" ]; then
+        local version_id="${VERSION_ID%.*}"
+        if [ "$version_id" -lt 20 ]; then
+            log "WARN" "Рекомендуется Ubuntu 20.04 или новее (текущая: $VERSION_ID)"
+        fi
+    elif [ "$ID" = "debian" ]; then
+        local version_id="${VERSION_ID%.*}"
+        if [ "$version_id" -lt 11 ]; then
+            log "WARN" "Рекомендуется Debian 11 или новее (текущая: $VERSION_ID)"
+        fi
     fi
     
-    safe_echo "${BOLD}${BLUE}Создание пользователей:${NC}"
-    safe_echo "${CYAN}# Создать администратора${NC}"
-    safe_echo "register_new_matrix_user -c /etc/matrix-synapse/homeserver.yaml --admin http://localhost:8008"
-    safe_echo ""
-    safe_echo "${CYAN}# Создать обычного пользователя${NC}"
-    safe_echo "register_new_matrix_user -c /etc/matrix-synapse/homeserver.yaml http://localhost:8008"
-    safe_echo ""
-    safe_echo "${CYAN}# Создать пользователя с конкретным именем${NC}"
-    safe_echo "register_new_matrix_user -c /etc/matrix-synapse/homeserver.yaml -u username http://localhost:8008"
+    check_root || return 1
     
-    echo
-    safe_echo "${BOLD}${BLUE}Управление через базу данных:${NC}"
-    safe_echo "${CYAN}# Подключиться к базе данных${NC}"
-    safe_echo "sudo -u postgres psql synapse_db"
-    safe_echo ""
-    safe_echo "${CYAN}# Показать всех пользователей${NC}"
-    safe_echo "sudo -u postgres psql -d synapse_db -c \"SELECT name, admin, deactivated FROM users;\""
-    safe_echo ""
-    safe_echo "${CYAN}# Сделать пользователя администратором${NC}"
-    safe_echo "sudo -u postgres psql -d synapse_db -c \"UPDATE users SET admin = 1 WHERE name = '@username:$matrix_domain';\""
-    safe_echo ""
-    safe_echo "${CYAN}# Деактивировать пользователя${NC}"
-    safe_echo "sudo -u postgres psql -d synapse_db -c \"UPDATE users SET deactivated = 1 WHERE name = '@username:$matrix_domain';\""
+    load_server_type || return 1
     
-    echo
-    safe_echo "${BOLD}${BLUE}Управление службами:${NC}"
-    safe_echo "${CYAN}# Перезапустить Synapse${NC}"
-    safe_echo "systemctl restart matrix-synapse"
-    safe_echo ""
-    safe_echo "${CYAN}# Посмотреть логи Synapse${NC}"
-    safe_echo "journalctl -u matrix-synapse -f"
-    safe_echo ""
-    safe_echo "${CYAN}# Проверить статус всех служб Matrix${NC}"
-    safe_echo "systemctl status matrix-synapse postgresql nginx"
+    log "INFO" "Тип сервера: $SERVER_TYPE"
+    log "INFO" "Bind адрес: $BIND_ADDRESS"
+    [[ -n "${PUBLIC_IP:-}" ]] && log "INFO" "Публичный IP: $PUBLIC_IP"
+    [[ -n "${LOCAL_IP:-}" ]] && log "INFO" "Локальный IP: $LOCAL_IP"
     
-    echo
-    safe_echo "${BOLD}${BLUE}Диагностика:${NC}"
-    safe_echo "${CYAN}# Проверить доступность API${NC}"
-    safe_echo "curl http://localhost:8008/_matrix/client/versions"
-    safe_echo ""
-    safe_echo "${CYAN}# Проверить конфигурацию Synapse${NC}"
-    safe_echo "python3 -m synapse.config -c /etc/matrix-synapse/homeserver.yaml"
-    safe_echo ""
-    safe_echo "${CYAN}# Проверить открытые порты${NC}"
-    safe_echo "ss -tlnp | grep -E ':(8008|8448|5432|80|443)'"
+    check_internet || return 1
     
-    echo
-    safe_echo "${BOLD}${BLUE}Важные файлы и пути:${NC}"
-    safe_echo "${YELLOW}Конфигурация Synapse:${NC} /etc/matrix-synapse/homeserver.yaml"
-    safe_echo "${YELLOW}Логи Synapse:${NC} /var/lib/matrix-synapse/homeserver.log"
-    safe_echo "${YELLOW}Данные Synapse:${NC} /var/lib/matrix-synapse/"
-    safe_echo "${YELLOW}Конфигурация установщика:${NC} $CONFIG_DIR/"
-    safe_echo "${YELLOW}База данных:${NC} PostgreSQL, база synapse_db"
+    get_system_info
     
+    log "SUCCESS" "Проверка системы завершена"
     return 0
 }
 
-# Функция диагностики проблем регистрации
-diagnose_registration_issues() {
-    print_header "ДИАГНОСТИКА ПРОБЛЕМ РЕГИСТРАЦИИ" "$YELLOW"
-    
-    local issues_found=0
-    
-    safe_echo "${BOLD}Проверка компонентов регистрации...${NC}"
-    echo
-    
-    # 1. Проверка статуса Matrix Synapse
-    safe_echo "${BLUE}1. Проверка Matrix Synapse:${NC}"
-    if systemctl is-active --quiet matrix-synapse; then
-        safe_echo "   ${GREEN}✅ Служба Matrix Synapse запущена${NC}"
-    else
-        safe_echo "   ${RED}❌ Служба Matrix Synapse не запущена${NC}"
-        ((issues_found++))
-    fi
-    
-    # 2. Проверка API доступности
-    safe_echo "${BLUE}2. Проверка Matrix API:${NC}"
-    if curl -s -f --connect-timeout 3 http://localhost:8008/_matrix/client/versions >/dev/null 2>&1; then
-        safe_echo "   ${GREEN}✅ Client API доступен${NC}"
-    else
-        safe_echo "   ${RED}❌ Client API недоступен${NC}"
-        ((issues_found++))
-    fi
-    
-    # 3. Проверка секрета регистрации
-    safe_echo "${BLUE}3. Проверка registration_shared_secret:${NC}"
-    if grep -q "registration_shared_secret:" /etc/matrix-synapse/homeserver.yaml; then
-        safe_echo "   ${GREEN}✅ registration_shared_secret найден в homeserver.yaml${NC}"
-    elif [ -f "/etc/matrix-synapse/conf.d/registration.yaml" ] && grep -q "registration_shared_secret:" /etc/matrix-synapse/conf.d/registration.yaml 2>/dev/null; then
-        safe_echo "   ${YELLOW}⚠️  registration_shared_secret найден в registration.yaml (может не работать)${NC}"
-        safe_echo "   ${BLUE}💡 Утилита register_new_matrix_user ищет секрет только в homeserver.yaml${NC}"
-        ((issues_found++))
-    else
-        safe_echo "   ${RED}❌ registration_shared_secret не найден${NC}"
-        ((issues_found++))
-    fi
-    
-    # 4. Проверка macaroon_secret_key
-    safe_echo "${BLUE}4. Проверка macaroon_secret_key:${NC}"
-    if grep -q "macaroon_secret_key:" /etc/matrix-synapse/homeserver.yaml 2>/dev/null; then
-        safe_echo "   ${GREEN}✅ macaroon_secret_key найден в homeserver.yaml${NC}"
-    else
-        safe_echo "   ${RED}❌ macaroon_secret_key не найден${NC}"
-        safe_echo "   ${YELLOW}💡 Этот ключ необходим для работы Synapse${NC}"
-        ((issues_found++))
-    fi
-    
-    # 5. Проверка form_secret
-    safe_echo "${BLUE}5. Проверка form_secret:${NC}"
-    if grep -q "form_secret:" /etc/matrix-synapse/homeserver.yaml 2>/dev/null; then
-        safe_echo "   ${GREEN}✅ form_secret найден в homeserver.yaml${NC}"
-    else
-        safe_echo "   ${RED}❌ form_secret не найден${NC}"
-        safe_echo "   ${YELLOW}💡 Этот ключ необходим для HTML форм${NC}"
-        ((issues_found++))
-    fi
-    
-    # 6. Проверка утилиты register_new_matrix_user
-    safe_echo "${BLUE}6. Проверка утилиты регистрации:${NC}"
-    if command -v register_new_matrix_user >/dev/null 2>&1; then
-        safe_echo "   ${GREEN}✅ Команда register_new_matrix_user доступна${NC}"
-    elif [ -x "/opt/venvs/matrix-synapse/bin/register_new_matrix_user" ]; then
-        safe_echo "   ${GREEN}✅ Команда найдена в venv: /opt/venvs/matrix-synapse/bin/register_new_matrix_user${NC}"
-    else
-        safe_echo "   ${RED}❌ Команда register_new_matrix_user не найдена${NC}"
-        ((issues_found++))
-    fi
-    
-    # 7. Проверка прав доступа к конфигурации
-    safe_echo "${BLUE}7. Проверка прав доступа:${NC}"
-    if [ -r "/etc/matrix-synapse/homeserver.yaml" ]; then
-        safe_echo "   ${GREEN}✅ Файл homeserver.yaml доступен для чтения${NC}"
-    else
-        safe_echo "   ${RED}❌ Нет доступа к файлу homeserver.yaml${NC}"
-        ((issues_found++))
-    fi
-    
-    # 8. Проверка PostgreSQL
-    safe_echo "${BLUE}8. Проверка базы данных:${NC}"
-    if systemctl is-active --quiet postgresql; then
-        if sudo -u postgres psql -d synapse_db -c "SELECT 1;" >/dev/null 2>&1; then
-            safe_echo "   ${GREEN}✅ База данных synapse_db доступна${NC}"
-        else
-            safe_echo "   ${RED}❌ База данных synapse_db недоступна${NC}"
-            ((issues_found++))
-        fi
-    else
-        safe_echo "   ${RED}❌ PostgreSQL не запущен${NC}"
-        ((issues_found++))
-    fi
-    
-    # 9. Проверка конфигурации Synapse
-    safe_echo "${BLUE}9. Проверка конфигурации Synapse:${NC}"
-    
-    # Проверяем различные способы валидации конфигурации Synapse
-    local validation_success=false
-    local validation_output=""
-    
-    # Метод 1: Системный python3 с модулем synapse
-    if python3 -c "import synapse" >/dev/null 2>&1; then
-        validation_output=$(python3 -m synapse.config -c /etc/matrix-synapse/homeserver.yaml 2>&1)
-        if [ $? -eq 0 ]; then
-            safe_echo "   ${GREEN}✅ Конфигурация корректна (проверено через системный python3)${NC}"
-            validation_success=true
-        fi
-    fi
-    
-    # Метод 2: Virtual environment (если первый не сработал)
-    if [ "$validation_success" = false ] && [ -x "/opt/venvs/matrix-synapse/bin/python" ]; then
-        validation_output=$(/opt/venvs/matrix-synapse/bin/python -m synapse.config -c /etc/matrix-synapse/homeserver.yaml 2>&1)
-        if [ $? -eq 0 ]; then
-            log "SUCCESS" "Конфигурация корректна (проверено через venv)"
-            validation_success=true
-        fi
-    fi
-    
-    # Метод 3: Основная проверка - если Synapse работает, конфигурация скорее всего корректна
-    if [ "$validation_success" = false ]; then
-        if systemctl is-active --quiet matrix-synapse 2>/dev/null; then
-            safe_echo "   ${GREEN}✅ Конфигурация проходит базовую проверку (Synapse запущен и работает)${NC}"
-            validation_success=true
-        fi
-    fi
-    
-    # Если все методы не сработали
-    if [ "$validation_success" = false ]; then
-        safe_echo "   ${RED}❌ Не удалось проверить конфигурацию или обнаружены ошибки${NC}"
-        if [ -n "$validation_output" ]; then
-            echo "Подробности ошибки:"
-            echo "$validation_output"
-        fi
-        echo
-        safe_echo "   ${YELLOW}💡 Альтернативные способы проверки:${NC}"
-        safe_echo "   ${YELLOW}• Если Synapse запущен и работает, конфигурация скорее всего корректна${NC}"
-        safe_echo "   ${YELLOW}• Проверьте логи Synapse: journalctl -u matrix-synapse -n 20${NC}"
-        safe_echo "   ${YELLOW}• Проверьте права доступа к homeserver.yaml${NC}"
-        ((issues_found++))
-    fi
-    
-    echo
-    
-    # Итоговый отчет
-    if [ $issues_found -eq 0 ]; then
-        safe_echo "${GREEN}🎉 Диагностика завершена: серьезных проблем не обнаружено${NC}"
-        safe_echo "${BLUE}💡 Все компоненты регистрации настроены корректно${NC}"
-    else
-        safe_echo "${YELLOW}⚠️  Диагностика завершена: обнаружено проблем: $issues_found${NC}"
-        safe_echo "${BLUE}💡 Используйте функцию 'Исправить проблемы регистрации' для автоматического устранения${NC}"
-    fi
-    
-    return 0
-}
-
-# Функция исправления проблем регистрации
-fix_registration_issues() {
-    print_header "ИСПРАВЛЕНИЕ ПРОБЛЕМ РЕГИСТРАЦИИ" "$GREEN"
-    
-    local fixes_applied=0
-    local need_restart=false
-    
-    safe_echo "${BOLD}Автоматическое исправление проблем...${NC}"
-    echo
-    
-    # 1. Запуск PostgreSQL если остановлен
-    if ! systemctl is-active --quiet postgresql; then
-        safe_echo "${BLUE}🔧 Запуск PostgreSQL...${NC}"
-        if systemctl start postgresql; then
-            safe_echo "   ${GREEN}✅ PostgreSQL запущен${NC}"
-            ((fixes_applied++))
-            sleep 2
-        else
-            safe_echo "   ${RED}❌ Не удалось запустить PostgreSQL${NC}"
-        fi
-    fi
-    
-    # Создаем резервную copie конфигурации один раз
-    if [ ! -f "/etc/matrix-synapse/homeserver.yaml.backup.$(date +%Y%m%d)" ]; then
-        safe_echo "${BLUE}🔧 Создание резервной копии конфигурации...${NC}"
-        cp /etc/matrix-synapse/homeserver.yaml /etc/matrix-synapse/homeserver.yaml.backup.$(date +%Y%m%d_%H%M%S)
-        safe_echo "   ${GREEN}✅ Резервная копия создана${NC}"
-    fi
-    
-    # 2. Проверка и добавление registration_shared_secret
-    if ! grep -q "registration_shared_secret:" /etc/matrix-synapse/homeserver.yaml 2>/dev/null; then
-        safe_echo "${BLUE}🔧 Добавление registration_shared_secret в homeserver.yaml...${NC}"
-        
-        # Генерируем новый секрет если его нет
-        local registration_secret=""
-        if [ -f "/opt/matrix-install/secrets.conf" ]; then
-            registration_secret=$(grep "REGISTRATION_SHARED_SECRET=" /opt/matrix-install/secrets.conf 2>/dev/null | cut -d'=' -f2 | tr -d '"')
-        fi
-        
-        if [ -z "$registration_secret" ]; then
-            registration_secret=$(openssl rand -hex 32)
-            safe_echo "   ${BLUE}💡 Сгенерирован новый registration_shared_secret${NC}"
-        fi
-        
-        # Добавляем секрет в homeserver.yaml
-        if ! grep -q "# Секреты безопасности" /etc/matrix-synapse/homeserver.yaml; then
-            echo "" >> /etc/matrix-synapse/homeserver.yaml
-            echo "# Секреты безопасности" >> /etc/matrix-synapse/homeserver.yaml
-        fi
-        
-        # Удаляем старую строку если есть и добавляем новую
-        sed -i '/^registration_shared_secret:/d' /etc/matrix-synapse/homeserver.yaml
-        echo "registration_shared_secret: \"$registration_secret\"" >> /etc/matrix-synapse/homeserver.yaml
-        
-        safe_echo "   ${GREEN}✅ registration_shared_secret добавлен в homeserver.yaml${NC}"
-        ((fixes_applied++))
-        need_restart=true
-        
-        # Сохраняем секрет в конфигурации установщика
-        mkdir -p /opt/matrix-install
-        if ! grep -q "REGISTRATION_SHARED_SECRET=" /opt/matrix-install/secrets.conf 2>/dev/null; then
-            echo "REGISTRATION_SHARED_SECRET=\"$registration_secret\"" >> /opt/matrix-install/secrets.conf
-        fi
-    fi
-    
-    # 3. Проверка и добавление macaroon_secret_key
-    if ! grep -q "macaroon_secret_key:" /etc/matrix-synapse/homeserver.yaml 2>/dev/null; then
-        safe_echo "${BLUE}🔧 Добавление macaroon_secret_key в homeserver.yaml...${NC}"
-        
-        # Генерируем новый macaroon secret
-        local macaroon_secret=""
-        if [ -f "/opt/matrix-install/secrets.conf" ]; then
-            macaroon_secret=$(grep "MACAROON_SECRET_KEY=" /opt/matrix-install/secrets.conf 2>/dev/null | cut -d'=' -f2 | tr -d '"')
-        fi
-        
-        if [ -z "$macaroon_secret" ]; then
-            macaroon_secret=$(openssl rand -hex 32)
-            safe_echo "   ${BLUE}💡 Сгенерирован новый macaroon_secret_key${NC}"
-        fi
-        
-        # Добавляем macaroon_secret_key в homeserver.yaml
-        if ! grep -q "# Секреты безопасности" /etc/matrix-synapse/homeserver.yaml; then
-            echo "" >> /etc/matrix-synapse/homeserver.yaml
-            echo "# Секреты безопасности" >> /etc/matrix-synapse/homeserver.yaml
-        fi
-        
-        # Удаляем старую строку если есть и добавляем новую
-        sed -i '/^macaroon_secret_key:/d' /etc/matrix-synapse/homeserver.yaml
-        echo "macaroon_secret_key: \"$macaroon_secret\"" >> /etc/matrix-synapse/homeserver.yaml
-        
-        safe_echo "   ${GREEN}✅ macaroon_secret_key добавлен в homeserver.yaml${NC}"
-        ((fixes_applied++))
-        need_restart=true
-        
-        # Сохраняем секрет в конфигурации установщика
-        mkdir -p /opt/matrix-install
-        if ! grep -q "MACAROON_SECRET_KEY=" /opt/matrix-install/secrets.conf 2>/dev/null; then
-            echo "MACAROON_SECRET_KEY=\"$macaroon_secret\"" >> /opt/matrix-install/secrets.conf
-        fi
-    fi
-    
-    # 4. Проверка и добавление form_secret
-    if ! grep -q "form_secret:" /etc/matrix-synapse/homeserver.yaml 2>/dev/null; then
-        safe_echo "${BLUE}🔧 Добавление form_secret в homeserver.yaml...${NC}"
-        
-        # Генерируем новый form secret
-        local form_secret=""
-        if [ -f "/opt/matrix-install/secrets.conf" ]; then
-            form_secret=$(grep "FORM_SECRET=" /opt/matrix-install/secrets.conf 2>/dev/null | cut -d'=' -f2 | tr -d '"')
-        fi
-        
-        if [ -z "$form_secret" ]; then
-            form_secret=$(openssl rand -hex 32)
-            safe_echo "   ${BLUE}💡 Сгенерирован новый form_secret${NC}"
-        fi
-        
-        # Добавляем form_secret в homeserver.yaml
-        sed -i '/^form_secret:/d' /etc/matrix-synapse/homeserver.yaml
-        echo "form_secret: \"$form_secret\"" >> /etc/matrix-synapse/homeserver.yaml
-        
-        safe_echo "   ${GREEN}✅ form_secret добавлен в homeserver.yaml${NC}"
-        ((fixes_applied++))
-        need_restart=true
-        
-        # Сохраняем секрет в конфигурации установщика
-        mkdir -p /opt/matrix-install
-        if ! grep -q "FORM_SECRET=" /opt/matrix-install/secrets.conf 2>/dev/null; then
-            echo "FORM_SECRET=\"$form_secret\"" >> /opt/matrix-install/secrets.conf
-        fi
-    fi
-    
-    # 5. Перезагрузка Matrix Synapse если были изменения или если он не запущен
-    if ! systemctl is-active --quiet matrix-synapse || [ "$need_restart" = true ]; then
-        if [ "$need_restart" = true ]; then
-            safe_echo "${BLUE}🔧 Перезагрузка Matrix Synapse для применения изменений...${NC}"
-        else
-            safe_echo "${BLUE}🔧 Запуск Matrix Synapse...${NC}"
-        fi
-        
-        if systemctl restart matrix-synapse; then
-            safe_echo "   ${GREEN}✅ Matrix Synapse перезапущен${NC}"
-            ((fixes_applied++))
-            sleep 5  # Даем время на запуск
-        else
-            safe_echo "   ${RED}❌ Не удалось перезапустить Matrix Synapse${NC}"
-            safe_echo "   ${YELLOW}💡 Проверьте конфигурацию: python3 -m synapse.config -c /etc/matrix-synapse/homeserver.yaml${NC}"
-            safe_echo "   ${YELLOW}💡 Проверьте логи: journalctl -u matrix-synapse -n 20${NC}"
-        fi
-    fi
-    
-    # 6. Проверка доступности API
-    safe_echo "${BLUE}🔧 Проверка доступности API...${NC}"
-    local api_attempts=0
-    while [ $api_attempts -lt 12 ]; do
-        if curl -s -f --connect-timeout 3 http://localhost:8008/_matrix/client/versions >/dev/null 2>&1; then
-            safe_echo "   ${GREEN}✅ Matrix API доступен${NC}"
-            break
-        fi
-        safe_echo "   ${YELLOW}⏳ Ожидание запуска API... (попытка $((api_attempts + 1))/12)${NC}"
-        sleep 3
-        ((api_attempts++))
-    done
-    
-    if [ $api_attempts -eq 12 ]; then
-        safe_echo "   ${RED}❌ Matrix API остается недоступным${NC}"
-        safe_echo "   ${YELLOW}💡 Проверьте конфигурацию: python3 -m synapse.config -c /etc/matrix-synapse/homeserver.yaml${NC}"
-        safe_echo "   ${YELLOW}💡 Проверьте логи: journalctl -u matrix-synapse -n 20${NC}"
-        safe_echo "   ${YELLOW}💡 Возможно требуется ручная диагностика${NC}"
-    fi
-    
-    echo
-    
-    # Итоговый отчет
-    if [ $fixes_applied -gt 0 ]; then
-        safe_echo "${GREEN}🎉 Исправление завершено: применено исправлений: $fixes_applied${NC}"
-        safe_echo "${BLUE}💡 Повторите диагностику для проверки результатов.${NC}"
-        
-        # Показываем что было исправлено
-        echo
-        safe_echo "${BOLD}${BLUE}Внесённые изменения:${NC}"
-        if [ -f "/etc/matrix-synapse/homeserver.yaml.backup.$(date +%Y%m%d)" ]; then
-            safe_echo "• Создана резервная копия конфигурации"
-        fi
-        if grep -q "registration_shared_secret:" /etc/matrix-synapse/homeserver.yaml; then
-            safe_echo "• Добавлен registration_shared_secret"
-        fi
-        if grep -q "macaroon_secret_key:" /etc/matrix-synapse/homeserver.yaml; then
-            safe_echo "• Добавлен macaroon_secret_key"
-        fi
-        if grep -q "form_secret:" /etc/matrix-synapse/homeserver.yaml; then
-            safe_echo "• Добавлен form_secret"
-        fi
-        if systemctl is-active --quiet matrix-synapse; then
-            safe_echo "• Matrix Synapse запущен и работает"
-        fi
-        
-    else
-        safe_echo "${BLUE}ℹ️  Исправления не требовались или не были применены.${NC}"
-        safe_echo "${YELLOW}💡 Если проблемы сохраняются, проверьте логи служб.${NC}"
-    fi
-    
-    return 0
-}
-
-# Главная функция
-main() {
-    # Автоматическое обновление при запуске
-    update_modules_and_library
-    
-    # Инициализация
-    if ! initialize; then
-        # Сообщение об ошибке уже выводится in initialize()
-        exit 1
-    fi
-
-    # Запуск главного меню
-    main_menu
-}
-
-# Обработка сигналов
-trap 'log "INFO" "Получен сигнал завершения, выходим..."; exit 0' SIGINT SIGTERM
-
-# Запуск если скрипт вызван напрямую
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main "$@"
-fi
+# Основной запуск
+initialize || exit 1
+main_menu
