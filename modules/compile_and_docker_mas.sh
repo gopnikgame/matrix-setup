@@ -218,11 +218,67 @@ check_mas_build_dependencies() {
         # Устанавливаем OPA если нужно
         if [[ " ${special_deps[@]} " =~ "opa" ]]; then
             log "INFO" "Установка Open Policy Agent..."
-            if ! curl -L -o /usr/local/bin/opa https://openpolicyagent.org/downloads/v0.58.0/opa_linux_amd64_static; then
-                log "ERROR" "Не удалось скачать OPA"
-                return 1
+            
+            # ИСПРАВЛЕНО: Устанавливаем последнюю версию OPA вместо 0.58.0
+            local opa_version="0.70.0"  # Современная версия с поддержкой нового синтаксиса Rego
+            local opa_url="https://openpolicyagent.org/downloads/v${opa_version}/opa_linux_amd64_static"
+            
+            log "INFO" "Скачивание OPA версии $opa_version..."
+            if ! curl -L -o /usr/local/bin/opa "$opa_url"; then
+                log "ERROR" "Не удалось скачать OPA версии $opa_version"
+                
+                # Пробуем установить через GitHub releases (более надежный способ)
+                log "INFO" "Попытка установки OPA через GitHub releases..."
+                local github_url="https://github.com/open-policy-agent/opa/releases/download/v${opa_version}/opa_linux_amd64_static"
+                
+                if curl -L -o /usr/local/bin/opa "$github_url"; then
+                    log "SUCCESS" "OPA скачан с GitHub releases"
+                else
+                    log "WARN" "Не удалось скачать OPA версии $opa_version, пробуем последнюю стабильную..."
+                    
+                    # Получаем последнюю версию из GitHub API
+                    local latest_version=$(curl -s https://api.github.com/repos/open-policy-agent/opa/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | sed 's/v//')
+                    if [ -n "$latest_version" ]; then
+                        log "INFO" "Найдена последняя версия OPA: $latest_version"
+                        local latest_url="https://github.com/open-policy-agent/opa/releases/download/v${latest_version}/opa_linux_amd64_static"
+                        
+                        if curl -L -o /usr/local/bin/opa "$latest_url"; then
+                            log "SUCCESS" "OPA версии $latest_version установлен"
+                        else
+                            log "ERROR" "Не удалось скачать OPA"
+                            return 1
+                        fi
+                    else
+                        log "ERROR" "Не удалось определить последнюю версию OPA"
+                        return 1
+                    fi
+                fi
             fi
+            
             chmod +x /usr/local/bin/opa
+            
+            # Проверяем установленную версию OPA
+            local installed_opa_version=$(opa version --format=json 2>/dev/null | grep '"Version"' | cut -d'"' -f4 2>/dev/null || opa version 2>/dev/null | head -1)
+            if [ -n "$installed_opa_version" ]; then
+                log "SUCCESS" "OPA установлен: $installed_opa_version"
+                
+                # Проверяем, что версия поддерживает новый синтаксис (>=0.60.0)
+                local major_ver=$(echo "$installed_opa_version" | grep -o '[0-9]\+\.[0-9]\+' | head -1)
+                if [ -n "$major_ver" ]; then
+                    local major=$(echo "$major_ver" | cut -d'.' -f1)
+                    local minor=$(echo "$major_ver" | cut -d'.' -f2)
+                    
+                    # Проверяем версию (должна быть >= 0.60 для поддержки нового синтаксиса)
+                    if [ "$major" -eq 0 ] && [ "$minor" -lt 60 ]; then
+                        log "WARN" "OPA версии $installed_opa_version может не поддерживать новый синтаксис Rego"
+                        log "WARN" "Рекомендуется версия 0.60.0 или выше для совместимости с MAS"
+                    else
+                        log "SUCCESS" "OPA версии $installed_opa_version поддерживает современный синтаксис Rego"
+                    fi
+                fi
+            else
+                log "WARN" "Не удалось определить версию установленного OPA"
+            fi
         fi
         
         # Устанавливаем обычныеDependencies через apt
@@ -1649,7 +1705,7 @@ install_matrix_authentication_service() {
             fi
             
             # Перезагружаем Synapse для применения конфигурации MAS
-            log "INFO" "Перезапуск Synapse для применения конфигурации MAS..."
+            log "INFO" "Перезагрузка Synapse для применения конфигурации MAS..."
             if systemctl restart matrix-synapse; then
                 log "SUCCESS" "Synapse перезапущен с поддержкой MAS"
                 
